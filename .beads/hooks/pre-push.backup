@@ -1,0 +1,48 @@
+#!/bin/bash
+# Global pre-push secret scan: gitleaks over exactly the commits about to leave
+# this machine. Blocks the push on any finding. Bypass: git push --no-verify.
+# Chains to the repo-local pre-push hook afterward (core.hooksPath shadows it).
+set -u
+
+# Non-interactive/GUI/IDE pushes often run with a PATH that lacks Homebrew, so
+# resolve gitleaks explicitly. Without this the bare `gitleaks` call exits 127
+# and reads as "secrets found", blocking EVERY push.
+export PATH="/opt/homebrew/bin:/usr/local/bin:$PATH"
+
+Z=0000000000000000000000000000000000000000
+stdin=$(cat)
+
+chain() {
+  # chain repo-local hook (husky, commit-gate, etc.) with the original stdin.
+  # NOTE: --git-dir, not --git-path hooks/... — the latter resolves through
+  # core.hooksPath and would exec this hook recursively.
+  local lh; lh="$(git rev-parse --git-dir)/hooks/pre-push"
+  [ -x "$lh" ] && exec "$lh" "$@" <<< "$stdin"
+  exit 0
+}
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+  # Fail OPEN, but loudly — a missing tool must not block every push (that just
+  # trains a reflexive --no-verify, which then bypasses real scans too).
+  echo "⚠ gitleaks not found — pre-push secret scan SKIPPED. Install: brew install gitleaks" >&2
+  chain "$@"
+fi
+
+while read -r lref lsha rref rsha; do
+  [ -z "${lsha:-}" ] && continue
+  [ "$lsha" = "$Z" ] && continue            # deleting a remote ref — nothing outgoing
+  if [ "$rsha" = "$Z" ]; then
+    opts="$lsha --not --remotes"            # new branch: scan commits no remote has
+  else
+    opts="$rsha..$lsha"
+  fi
+  if ! gitleaks git --no-banner --redact --log-opts="$opts" .; then
+    echo "" >&2
+    echo "PUSH BLOCKED: gitleaks found secrets in outgoing commits ($lref)." >&2
+    echo "Fix (rewrite the offending commits), or bypass ONLY if false positive:" >&2
+    echo "  git push --no-verify" >&2
+    exit 1
+  fi
+done <<< "$stdin"
+
+chain "$@"
