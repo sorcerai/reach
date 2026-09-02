@@ -281,7 +281,7 @@ fn t15_key_combo() {
 #[ignore]
 fn t16_chrome_version() {
     ensure_container();
-    assert!(sh_ok("google-chrome --version").contains("Google Chrome"));
+    assert!(sh_ok("reach-chrome --version").contains("Chrom"));
 }
 
 #[test]
@@ -291,7 +291,7 @@ fn t17_chrome_headed() {
     let _ = sh("pkill -f chrome");
     sleep_ms(500);
     sh_ok(
-        "DISPLAY=:99 google-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
+        "DISPLAY=:99 reach-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
     );
     sleep_ms(3000);
     sh_ok("DISPLAY=:99 scrot -z /tmp/e2e_chrome.png");
@@ -306,7 +306,7 @@ fn t17_chrome_headed() {
 #[ignore]
 fn t18_chrome_headless_dom() {
     ensure_container();
-    let html = String::from_utf8_lossy(&sh("timeout 15 google-chrome --headless --dump-dom --no-sandbox https://example.com 2>/dev/null").stdout).to_string();
+    let html = String::from_utf8_lossy(&sh("timeout 15 reach-chrome --headless --dump-dom --no-sandbox https://example.com 2>/dev/null").stdout).to_string();
     assert!(html.contains("Example Domain"));
 }
 
@@ -317,7 +317,7 @@ fn t19_chrome_click_navigates() {
     let _ = sh("pkill -f chrome");
     sleep_ms(500);
     sh_ok(
-        "DISPLAY=:99 google-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
+        "DISPLAY=:99 reach-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
     );
     sleep_ms(3000);
     sh_ok("DISPLAY=:99 xdotool mousemove 266 353 click 1");
@@ -478,7 +478,7 @@ fn t33_workflow_scrape_then_visual() {
     let _ = sh("pkill -f chrome");
     sleep_ms(500);
     sh_ok(
-        "DISPLAY=:99 google-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
+        "DISPLAY=:99 reach-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
     );
     sleep_ms(3000);
     sh_ok("DISPLAY=:99 scrot -z /tmp/e2e_wf1.png");
@@ -492,7 +492,7 @@ fn t34_workflow_type_url() {
     let _ = sh("pkill -f chrome");
     sleep_ms(500);
     sh_ok(
-        "DISPLAY=:99 google-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 about:blank &",
+        "DISPLAY=:99 reach-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 about:blank &",
     );
     sleep_ms(2000);
     sh_ok("DISPLAY=:99 xdotool key ctrl+l");
@@ -512,9 +512,17 @@ fn t35_workflow_headed_and_headless_coexist() {
     let _ = sh("pkill -f chrome");
     sleep_ms(500);
     sh_ok(
-        "DISPLAY=:99 google-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
+        "DISPLAY=:99 reach-chrome --no-sandbox --disable-gpu --no-first-run --window-size=1280,720 https://example.com &",
     );
-    sleep_ms(1000);
+    sleep_ms(3000);
+    // Prove the headed browser actually rendered a window, not just that
+    // the backgrounded launch command returned (which it always does).
+    sh_ok("DISPLAY=:99 scrot -z /tmp/e2e_wf35.png");
+    let bytes: u64 = sh_ok("stat -c %s /tmp/e2e_wf35.png").parse().unwrap();
+    assert!(
+        bytes > 10_000,
+        "headed screenshot too small ({bytes}b), reach-chrome didn't render"
+    );
     // Headless playwright while headed chrome is running
     let h1 = sh_ok(
         "python3 << 'PY'\nfrom playwright.sync_api import sync_playwright\nwith sync_playwright() as p:\n  b=p.chromium.launch(headless=True)\n  pg=b.new_page(); pg.goto('https://example.com')\n  print(pg.query_selector('h1').inner_text()); b.close()\nPY",
