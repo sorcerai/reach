@@ -3,12 +3,12 @@ use axum::response::sse::{Event, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use clap::Args;
-use reach_cli::docker::{
-    AuthHandoffOptions, DockerClient, PageTextOptions, ProfileMount, novnc_url,
-};
+use reach_cli::config::ReachConfig;
+use reach_cli::docker::DockerClient;
 use reach_cli::mcp::{
     JsonRpcRequest, JsonRpcResponse, McpInitializeResult, ToolResponse, tool_definitions,
 };
+use reach_cli::tools::{ToolContext, dispatch};
 use std::convert::Infallible;
 use std::sync::Arc;
 
@@ -30,6 +30,7 @@ pub struct ServeArgs {
 struct AppState {
     docker: DockerClient,
     default_sandbox: Option<String>,
+    public_host: String,
 }
 
 pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
@@ -39,6 +40,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let state = Arc::new(AppState {
         docker: DockerClient::new()?,
         default_sandbox: args.sandbox,
+        public_host: ReachConfig::load().server.effective_public_host(),
     });
 
     let app = Router::new()
@@ -109,7 +111,11 @@ async fn handle_mcp(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 }
             };
 
-            let result = dispatch(state, tool, &args, &target).await;
+            let ctx = ToolContext {
+                docker: &state.docker,
+                public_host: state.public_host.clone(),
+            };
+            let result = dispatch(&ctx, tool, &args, &target).await;
             JsonRpcResponse::success(req.id.clone(), serde_json::to_value(result).unwrap())
         }
         "notifications/initialized" | "ping" => {
@@ -120,232 +126,5 @@ async fn handle_mcp(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
             -32601,
             format!("unknown method: {}", req.method),
         ),
-    }
-}
-
-async fn dispatch(
-    state: &AppState,
-    tool: &str,
-    args: &serde_json::Value,
-    target: &str,
-) -> ToolResponse {
-    match tool {
-        "screenshot" => match state.docker.screenshot(target).await {
-            Ok(bytes) => {
-                use base64::Engine;
-                ToolResponse::image(
-                    base64::engine::general_purpose::STANDARD.encode(&bytes),
-                    "image/png",
-                )
-            }
-            Err(e) => ToolResponse::error(e.to_string()),
-        },
-        "click" => {
-            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-            let btn = match args.get("button").and_then(|v| v.as_str()) {
-                Some("right") => "3",
-                Some("middle") => "2",
-                _ => "1",
-            };
-            sh(
-                state,
-                target,
-                &format!("xdotool mousemove {x} {y} click {btn}"),
-            )
-            .await
-        }
-        "type" => {
-            let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            sh(
-                state,
-                target,
-                &format!("xdotool type -- '{}'", text.replace('\'', "'\\''")),
-            )
-            .await
-        }
-        "key" => {
-            let combo = args
-                .get("combo")
-                .and_then(|v| v.as_str())
-                .unwrap_or("Return");
-            sh(state, target, &format!("xdotool key {combo}")).await
-        }
-        "browse" => {
-            let url = args
-                .get("url")
-                .and_then(|v| v.as_str())
-                .unwrap_or("about:blank");
-            sh(
-                state,
-                target,
-                &format!(
-                    "google-chrome --no-sandbox --disable-gpu '{}' &",
-                    url.replace('\'', "%27")
-                ),
-            )
-            .await
-        }
-        "scrape" => {
-            let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
-            let sel = args
-                .get("selector")
-                .and_then(|v| v.as_str())
-                .unwrap_or("body");
-            let stealth = args
-                .get("stealth")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let f = if stealth {
-                "StealthyFetcher"
-            } else {
-                "Fetcher"
-            };
-            py(
-                state,
-                target,
-                &format!(
-                    "from scrapling import {f}; r = {f}().get('{url}'); \
-                     elems = r.css('{sel}'); \
-                     import json; print(json.dumps([{{'content': e.text, 'tag': e.tag}} for e in elems]))"
-                ),
-            )
-            .await
-        }
-        "playwright_eval" => {
-            let script = args.get("script").and_then(|v| v.as_str()).unwrap_or("");
-            py(state, target, script).await
-        }
-        "exec" => {
-            let cmd = args
-                .get("command")
-                .and_then(|v| v.as_str())
-                .unwrap_or("echo");
-            sh(state, target, cmd).await
-        }
-        "page_text" => {
-            let url = match args.get("url").and_then(|v| v.as_str()) {
-                Some(u) if !u.is_empty() => u.to_string(),
-                _ => return ToolResponse::error("page_text: missing required `url`"),
-            };
-            let opts = PageTextOptions {
-                url,
-                wait_for: args
-                    .get("wait_for")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                selector: args
-                    .get("selector")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                timeout_ms: args
-                    .get("timeout_ms")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(30_000),
-                user_data_dir: args
-                    .get("use_profile")
-                    .and_then(|v| v.as_str())
-                    .map(ProfileMount::container_path_for),
-            };
-            match state.docker.page_text(target, &opts).await {
-                Ok(out) => match serde_json::to_string_pretty(&out) {
-                    Ok(s) => ToolResponse::text(s),
-                    Err(e) => ToolResponse::error(e.to_string()),
-                },
-                Err(e) => ToolResponse::error(e.to_string()),
-            }
-        }
-        "auth_handoff" => {
-            let url = match args.get("url").and_then(|v| v.as_str()) {
-                Some(u) if !u.is_empty() => u.to_string(),
-                _ => return ToolResponse::error("auth_handoff: missing required `url`"),
-            };
-            let opts = AuthHandoffOptions {
-                url,
-                wait_for_selector: args
-                    .get("wait_for_selector")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                wait_for_url_contains: args
-                    .get("wait_for_url_contains")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                timeout_seconds: args
-                    .get("timeout_seconds")
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(300),
-                user_data_dir: args
-                    .get("use_profile")
-                    .and_then(|v| v.as_str())
-                    .map(ProfileMount::container_path_for),
-            };
-
-            // Resolve the noVNC URL up-front so we can include it in the
-            // response no matter which branch the helper takes.
-            let vnc = match state.docker.find(target).await {
-                Ok(sandbox) => sandbox
-                    .ports
-                    .novnc
-                    .map(|p| novnc_url("localhost", p))
-                    .unwrap_or_else(|| novnc_url("localhost", 6080)),
-                Err(_) => novnc_url("localhost", 6080),
-            };
-
-            match state.docker.auth_handoff(target, &opts).await {
-                Ok(out) => {
-                    let body = serde_json::json!({
-                        "status": out.status,
-                        "vnc_url": vnc,
-                        "url": out.url,
-                        "message": out.message,
-                        "instructions": "Open the vnc_url in your browser to log in. Re-call \
-                                          `auth_handoff` (with wait_for_*) or `page_text` once done.",
-                    });
-                    match serde_json::to_string_pretty(&body) {
-                        Ok(s) => ToolResponse::text(s),
-                        Err(e) => ToolResponse::error(e.to_string()),
-                    }
-                }
-                Err(e) => {
-                    let body = serde_json::json!({
-                        "status": "error",
-                        "vnc_url": vnc,
-                        "message": e.to_string(),
-                    });
-                    ToolResponse::error(
-                        serde_json::to_string_pretty(&body).unwrap_or_else(|_| e.to_string()),
-                    )
-                }
-            }
-        }
-        _ => ToolResponse::error(format!("unknown tool: {tool}")),
-    }
-}
-
-async fn sh(state: &AppState, target: &str, cmd: &str) -> ToolResponse {
-    match state
-        .docker
-        .exec(target, &["bash".into(), "-c".into(), cmd.into()])
-        .await
-    {
-        Ok(out) if out.exit_code == 0 => ToolResponse::text(if out.stdout.is_empty() {
-            "ok".into()
-        } else {
-            out.stdout
-        }),
-        Ok(out) => ToolResponse::error(format!("exit {}: {}", out.exit_code, out.stderr)),
-        Err(e) => ToolResponse::error(e.to_string()),
-    }
-}
-
-async fn py(state: &AppState, target: &str, script: &str) -> ToolResponse {
-    match state
-        .docker
-        .exec(target, &["python3".into(), "-c".into(), script.into()])
-        .await
-    {
-        Ok(out) if out.exit_code == 0 => ToolResponse::text(out.stdout),
-        Ok(out) => ToolResponse::error(format!("exit {}: {}", out.exit_code, out.stderr)),
-        Err(e) => ToolResponse::error(e.to_string()),
     }
 }
