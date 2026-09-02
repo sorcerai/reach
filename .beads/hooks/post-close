@@ -1,0 +1,41 @@
+#!/usr/bin/env sh
+# .beads/hooks/post-close — architecture-drift checkpoint (advisory).
+# Fires after 'bd close' succeeds. CANNOT block or undo the close.
+# Scaffolded by 'bd arch init' — edit freely. Output to stderr only.
+#
+# No ARCH.md yet? Run 'bd arch init' to scaffold the construction blueprint.
+# Args: $@ = closed issue IDs. cwd = repo root.
+
+# POSIX sh only — no bashisms here. (A pipe-failure option under this sh shebang
+# aborts dash at startup — dash is the default /bin/sh on Debian/Ubuntu — which
+# silently skips the checkpoint.)
+set -eu
+
+# --- nudge: no ARCH.md means no blueprint to check against ---
+if [ ! -f ARCH.md ]; then
+  echo "ℹ  no ARCH.md — run 'bd arch init' to scaffold construction guardrails." >&2
+fi
+
+# --- Tier 1: deterministic check (explicit opt-in; runs repository code) ---
+# Repository-controlled scripts must not execute without an explicit opt-in:
+# a compromised checkout could otherwise run code on every close.
+if [ "${BD_ARCH_CHECK:-0}" = "1" ] && [ -x ./scripts/arch-check.sh ]; then
+  ./scripts/arch-check.sh || echo "⚠  see arch-check output above (advisory)" >&2
+fi
+
+# --- Tier 2 (opt-in): fresh-context LLM review of the diff vs ARCH.md ---
+# Enable by setting BD_ARCH_REVIEW=1. Uses a FRESH pi process so the reviewer
+# has zero investment in justifying the builder's work. Costs tokens + ~30s.
+if [ "${BD_ARCH_REVIEW:-0}" = "1" ] && command -v pi >/dev/null 2>&1; then
+  DIFF_FILE=$(mktemp /tmp/arch-diff.XXXXXX)
+  trap 'rm -f "$DIFF_FILE"' EXIT
+  git diff HEAD~1 HEAD 2>/dev/null | head -400 > "$DIFF_FILE" || true
+  if [ -s "$DIFF_FILE" ]; then
+    for id in "$@"; do
+      pi -p --approve --no-prompt-templates "You are a FRESH-CONTEXT architecture reviewer with no investment in this work. Read ARCH.md. Review the git diff below + closed issue $id. Does the diff violate any invariant (cite the #), make ARCH.md stale, or look like drift? If fine, reply NO DRIFT only.
+$(cat "$DIFF_FILE")" 2>&1 | sed 's/^/  arch-review> /' >&2 || true
+    done
+  fi
+fi
+
+exit 0
