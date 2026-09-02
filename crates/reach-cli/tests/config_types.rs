@@ -16,9 +16,9 @@ fn default_config_has_sane_values() {
 }
 
 #[test]
-fn default_shm_is_2gb() {
+fn default_shm_is_512mb() {
     let config = ReachConfig::default();
-    assert_eq!(config.sandbox.shm_size, 2 * 1024 * 1024 * 1024);
+    assert_eq!(config.sandbox.shm_size, 512 * 1024 * 1024);
 }
 
 #[test]
@@ -144,4 +144,41 @@ fn resolved_profile_dir_falls_back_when_unset() {
 fn default_profile_dir_helper_returns_reach_path() {
     let dir = default_profile_dir();
     assert!(dir.to_string_lossy().contains("reach"));
+}
+
+// ═══════════════════════════════════════════════════════════
+// Server config — public_host
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+fn public_host_defaults_to_localhost() {
+    let config = ReachConfig::default();
+    assert_eq!(config.server.public_host, None);
+    assert_eq!(config.server.effective_public_host(), "localhost");
+}
+
+#[test]
+fn public_host_and_memory_parse_from_toml() {
+    let config: ReachConfig = toml::from_str(
+        r#"
+        [server]
+        public_host = "100.124.38.17"
+        [sandbox]
+        memory = 2684354560
+        workspace_dir = "/srv/reach/workspaces"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.server.effective_public_host(), "100.124.38.17");
+    assert_eq!(config.sandbox.memory, Some(2_684_354_560));
+    assert_eq!(
+        config.sandbox.resolved_workspace_dir(),
+        std::path::PathBuf::from("/srv/reach/workspaces")
+    );
+}
+
+#[test]
+fn workspace_dir_falls_back_to_default() {
+    let d = SandboxDefaults::default().resolved_workspace_dir();
+    assert!(d.ends_with("reach/workspaces"));
 }

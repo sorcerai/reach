@@ -36,6 +36,12 @@ pub struct SandboxDefaults {
     /// (`~/.local/share/reach/profiles`).
     #[serde(default)]
     pub profile_dir: Option<PathBuf>,
+    /// Hard memory limit for the container in bytes (`None` = unlimited).
+    #[serde(default)]
+    pub memory: Option<u64>,
+    /// Root directory for `/workspace` bind mounts on the host.
+    #[serde(default)]
+    pub workspace_dir: Option<PathBuf>,
 }
 
 impl SandboxDefaults {
@@ -46,17 +52,36 @@ impl SandboxDefaults {
     pub fn resolved_profile_dir(&self) -> PathBuf {
         self.profile_dir.clone().unwrap_or_else(default_profile_dir)
     }
+
+    /// Resolve the directory used for `/workspace` bind mounts.
+    ///
+    /// Falls back to `$XDG_DATA_HOME/reach/workspaces` (or
+    /// `~/.local/share/reach/workspaces`) when `workspace_dir` is unset.
+    pub fn resolved_workspace_dir(&self) -> PathBuf {
+        self.workspace_dir
+            .clone()
+            .unwrap_or_else(default_workspace_dir)
+    }
 }
 
-/// Platform default for the persistent Chrome profile root.
-pub fn default_profile_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME")
+/// XDG data home directory (or fallback to ~/.local/share).
+fn data_home() -> PathBuf {
+    std::env::var("XDG_DATA_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| {
             let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
             PathBuf::from(home).join(".local").join("share")
-        });
-    base.join("reach").join("profiles")
+        })
+}
+
+/// Platform default for the persistent Chrome profile root.
+pub fn default_profile_dir() -> PathBuf {
+    data_home().join("reach").join("profiles")
+}
+
+/// Platform default for `/workspace` bind mounts: `~/.local/share/reach/workspaces`.
+pub fn default_workspace_dir() -> PathBuf {
+    data_home().join("reach").join("workspaces")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +91,18 @@ pub struct ServerConfig {
     pub port: u16,
     /// Bind address
     pub host: String,
+    /// Hostname or IP that humans use to open noVNC (e.g. a Tailscale IP).
+    /// `None` = "localhost".
+    #[serde(default)]
+    pub public_host: Option<String>,
+}
+
+impl ServerConfig {
+    pub fn effective_public_host(&self) -> String {
+        self.public_host
+            .clone()
+            .unwrap_or_else(|| "localhost".into())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -85,11 +122,13 @@ impl Default for SandboxDefaults {
         Self {
             image: "reach:latest".into(),
             resolution: "1280x720".into(),
-            shm_size: 2 * 1024 * 1024 * 1024,
+            shm_size: 512 * 1024 * 1024,
             vnc_port: 5900,
             novnc_port: 6080,
             health_port: 8400,
             profile_dir: None,
+            memory: None,
+            workspace_dir: None,
         }
     }
 }
@@ -99,6 +138,7 @@ impl Default for ServerConfig {
         Self {
             port: 4200,
             host: "127.0.0.1".into(),
+            public_host: None,
         }
     }
 }
