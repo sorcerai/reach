@@ -16,6 +16,17 @@ pub fn novnc_url_for(ctx: &ToolContext<'_>, sandbox: &Sandbox) -> String {
     novnc_url(&ctx.public_host, port)
 }
 
+/// Validate the `screen` argument for `live_view`. Only screen 0 exists
+/// today (single-display sandbox); anything else is a caller error.
+pub fn requested_screen(args: &serde_json::Value) -> Result<u32, String> {
+    match args.get("screen").and_then(|v| v.as_u64()) {
+        None | Some(0) => Ok(0),
+        Some(n) => Err(format!(
+            "screen {n} is not available: this sandbox has a single screen (0)"
+        )),
+    }
+}
+
 pub fn browse_command(url: &str, profile_dir: &str) -> String {
     format!(
         "mkdir -p '{p}' && reach-chrome --no-sandbox --disable-gpu --no-first-run \
@@ -217,26 +228,31 @@ pub async fn dispatch(
                 }
             }
         }
-        "live_view" => match ctx.docker.find(target).await {
-            Ok(sb) => {
-                let busy = ctx
-                    .docker
-                    .exec(target, &["xdotool".into(), "getactivewindow".into()])
-                    .await
-                    .map(|o| o.exit_code == 0)
-                    .unwrap_or(false);
-                ToolResponse::text(
-                    serde_json::json!({
-                        "novnc_url": novnc_url_for(ctx, &sb),
-                        "screen": 0,
-                        "display": ":99",
-                        "busy": busy,
-                    })
-                    .to_string(),
-                )
+        "live_view" => {
+            if let Err(e) = requested_screen(args) {
+                return ToolResponse::error(e);
             }
-            Err(e) => ToolResponse::error(e.to_string()),
-        },
+            match ctx.docker.find(target).await {
+                Ok(sb) => {
+                    let busy = ctx
+                        .docker
+                        .exec(target, &["xdotool".into(), "getactivewindow".into()])
+                        .await
+                        .map(|o| o.exit_code == 0)
+                        .unwrap_or(false);
+                    ToolResponse::text(
+                        serde_json::json!({
+                            "novnc_url": novnc_url_for(ctx, &sb),
+                            "screen": 0,
+                            "display": ":99",
+                            "busy": busy,
+                        })
+                        .to_string(),
+                    )
+                }
+                Err(e) => ToolResponse::error(e.to_string()),
+            }
+        }
         _ => ToolResponse::error(format!("unknown tool: {tool}")),
     }
 }
@@ -272,6 +288,13 @@ async fn py(ctx: &ToolContext<'_>, target: &str, script: &str) -> ToolResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn requested_screen_rejects_nonzero() {
+        assert_eq!(requested_screen(&serde_json::json!({})), Ok(0));
+        assert_eq!(requested_screen(&serde_json::json!({"screen": 0})), Ok(0));
+        assert!(requested_screen(&serde_json::json!({"screen": 1})).is_err());
+    }
 
     #[test]
     fn browse_command_uses_wrapper_and_profile() {
