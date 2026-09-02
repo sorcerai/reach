@@ -45,14 +45,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 2: Google Chrome
-RUN curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
-    | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
-    && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
-    > /etc/apt/sources.list.d/google-chrome.list \
-    && apt-get update && apt-get install -y --no-install-recommends \
-    google-chrome-stable \
-    && rm -rf /var/lib/apt/lists/*
+# Layer 2: Google Chrome (amd64 only — there is no arm64 Linux Chrome build).
+ARG TARGETARCH
+RUN if [ "$TARGETARCH" = "amd64" ]; then \
+      curl -fsSL https://dl.google.com/linux/linux_signing_key.pub \
+        | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg \
+      && echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" \
+        > /etc/apt/sources.list.d/google-chrome.list \
+      && apt-get update && apt-get install -y --no-install-recommends google-chrome-stable \
+      && rm -rf /var/lib/apt/lists/*; \
+    fi
 
 # Layer 3: Node.js + computer-use-mcp
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
@@ -60,14 +62,16 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && npm install -g computer-use-mcp \
     && rm -rf /var/lib/apt/lists/*
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+
 # Layer 4: Playwright + Scrapling + websockify
 RUN pip install --break-system-packages \
     playwright \
     "scrapling[fetchers]" \
     websockify \
+    && playwright install-deps chromium \
     && playwright install chromium \
-    && scrapling install \
-    || true
+    && scrapling install
 
 # Layer 5: noVNC
 RUN git_url="https://github.com/novnc/noVNC.git" && \
@@ -78,6 +82,12 @@ RUN git_url="https://github.com/novnc/noVNC.git" && \
 
 # Layer 6: reach-supervisor binary
 COPY --from=builder /build/target/release/reach-supervisor /usr/local/bin/reach-supervisor
+
+COPY scripts/reach-chrome /usr/local/bin/reach-chrome
+RUN chmod +x /usr/local/bin/reach-chrome \
+    && mkdir -p /etc/chromium/policies/managed \
+    && chmod -R a+rX /opt/ms-playwright
+COPY config/chrome-policies.json /etc/chromium/policies/managed/reach.json
 
 # Layer 7: User + permissions + X11 socket dir
 RUN useradd -m -s /bin/bash sandbox \

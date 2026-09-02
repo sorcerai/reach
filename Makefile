@@ -1,4 +1,4 @@
-.PHONY: build release image compose down dev fmt lint deny test test-integration run shell screenshot ci-check ci-build install hooks clean
+.PHONY: build release image image-arm64 lab-load compose down dev fmt lint deny test test-integration run shell screenshot ci-check ci-build install hooks clean
 
 # Primary targets
 build:
@@ -9,6 +9,14 @@ release:
 
 image:
 	docker build -t reach .
+
+image-arm64:
+	docker buildx build --platform linux/arm64 -t reach:arm64 --load .
+
+# Load the arm64 image into the reach-lab Lima VM's rootless Docker.
+lab-load: image-arm64
+	docker save reach:arm64 | limactl shell reach-lab docker load
+	limactl shell reach-lab docker tag reach:arm64 reach:latest
 
 compose:
 	docker compose up -d

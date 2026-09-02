@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# Resolve a headed Chromium-family browser for this architecture.
+# amd64: Google Chrome (deb). arm64: Playwright's Chromium (no Chrome deb exists).
+set -euo pipefail
+for c in /usr/bin/google-chrome-stable \
+         "${PLAYWRIGHT_BROWSERS_PATH:-/opt/ms-playwright}"/chromium-*/chrome-linux*/chrome; do
+  if [ -x "$c" ]; then exec "$c" "$@"; fi
+done
+echo "reach-chrome: no browser found" >&2
+exit 127

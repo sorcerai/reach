@@ -672,6 +672,21 @@ fn t39_auth_handoff_returns_vnc_url() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 90. MULTI-ARCH BROWSER WRAPPER
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn t90_reach_chrome_resolves() {
+    ensure_container();
+    let out = sh_ok("reach-chrome --version");
+    assert!(
+        out.contains("Chrom"),
+        "reach-chrome should report a Chrome/Chromium version, got: {out}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════
 // 99. SHUTDOWN (must run last)
 // ═══════════════════════════════════════════════════════════
 
