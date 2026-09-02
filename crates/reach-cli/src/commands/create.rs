@@ -53,6 +53,19 @@ pub struct CreateArgs {
     /// `use_profile` to reuse the session.
     #[arg(long, value_name = "NAME")]
     pub persist_profile: Option<String>,
+
+    /// Mount a host directory at /workspace (durable files). Without a value,
+    /// uses `<workspace_dir>/<name>` (default ~/.local/share/reach/workspaces/<name>).
+    #[arg(long, value_name = "PATH", num_args = 0..=1, default_missing_value = "")]
+    pub workspace: Option<String>,
+
+    /// Hard memory cap, e.g. `2.5g` (default: sandbox.memory from config, else unlimited)
+    #[arg(long, value_parser = parse_memory)]
+    pub memory: Option<u64>,
+
+    /// Do not set the `unless-stopped` restart policy
+    #[arg(long)]
+    pub no_restart: bool,
 }
 
 /// Parse a `HOST:CONTAINER` port pair, or a single `PORT` shorthand for
@@ -70,6 +83,21 @@ fn parse_port_pair(s: &str) -> Result<(u16, u16), String> {
     }
 }
 
+/// Parse `512m`, `2g`, `2.5G`, or raw bytes.
+pub fn parse_memory(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num, mult) = match s.chars().last() {
+        Some('k' | 'K') => (&s[..s.len() - 1], 1024f64),
+        Some('m' | 'M') => (&s[..s.len() - 1], 1024f64 * 1024.0),
+        Some('g' | 'G') => (&s[..s.len() - 1], 1024f64 * 1024.0 * 1024.0),
+        _ => (s, 1.0),
+    };
+    let n: f64 = num
+        .parse()
+        .map_err(|_| format!("invalid memory size {s:?}"))?;
+    Ok((n * mult) as u64)
+}
+
 pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
     let cfg = ReachConfig::load();
     let resolution = Resolution::parse(&args.resolution)?;
@@ -83,6 +111,16 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         }
     });
 
+    let workspace = args.workspace.as_ref().map(|w| {
+        if w.is_empty() {
+            cfg.sandbox.resolved_workspace_dir().join(&args.name)
+        } else {
+            std::path::PathBuf::from(w)
+        }
+    });
+
+    let memory = args.memory.or(cfg.sandbox.memory);
+
     let config = SandboxConfig {
         name: args.name.clone(),
         image: args.image.unwrap_or(cfg.sandbox.image.clone()),
@@ -95,9 +133,9 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
             extra: args.extra_ports.clone(),
         },
         profile,
-        workspace: None,
-        memory: None,
-        restart_unless_stopped: true,
+        workspace: workspace.clone(),
+        memory,
+        restart_unless_stopped: !args.no_restart,
     };
 
     let docker = DockerClient::new()?;
@@ -133,6 +171,31 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
             "Profile   ".dimmed(),
             name,
             format!("({})", host.display()).dimmed()
+        );
+    }
+
+    if let Some(ws) = &workspace {
+        println!(
+            "  {} {}  {}",
+            "\u{2713}".green(),
+            "Workspace ".dimmed(),
+            ws.display()
+        );
+    }
+
+    if let Some(mem) = memory {
+        let gb = mem as f64 / (1024.0 * 1024.0 * 1024.0);
+        let mb = mem as f64 / (1024.0 * 1024.0);
+        let mem_str = if gb >= 1.0 {
+            format!("{:.1}G", gb)
+        } else {
+            format!("{:.0}M", mb)
+        };
+        println!(
+            "  {} {}  {}",
+            "\u{2713}".green(),
+            "Memory    ".dimmed(),
+            mem_str
         );
     }
 
@@ -176,4 +239,18 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
     );
     println!();
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_memory;
+
+    #[test]
+    fn parses_suffixes() {
+        assert_eq!(parse_memory("512m").unwrap(), 512 * 1024 * 1024);
+        assert_eq!(parse_memory("2g").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(parse_memory("2.5G").unwrap(), 2_684_354_560);
+        assert_eq!(parse_memory("1024").unwrap(), 1024);
+        assert!(parse_memory("lots").is_err());
+    }
 }
