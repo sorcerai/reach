@@ -767,6 +767,125 @@ fn t91_live_view_uses_public_host() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 92. WORKSPACE MOUNT + SHARED BROWSER PROFILE
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn t92_workspace_is_mounted() {
+    ensure_container();
+    sh_ok("echo hello > /workspace/probe.txt");
+    assert_eq!(
+        std::fs::read_to_string("/tmp/reach-e2e-ws/probe.txt")
+            .unwrap()
+            .trim(),
+        "hello"
+    );
+}
+
+#[test]
+#[ignore]
+fn t93_browse_and_page_text_share_profile() {
+    ensure_container();
+    let _ = sh("pkill -f chrome");
+    sleep_ms(500);
+
+    // Serve a page that sets a cookie, then echoes back whatever cookie
+    // the client sent on the request. Uses Max-Age (not a bare session
+    // cookie) so Chromium reliably flushes it to the profile's SQLite
+    // Cookies db before we kill the process and reload it in Playwright;
+    // a session cookie's persist-to-disk timing is unreliable across an
+    // abrupt process kill and makes this test flaky.
+    let cookie_server = r#"
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        c = self.headers.get('Cookie', '')
+        self.send_response(200)
+        self.send_header('Set-Cookie', 'reach=yes; Path=/; Max-Age=86400')
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(('<body>cookie=[%s]</body>' % c).encode())
+HTTPServer(('127.0.0.1', 8765), H).serve_forever()
+"#;
+    {
+        use std::io::Write;
+        let mut tmp = std::env::temp_dir();
+        tmp.push("reach_e2e_cookie_server.py");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(cookie_server.as_bytes())
+            .unwrap();
+        let cp = docker(&[
+            "cp",
+            &tmp.to_string_lossy(),
+            &format!("{CONTAINER}:/tmp/cookie.py"),
+        ]);
+        assert!(cp.status.success(), "docker cp failed: {}", stderr(&cp));
+        let _ = std::fs::remove_file(&tmp);
+    }
+    sh_ok("nohup python3 /tmp/cookie.py >/dev/null 2>&1 & disown");
+    sleep_ms(500);
+
+    let profile = "/home/sandbox/.config/google-chrome-profiles/default";
+
+    // Headed browse (default profile, no `use_profile`) sets the cookie.
+    sh_ok(&reach_cli::tools::browse_command(
+        "http://127.0.0.1:8765/",
+        profile,
+    ));
+
+    // Chromium's SQLite cookie store batches writes and only commits them
+    // to disk on a ~30s timer (confirmed empirically: killing the browser
+    // before that commit fires drops the pending write entirely, since
+    // it lives only in memory until then). So we must wait for the row to
+    // actually land on disk *while the browser is still alive*, and only
+    // then kill it — killing early loses the cookie, no amount of
+    // post-kill waiting recovers it.
+    let cookie_query = format!(
+        "python3 -c \"import sqlite3,sys; c=sqlite3.connect('{profile}/Default/Cookies'); \
+         sys.exit(0 if c.execute(\\\"select 1 from cookies where name='reach'\\\").fetchone() else 1)\""
+    );
+    let mut flushed = false;
+    for _ in 0..60 {
+        if sh_code(&cookie_query) == 0 {
+            flushed = true;
+            break;
+        }
+        sleep_ms(1000);
+    }
+    assert!(
+        flushed,
+        "cookie never flushed to the profile's SQLite store"
+    );
+
+    // Now close the browser so the profile directory unlocks.
+    // `[u]ser-data-dir=` (bracket trick) avoids pkill matching its own argv,
+    // which literally contains the pattern text and would otherwise
+    // self-terminate with SIGTERM before `|| true` can save the exit code.
+    sh_ok("pkill -f '[u]ser-data-dir=' || true");
+    sleep_ms(1000);
+    // Chromium can leave a stale SingletonLock behind after the kill;
+    // clear it so Playwright can open the same profile directory.
+    sh_ok(&format!("rm -f '{profile}/SingletonLock' || true"));
+
+    let payload = serde_json::json!({
+        "url": "http://127.0.0.1:8765/",
+        "user_data_dir": profile,
+        "timeout_ms": 15000,
+    });
+    let stdout = run_embedded_python(
+        "REACH_PAGE_TEXT_PAYLOAD",
+        &payload,
+        reach_cli::docker::PAGE_TEXT_SCRIPT,
+    );
+    let parsed = last_json(&stdout);
+    assert_eq!(parsed["status"], "ok", "page_text not ok: {stdout}");
+    let text = parsed["text"].as_str().unwrap_or_default();
+    assert!(text.contains("reach=yes"), "cookie not shared: {text}");
+}
+
+// ═══════════════════════════════════════════════════════════
 // 99. SHUTDOWN (must run last)
 // ═══════════════════════════════════════════════════════════
 

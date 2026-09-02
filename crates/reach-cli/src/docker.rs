@@ -869,7 +869,7 @@ url = payload.get("url")
 wait_for_selector = payload.get("wait_for_selector")
 wait_for_url_contains = payload.get("wait_for_url_contains")
 timeout_seconds = int(payload.get("timeout_seconds") or 300)
-user_data_dir = payload.get("user_data_dir") or "/home/sandbox/.config/google-chrome-profiles/_reach_default"
+user_data_dir = payload.get("user_data_dir") or "/home/sandbox/.config/google-chrome-profiles/default"
 
 if not url:
     print(json.dumps({"status": "error", "message": "missing url"}))

@@ -156,10 +156,11 @@ pub async fn dispatch(
                     .get("timeout_ms")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(30_000),
-                user_data_dir: args
-                    .get("use_profile")
-                    .and_then(|v| v.as_str())
-                    .map(ProfileMount::container_path_for),
+                user_data_dir: Some(ProfileMount::container_path_for(
+                    args.get("use_profile")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default"),
+                )),
             };
             match ctx.docker.page_text(target, &opts).await {
                 Ok(out) => match serde_json::to_string_pretty(&out) {
@@ -188,10 +189,11 @@ pub async fn dispatch(
                     .get("timeout_seconds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(300),
-                user_data_dir: args
-                    .get("use_profile")
-                    .and_then(|v| v.as_str())
-                    .map(ProfileMount::container_path_for),
+                user_data_dir: Some(ProfileMount::container_path_for(
+                    args.get("use_profile")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("default"),
+                )),
             };
 
             // Resolve the noVNC URL up-front so we can include it in the
