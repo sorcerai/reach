@@ -25,6 +25,10 @@ pub struct ServeArgs {
     /// Target sandbox (default: first running)
     #[arg(long)]
     pub sandbox: Option<String>,
+
+    /// Host/IP humans should use to reach noVNC (overrides config)
+    #[arg(long)]
+    pub public_host: Option<String>,
 }
 
 struct AppState {
@@ -37,11 +41,17 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let port = args.port;
     let host = args.host.clone();
 
+    let public_host = args
+        .public_host
+        .unwrap_or_else(|| ReachConfig::load().server.effective_public_host());
+
     let state = Arc::new(AppState {
         docker: DockerClient::new()?,
         default_sandbox: args.sandbox,
-        public_host: ReachConfig::load().server.effective_public_host(),
+        public_host,
     });
+
+    println!("Live view host: {}", state.public_host);
 
     let app = Router::new()
         .route("/mcp", post(mcp_handler))

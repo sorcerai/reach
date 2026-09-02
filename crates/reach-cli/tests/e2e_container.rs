@@ -11,7 +11,6 @@ use std::process::Command;
 use std::sync::Once;
 use std::time::Duration;
 
-const IMAGE: &str = "reach:latest";
 const CONTAINER: &str = "reach-e2e";
 const HEALTH_URL: &str = "http://localhost:18400/health";
 const NOVNC_URL: &str = "http://localhost:16080";
@@ -21,20 +20,25 @@ static INIT: Once = Once::new();
 fn ensure_container() {
     INIT.call_once(|| {
         let _ = docker(&["rm", "-f", CONTAINER]);
-        let out = docker(&[
-            "run",
-            "-d",
-            "--name",
-            CONTAINER,
-            "--shm-size=2g",
-            "-p",
-            "15900:5900",
-            "-p",
-            "16080:6080",
-            "-p",
-            "18400:8400",
-            IMAGE,
-        ]);
+        let out = Command::new(env!("CARGO_BIN_EXE_reach"))
+            .args([
+                "create",
+                "--name",
+                CONTAINER,
+                "--workspace",
+                "/tmp/reach-e2e-ws",
+                "--vnc-port",
+                "15900",
+                "--novnc-port",
+                "16080",
+                "--health-port",
+                "18400",
+                "--memory",
+                "2560m",
+                "--no-wait",
+            ])
+            .output()
+            .expect("reach binary not found");
         assert!(out.status.success(), "start failed: {}", stderr(&out));
         assert!(
             wait_for_health(30),
@@ -99,6 +103,42 @@ fn sh_code(cmd: &str) -> i32 {
 }
 fn sleep_ms(ms: u64) {
     std::thread::sleep(Duration::from_millis(ms));
+}
+
+/// Kills a spawned child on drop, even if a later assertion panics.
+struct ChildGuard(std::process::Child);
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+fn mcp_call(port: u16, name: &str, args: serde_json::Value) -> String {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": name, "arguments": args }
+    })
+    .to_string();
+    String::from_utf8_lossy(
+        &Command::new("curl")
+            .args([
+                "-s",
+                "-X",
+                "POST",
+                "-H",
+                "content-type: application/json",
+                "-d",
+                &body,
+                &format!("http://127.0.0.1:{port}/mcp"),
+            ])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .to_string()
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -691,6 +731,38 @@ fn t90_reach_chrome_resolves() {
     assert!(
         out.contains("Chrom"),
         "reach-chrome should report a Chrome/Chromium version, got: {out}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════
+// 91. LIVE VIEW / PUBLIC HOST
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn t91_live_view_uses_public_host() {
+    ensure_container();
+    let child = Command::new(env!("CARGO_BIN_EXE_reach"))
+        .args([
+            "serve",
+            "--port",
+            "14200",
+            "--sandbox",
+            CONTAINER,
+            "--public-host",
+            "100.64.0.9",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("failed to spawn reach serve");
+    let _guard = ChildGuard(child);
+    sleep_ms(1000);
+
+    let text = mcp_call(14200, "live_view", serde_json::json!({}));
+    assert!(
+        text.contains("http://100.64.0.9:16080/vnc.html"),
+        "got {text}"
     );
 }
 

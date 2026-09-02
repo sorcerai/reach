@@ -217,6 +217,26 @@ pub async fn dispatch(
                 }
             }
         }
+        "live_view" => match ctx.docker.find(target).await {
+            Ok(sb) => {
+                let busy = ctx
+                    .docker
+                    .exec(target, &["xdotool".into(), "getactivewindow".into()])
+                    .await
+                    .map(|o| o.exit_code == 0)
+                    .unwrap_or(false);
+                ToolResponse::text(
+                    serde_json::json!({
+                        "novnc_url": novnc_url_for(ctx, &sb),
+                        "screen": 0,
+                        "display": ":99",
+                        "busy": busy,
+                    })
+                    .to_string(),
+                )
+            }
+            Err(e) => ToolResponse::error(e.to_string()),
+        },
         _ => ToolResponse::error(format!("unknown tool: {tool}")),
     }
 }

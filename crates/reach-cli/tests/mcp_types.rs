@@ -63,7 +63,7 @@ fn mcp_initialize_default_has_correct_protocol_version() {
 #[test]
 fn all_tools_are_registered() {
     let tools = tool_definitions();
-    assert_eq!(tools.len(), 10);
+    assert_eq!(tools.len(), 11);
 
     let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
     assert!(names.contains(&"screenshot"));
@@ -76,6 +76,16 @@ fn all_tools_are_registered() {
     assert!(names.contains(&"exec"));
     assert!(names.contains(&"page_text"));
     assert!(names.contains(&"auth_handoff"));
+    assert!(names.contains(&"live_view"));
+}
+
+#[test]
+fn live_view_tool_is_registered_and_has_no_required_fields() {
+    let tool = tool_definitions()
+        .into_iter()
+        .find(|t| t.name == "live_view")
+        .unwrap();
+    assert!(tool.input_schema.get("required").is_none());
 }
 
 #[test]

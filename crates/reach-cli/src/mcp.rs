@@ -581,6 +581,19 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 }
             }),
         },
+        ToolDefinition {
+            name: "live_view".into(),
+            description: "Return the noVNC URL where a human can watch (and take over) this \
+                          sandbox's screen. Call once per task and share the URL with the user."
+                .into(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
+                }
+            }),
+        },
     ]
 }
 
