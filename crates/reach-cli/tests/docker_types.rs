@@ -2,6 +2,7 @@
 //! parsing, labels, status mapping.
 
 use reach_cli::docker::*;
+use std::path::PathBuf;
 
 // ═══════════════════════════════════════════════════════════
 // Resolution parsing
@@ -55,9 +56,42 @@ fn sandbox_config_default_resolution_is_720p() {
 }
 
 #[test]
-fn sandbox_config_default_shm_is_2gb() {
-    let config = SandboxConfig::default();
-    assert_eq!(config.shm_size, 2 * 1024 * 1024 * 1024);
+fn default_sandbox_config_has_no_workspace_and_512mb_shm() {
+    let c = SandboxConfig::default();
+    assert_eq!(c.shm_size, 512 * 1024 * 1024);
+    assert!(c.workspace.is_none());
+    assert_eq!(c.memory, None);
+    assert!(c.restart_unless_stopped);
+}
+
+#[test]
+fn build_mounts_includes_workspace_and_profile() {
+    let c = SandboxConfig {
+        workspace: Some(PathBuf::from("/tmp/ws")),
+        profile: Some(ProfileMount {
+            name: "default".into(),
+            host_path: PathBuf::from("/tmp/prof"),
+            container_path: ProfileMount::container_path_for("default"),
+        }),
+        ..SandboxConfig::default()
+    };
+    let mounts = build_mounts(&c);
+    let targets: Vec<String> = mounts.iter().map(|m| m.target.clone().unwrap()).collect();
+    assert!(targets.contains(&WORKSPACE_CONTAINER_PATH.to_string()));
+    assert!(targets.contains(&"/home/sandbox/.config/google-chrome-profiles/default".to_string()));
+}
+
+#[test]
+fn labels_include_workspace_when_set() {
+    let c = SandboxConfig {
+        workspace: Some(PathBuf::from("/tmp/ws")),
+        ..SandboxConfig::default()
+    };
+    let l = Labels::for_sandbox(&c);
+    assert_eq!(
+        l.get(Labels::WORKSPACE).map(String::as_str),
+        Some("/tmp/ws")
+    );
 }
 
 #[test]

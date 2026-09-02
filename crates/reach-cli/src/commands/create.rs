@@ -95,6 +95,9 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
             extra: args.extra_ports.clone(),
         },
         profile,
+        workspace: None,
+        memory: None,
+        restart_unless_stopped: true,
     };
 
     let docker = DockerClient::new()?;

@@ -14,6 +14,9 @@ use std::time::Duration;
 // Sandbox configuration
 // ═══════════════════════════════════════════════════════════
 
+/// Path inside the container where the durable workspace mount lands.
+pub const WORKSPACE_CONTAINER_PATH: &str = "/workspace";
+
 #[derive(Debug, Clone)]
 pub struct SandboxConfig {
     pub name: String,
@@ -23,6 +26,12 @@ pub struct SandboxConfig {
     pub ports: SandboxPorts,
     /// Optional persistent Chrome profile mount.
     pub profile: Option<ProfileMount>,
+    /// Host directory bind-mounted at `/workspace` (durable files).
+    pub workspace: Option<PathBuf>,
+    /// Hard memory cap in bytes.
+    pub memory: Option<u64>,
+    /// Docker restart policy `unless-stopped` (always-on Agent Computer).
+    pub restart_unless_stopped: bool,
 }
 
 /// Bind mount that backs a persistent Chrome profile.
@@ -111,9 +120,12 @@ impl Default for SandboxConfig {
                 width: 1280,
                 height: 720,
             },
-            shm_size: 2 * 1024 * 1024 * 1024,
+            shm_size: 512 * 1024 * 1024,
             ports: SandboxPorts::default(),
             profile: None,
+            workspace: None,
+            memory: None,
+            restart_unless_stopped: true,
         }
     }
 }
@@ -183,6 +195,7 @@ impl Labels {
     pub const CREATED: &str = "reach.created";
     pub const RESOLUTION: &str = "reach.resolution";
     pub const PROFILE: &str = "reach.profile";
+    pub const WORKSPACE: &str = "reach.workspace";
 
     pub fn for_sandbox(config: &SandboxConfig) -> HashMap<String, String> {
         let mut labels = HashMap::new();
@@ -193,6 +206,9 @@ impl Labels {
         if let Some(profile) = &config.profile {
             labels.insert(Self::PROFILE.into(), profile.name.clone());
         }
+        if let Some(ws) = &config.workspace {
+            labels.insert(Self::WORKSPACE.into(), ws.to_string_lossy().into_owned());
+        }
         labels
     }
 
@@ -201,6 +217,28 @@ impl Labels {
         filters.insert("label".into(), vec![format!("{}=true", Self::MANAGED)]);
         filters
     }
+}
+
+fn bind(source: &std::path::Path, target: &str) -> Mount {
+    Mount {
+        target: Some(target.to_string()),
+        source: Some(source.to_string_lossy().into_owned()),
+        typ: Some(MountTypeEnum::BIND),
+        read_only: Some(false),
+        ..Default::default()
+    }
+}
+
+/// Bind mounts for a sandbox: persistent Chrome profile and `/workspace`.
+pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
+    let mut v = Vec::new();
+    if let Some(p) = &config.profile {
+        v.push(bind(&p.host_path, &p.container_path));
+    }
+    if let Some(ws) = &config.workspace {
+        v.push(bind(ws, WORKSPACE_CONTAINER_PATH));
+    }
+    v
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -259,40 +297,48 @@ impl DockerClient {
             map
         };
 
-        let mounts = if let Some(profile) = &config.profile {
-            // Ensure the host directory exists so the bind mount succeeds.
-            std::fs::create_dir_all(&profile.host_path).with_context(|| {
-                format!(
-                    "failed to create profile dir {}",
-                    profile.host_path.display()
-                )
-            })?;
-            Some(vec![Mount {
-                target: Some(profile.container_path.clone()),
-                source: Some(profile.host_path.to_string_lossy().into_owned()),
-                typ: Some(MountTypeEnum::BIND),
-                read_only: Some(false),
-                ..Default::default()
-            }])
-        } else {
-            None
-        };
+        for dir in config
+            .profile
+            .iter()
+            .map(|p| &p.host_path)
+            .chain(config.workspace.iter())
+        {
+            std::fs::create_dir_all(dir)
+                .with_context(|| format!("failed to create host dir {}", dir.display()))?;
+        }
+        let mounts = build_mounts(&config);
 
         let host_config = HostConfig {
             port_bindings: Some(port_bindings),
             shm_size: Some(config.shm_size as i64),
-            mounts,
+            memory: config.memory.map(|m| m as i64),
+            restart_policy: config.restart_unless_stopped.then_some(
+                bollard::models::RestartPolicy {
+                    name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                    maximum_retry_count: None,
+                },
+            ),
+            mounts: if mounts.is_empty() {
+                None
+            } else {
+                Some(mounts)
+            },
             ..Default::default()
         };
+
+        let mut env = vec![
+            format!("WIDTH={}", config.resolution.width),
+            format!("HEIGHT={}", config.resolution.height),
+        ];
+        if config.workspace.is_some() {
+            env.push(format!("REACH_WORKSPACE={WORKSPACE_CONTAINER_PATH}"));
+        }
 
         let container_config = Config {
             image: Some(config.image.clone()),
             labels: Some(labels),
             host_config: Some(host_config),
-            env: Some(vec![
-                format!("WIDTH={}", config.resolution.width),
-                format!("HEIGHT={}", config.resolution.height),
-            ]),
+            env: Some(env),
             exposed_ports: Some({
                 let mut m = HashMap::new();
                 m.insert("5900/tcp".into(), HashMap::new());
