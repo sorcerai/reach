@@ -921,6 +921,121 @@ fn t94_recreate_keeps_workspace() {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 95. VNC PASSWORD (separate short-lived sandbox)
+// ═══════════════════════════════════════════════════════════
+
+/// Removes the second, password-protected sandbox on drop (pass or panic).
+struct SandboxGuard(&'static str);
+impl Drop for SandboxGuard {
+    fn drop(&mut self) {
+        let _ = docker(&["rm", "-f", self.0]);
+    }
+}
+
+#[test]
+#[ignore]
+fn t95_vnc_password_is_enforced() {
+    const PW_CONTAINER: &str = "reach-e2e-pw";
+    let _ = docker(&["rm", "-f", PW_CONTAINER]);
+    let _guard = SandboxGuard(PW_CONTAINER);
+
+    let out = Command::new(env!("CARGO_BIN_EXE_reach"))
+        .args([
+            "create",
+            "--name",
+            PW_CONTAINER,
+            "--vnc-password",
+            "s3cret",
+            "--vnc-port",
+            "15901",
+            "--novnc-port",
+            "16081",
+            "--health-port",
+            "18401",
+            "--no-wait",
+        ])
+        .output()
+        .expect("reach binary not found");
+    assert!(out.status.success(), "start failed: {}", stderr(&out));
+
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    let mut healthy = false;
+    while std::time::Instant::now() < end {
+        if Command::new("curl")
+            .args(["-sf", "http://localhost:18401/health"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+        {
+            healthy = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    assert!(
+        healthy,
+        "never healthy. logs:\n{}",
+        docker_out(&["logs", "--tail", "50", PW_CONTAINER])
+    );
+
+    // x11vnc scrubs `-passwd <value>` from its own argv immediately after
+    // startup (a security feature, confirmed by reading /proc/<pid>/cmdline
+    // directly: with a password set, `-passwd <pw>` is replaced by blank
+    // args; without one, `-nopw` stays visible). So `pgrep -af` can't
+    // observe `-passwd`, but it can still confirm `-nopw` is absent (the
+    // brief's second assertion still holds).
+    //
+    // x11vnc's own startup log would name the flags it received, but its
+    // stdout is fully block-buffered once redirected into `docker logs`
+    // (confirmed empirically: the buffer only flushes after several KB of
+    // banner text, not on a timer), so reading `docker logs` for that line
+    // is racy and was dropped in favor of a direct protocol check below.
+    let ps = docker_out(&["exec", PW_CONTAINER, "pgrep", "-af", "x11vnc"]);
+    assert!(!ps.contains("-nopw"), "did not expect -nopw in: {ps}");
+
+    // Deterministic proof VNC auth is enforced: read the RFB handshake's
+    // security-type list directly over TCP. x11vnc offers type 1 (None)
+    // with no password, and drops it in favor of type 2 (VNC Authentication)
+    // once `-passwd` is set — no full VNC client login needed to see this.
+    let types = rfb_security_types(15901);
+    assert!(
+        types.contains(&2),
+        "expected VNC Authentication (2) offered with password set, got {types:?}"
+    );
+    assert!(
+        !types.contains(&1),
+        "did not expect no-auth (1) offered with password set, got {types:?}"
+    );
+}
+
+/// Reads the RFB handshake's offered security types from a live VNC server:
+/// server version string -> echo it back -> 1-byte count -> that many
+/// 1-byte security type codes. Stops there; no full login is performed.
+fn rfb_security_types(port: u16) -> Vec<u8> {
+    use std::io::{Read, Write};
+    use std::net::TcpStream;
+
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect to VNC port");
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+
+    let mut version = [0u8; 12];
+    stream.read_exact(&mut version).expect("read RFB version");
+    stream.write_all(&version).expect("echo RFB version");
+
+    let mut count = [0u8; 1];
+    stream
+        .read_exact(&mut count)
+        .expect("read security type count");
+    let mut types = vec![0u8; count[0] as usize];
+    if !types.is_empty() {
+        stream.read_exact(&mut types).expect("read security types");
+    }
+    types
+}
+
+// ═══════════════════════════════════════════════════════════
 // 99. SHUTDOWN (must run last)
 // ═══════════════════════════════════════════════════════════
 

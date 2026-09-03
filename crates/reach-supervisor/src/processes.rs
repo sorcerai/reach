@@ -143,6 +143,7 @@ pub struct Supervisor {
     display: u32,
     width: u32,
     height: u32,
+    vnc_password: Option<String>,
 }
 
 impl Default for Supervisor {
@@ -158,7 +159,25 @@ impl Supervisor {
             display: 99,
             width: 1280,
             height: 720,
+            vnc_password: None,
         }
+    }
+
+    /// Set (or clear) the VNC password. When set, `x11vnc` runs with
+    /// `-passwd <pw>` instead of `-nopw`.
+    ///
+    /// Note: `x11vnc` is passed the password on its command line, so in
+    /// principle another process could catch it via `execve` tracing or a
+    /// race right at spawn time — `x11vnc` itself scrubs `-passwd <pw>`
+    /// from its own argv immediately after startup (confirmed: it does not
+    /// appear in `ps`/`/proc/<pid>/cmdline` once running), so this is not
+    /// the plaintext-in-`ps`-forever exposure it would be for most CLI
+    /// tools. Acceptable for phase 2 — the container itself is the trust
+    /// boundary — but not a substitute for `-rfbauth` if that boundary
+    /// ever moves.
+    pub fn with_vnc_password(mut self, vnc_password: Option<String>) -> Self {
+        self.vnc_password = vnc_password;
+        self
     }
 
     pub fn from_env() -> Self {
@@ -174,17 +193,20 @@ impl Supervisor {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(720);
+        let vnc_password = std::env::var("VNC_PASSWORD").ok().filter(|s| !s.is_empty());
 
         Self {
             processes: Vec::new(),
             display,
             width,
             height,
+            vnc_password: None,
         }
+        .with_vnc_password(vnc_password)
     }
 
     /// Build the process table — defines what runs and in what order.
-    fn process_table(&self) -> Vec<ProcessSpec> {
+    pub(crate) fn process_table(&self) -> Vec<ProcessSpec> {
         let display = format!(":{}", self.display);
         let resolution = format!("{}x{}x24", self.width, self.height);
 
@@ -223,15 +245,15 @@ impl Supervisor {
             ProcessSpec {
                 name: "x11vnc",
                 command: "x11vnc",
-                args: vec![
-                    "-display".into(),
-                    display.clone(),
-                    "-forever".into(),
-                    "-nopw".into(),
-                    "-rfbport".into(),
-                    "5900".into(),
-                    "-shared".into(),
-                ],
+                args: {
+                    let mut args = vec!["-display".to_string(), display.clone(), "-forever".into()];
+                    match &self.vnc_password {
+                        Some(pw) => args.extend(["-passwd".into(), pw.clone()]),
+                        None => args.push("-nopw".into()),
+                    }
+                    args.extend(["-rfbport".into(), "5900".into(), "-shared".into()]);
+                    args
+                },
                 env: vec![],
                 restart: RestartPolicy::Always {
                     max_restarts: 10,
@@ -526,4 +548,33 @@ pub fn clean_x11_locks() -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Supervisor;
+
+    #[test]
+    fn x11vnc_uses_password_when_env_set() {
+        let sup = Supervisor::new().with_vnc_password(Some("s3cret".into()));
+        let x = sup
+            .process_table()
+            .into_iter()
+            .find(|p| p.name == "x11vnc")
+            .unwrap();
+        assert!(x.args.windows(2).any(|w| w == ["-passwd", "s3cret"]));
+        assert!(!x.args.iter().any(|a| a == "-nopw"));
+    }
+
+    #[test]
+    fn x11vnc_uses_nopw_when_unset() {
+        let sup = Supervisor::new();
+        let x = sup
+            .process_table()
+            .into_iter()
+            .find(|p| p.name == "x11vnc")
+            .unwrap();
+        assert!(x.args.iter().any(|a| a == "-nopw"));
+        assert!(!x.args.iter().any(|a| a == "-passwd"));
+    }
 }

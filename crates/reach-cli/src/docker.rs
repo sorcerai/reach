@@ -34,6 +34,12 @@ pub struct SandboxConfig {
     pub memory: Option<u64>,
     /// Docker restart policy `unless-stopped` (always-on Agent Computer).
     pub restart_unless_stopped: bool,
+    /// Optional VNC password. When set, `x11vnc` requires it and noVNC
+    /// prompts for it in the browser. `None` disables VNC auth entirely.
+    ///
+    /// Never logged, never put in a container label — round-tripped for
+    /// `recreate` via the container's `VNC_PASSWORD` env var instead.
+    pub vnc_password: Option<String>,
 }
 
 /// Bind mount that backs a persistent Chrome profile.
@@ -128,6 +134,7 @@ impl Default for SandboxConfig {
             workspace: None,
             memory: None,
             restart_unless_stopped: true,
+            vnc_password: None,
         }
     }
 }
@@ -329,6 +336,14 @@ pub fn config_from_inspect(
 
     let workspace = labels.get(Labels::WORKSPACE).map(PathBuf::from);
 
+    let vnc_password = cfg
+        .env
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .find_map(|e| e.strip_prefix("VNC_PASSWORD=").map(String::from))
+        .filter(|s| !s.is_empty());
+
     let profile = labels.get(Labels::PROFILE).map(|name| {
         let host_path = labels
             .get(Labels::PROFILE_HOST)
@@ -351,6 +366,7 @@ pub fn config_from_inspect(
         workspace,
         memory,
         restart_unless_stopped,
+        vnc_password,
     })
 }
 
@@ -445,6 +461,9 @@ impl DockerClient {
         ];
         if config.workspace.is_some() {
             env.push(format!("REACH_WORKSPACE={WORKSPACE_CONTAINER_PATH}"));
+        }
+        if let Some(pw) = config.vnc_password.as_deref().filter(|s| !s.is_empty()) {
+            env.push(format!("VNC_PASSWORD={pw}"));
         }
 
         let container_config = Config {

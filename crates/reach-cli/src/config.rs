@@ -42,6 +42,9 @@ pub struct SandboxDefaults {
     /// Root directory for `/workspace` bind mounts on the host.
     #[serde(default)]
     pub workspace_dir: Option<PathBuf>,
+    /// Optional VNC password (`None` = no auth, matching prior behavior).
+    #[serde(default)]
+    pub vnc_password: Option<String>,
 }
 
 impl SandboxDefaults {
@@ -129,6 +132,7 @@ impl Default for SandboxDefaults {
             profile_dir: None,
             memory: None,
             workspace_dir: None,
+            vnc_password: None,
         }
     }
 }

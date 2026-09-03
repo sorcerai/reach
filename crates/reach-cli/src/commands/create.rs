@@ -66,6 +66,15 @@ pub struct CreateArgs {
     /// Do not set the `unless-stopped` restart policy
     #[arg(long)]
     pub no_restart: bool,
+
+    /// Require this password for VNC access (also prompted by noVNC).
+    ///
+    /// Default: `sandbox.vnc_password` from config, else no password.
+    /// The password reaches the container via an env var; the container
+    /// is the trust boundary. Never printed by `reach create` or
+    /// `reach list`.
+    #[arg(long, value_name = "PW")]
+    pub vnc_password: Option<String>,
 }
 
 /// Parse a `HOST:CONTAINER` port pair, or a single `PORT` shorthand for
@@ -120,6 +129,13 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
     });
 
     let memory = args.memory.or(cfg.sandbox.memory);
+    // Empty string means "no password" (same as unset) — never report auth
+    // as on when x11vnc would actually run with `-nopw`.
+    let vnc_password = args
+        .vnc_password
+        .clone()
+        .or(cfg.sandbox.vnc_password.clone())
+        .filter(|s| !s.is_empty());
 
     let config = SandboxConfig {
         name: args.name.clone(),
@@ -136,6 +152,7 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         workspace: workspace.clone(),
         memory,
         restart_unless_stopped: !args.no_restart,
+        vnc_password: vnc_password.clone(),
     };
 
     let docker = DockerClient::new()?;
@@ -196,6 +213,14 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
             "\u{2713}".green(),
             "Memory    ".dimmed(),
             mem_str
+        );
+    }
+
+    if vnc_password.is_some() {
+        println!(
+            "  {} {}  password set",
+            "\u{2713}".green(),
+            "VNC       ".dimmed(),
         );
     }
 

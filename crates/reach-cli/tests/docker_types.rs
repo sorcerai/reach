@@ -228,6 +228,19 @@ fn labels_for_sandbox_omits_profile_label_when_unset() {
     assert!(!labels.contains_key(Labels::PROFILE));
 }
 
+#[test]
+fn labels_for_sandbox_never_carries_vnc_password() {
+    let config = SandboxConfig {
+        vnc_password: Some("s3cret".into()),
+        ..SandboxConfig::default()
+    };
+    let labels = Labels::for_sandbox(&config);
+    assert!(
+        labels.values().all(|v| v != "s3cret"),
+        "VNC password must never end up in a container label: {labels:?}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════
 // config_from_inspect (recreate)
 // ═══════════════════════════════════════════════════════════
@@ -239,6 +252,27 @@ fn fake_inspect(
     memory: Option<i64>,
     shm_size: Option<i64>,
     restart_unless_stopped: bool,
+) -> bollard::models::ContainerInspectResponse {
+    fake_inspect_with_env(
+        labels,
+        image,
+        port_bindings,
+        memory,
+        shm_size,
+        restart_unless_stopped,
+        &[],
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fake_inspect_with_env(
+    labels: &[(&str, &str)],
+    image: &str,
+    port_bindings: &[(&str, &str)],
+    memory: Option<i64>,
+    shm_size: Option<i64>,
+    restart_unless_stopped: bool,
+    env: &[&str],
 ) -> bollard::models::ContainerInspectResponse {
     use bollard::models::{
         ContainerConfig, ContainerInspectResponse, HostConfig, PortBinding, RestartPolicy,
@@ -266,6 +300,7 @@ fn fake_inspect(
         config: Some(ContainerConfig {
             image: Some(image.to_string()),
             labels: Some(label_map),
+            env: (!env.is_empty()).then(|| env.iter().map(|s| s.to_string()).collect()),
             ..Default::default()
         }),
         host_config: Some(HostConfig {
@@ -317,6 +352,49 @@ fn config_from_inspect_roundtrips_basic_fields() {
     assert!(config.restart_unless_stopped);
     assert_eq!(config.workspace, Some(PathBuf::from("/tmp/reach-e2e-ws")));
     assert!(config.profile.is_none());
+    assert_eq!(config.vnc_password, None);
+}
+
+#[test]
+fn config_from_inspect_roundtrips_vnc_password_from_env() {
+    let resp = fake_inspect_with_env(
+        &[
+            (Labels::NAME, "reach-e2e"),
+            (Labels::RESOLUTION, "1280x720"),
+        ],
+        "reach:latest",
+        &[],
+        None,
+        None,
+        false,
+        &["WIDTH=1280", "VNC_PASSWORD=s3cret", "HEIGHT=720"],
+    );
+
+    let fallback = std::path::Path::new("/tmp/unused-profiles");
+    let config = config_from_inspect(&resp, fallback).unwrap();
+
+    assert_eq!(config.vnc_password, Some("s3cret".into()));
+}
+
+#[test]
+fn config_from_inspect_treats_empty_vnc_password_env_as_none() {
+    let resp = fake_inspect_with_env(
+        &[
+            (Labels::NAME, "reach-e2e"),
+            (Labels::RESOLUTION, "1280x720"),
+        ],
+        "reach:latest",
+        &[],
+        None,
+        None,
+        false,
+        &["VNC_PASSWORD="],
+    );
+
+    let fallback = std::path::Path::new("/tmp/unused-profiles");
+    let config = config_from_inspect(&resp, fallback).unwrap();
+
+    assert_eq!(config.vnc_password, None);
 }
 
 #[test]

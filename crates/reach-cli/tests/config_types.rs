@@ -182,3 +182,18 @@ fn workspace_dir_falls_back_to_default() {
     let d = SandboxDefaults::default().resolved_workspace_dir();
     assert!(d.ends_with("reach/workspaces"));
 }
+
+#[test]
+fn vnc_password_defaults_to_none_and_parses_from_toml() {
+    let config = ReachConfig::default();
+    assert_eq!(config.sandbox.vnc_password, None);
+
+    let config: ReachConfig = toml::from_str(
+        r#"
+        [sandbox]
+        vnc_password = "s3cret"
+        "#,
+    )
+    .unwrap();
+    assert_eq!(config.sandbox.vnc_password, Some("s3cret".into()));
+}

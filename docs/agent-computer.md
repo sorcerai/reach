@@ -10,6 +10,7 @@ reach as a persistent, watchable desktop for an AI teammate (hermes).
 | Browser sessions | profile `default` shared by `browse`, `page_text`, `auth_handoff` |
 | Memory cap | `reach create --memory 2.5g` |
 | Always-on | restart policy `unless-stopped` (disable with `--no-restart`) |
+| VNC password | `reach create --vnc-password <pw>` or `sandbox.vnc_password` |
 
 Set `server.public_host` in `~/.config/reach/config.toml` (or `reach serve --public-host`) to the
 address humans reach the host on, e.g. a Tailscale IP.
