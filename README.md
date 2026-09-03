@@ -145,6 +145,7 @@ make image
 
 ## Documentation
 
+- [Agent Computer](docs/agent-computer.md) — configuration, setup, and AI teammate workflows
 - [Architecture](docs/architecture.md)
 - [MCP Tools Reference](docs/mcp-tools.md)
 - [Deployment](docs/deployment.md)
