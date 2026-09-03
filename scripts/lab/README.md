@@ -150,36 +150,58 @@ headless VM.
 `reach-serve.service` sets `Environment=DOCKER_HOST=unix:///run/user/%U/docker.sock`
 directly (systemd user units don't source `~/.profile` or
 `~/.config/environment.d/`, so this mirrors the value `up.sh` exports for
-interactive shells — see "Rootless Docker socket" above).
+interactive shells — see "Rootless Docker socket" above). It also declares
+`After=docker.service` + `Wants=docker.service` (not `After=default.target`
+— see the ordering-cycle note below) so it doesn't race rootless dockerd
+for `/run/user/%U/docker.sock` on a cold boot; without it, reach-serve fails
+once and `Restart=always` recovers it 3s later, which is a strictly worse
+"always-on" than starting clean.
 
 `hermes-gateway.service`'s `After=reach-serve.service` is ordering only, not
 a dependency (`Wants=`) — a fresh `systemctl --user start` can start
 hermes-gateway before reach-serve is ready; `Restart=always` on both units
 converges shortly after either fails.
 
-`hermes-gateway.service` opts into hermes's systemd watchdog: set
-`gateway.systemd_watchdog_seconds: 120` in `~/.hermes/config.yaml` (added by
-`integrations/hermes/config.snippet.yaml` / `hermes-setup.sh`) so hermes
-sends `sd_notify` heartbeats, and the unit runs `Type=notify` +
-`NotifyAccess=main` + `WatchdogSec=120` to match — per hermes's docs
-(`hermes gateway install --force` generates the same shape when this config
-key is set), a plain `Type=simple` unit would never receive the heartbeats
-and the watchdog would do nothing. `TimeoutStartSec=180` gives hermes room
-to load its provider clients before sending `READY=1` — if
-`systemctl --user status hermes-gateway` sits in `activating` past that,
-hermes never sent `READY=1`; check `journalctl --user -u hermes-gateway`.
+**Important — hermes rewrites its own unit file on every start.** hermes's
+`run_gateway()` entrypoint calls `refresh_systemd_unit_if_needed()` on every
+`hermes gateway` startup (`hermes_cli/gateway.py`) and silently overwrites
+`~/.config/systemd/user/hermes-gateway.service` with its own generated
+content whenever ours differs — wiping our checked-in `Description=`,
+`After=reach-serve.service`, and `TimeoutStartSec=180` within a second of
+the process starting. Confirmed live: the base file's content changes to
+hermes's own shape on the very first `hermes gateway` run, every time.
 
-**Important:** hermes's own `run_gateway()` entrypoint calls
-`refresh_systemd_unit_if_needed()` on every `hermes gateway` startup
-(`hermes_cli/gateway.py`) and silently rewrites `~/.config/systemd/user/hermes-gateway.service`
-back to its own generated shape whenever ours differs — wiping our custom
-`Description=`, `After=reach-serve.service`, and `TimeoutStartSec=180`
-within seconds of the process starting. `install-units.sh` therefore also
-installs `integrations/systemd/hermes-gateway.service.d/override.conf` as a
-systemd drop-in: hermes only ever writes the single `hermes-gateway.service`
-file, never a `<unit>.d/` directory, so the drop-in's `After=` and
-`TimeoutStartSec=` survive every hermes self-heal. `systemctl --user cat
-hermes-gateway` shows both fragments merged.
+Two consequences:
+- `install-units.sh` also installs `integrations/systemd/hermes-gateway.service.d/override.conf`
+  as a systemd drop-in: hermes only ever writes the single
+  `hermes-gateway.service` file, never a `<unit>.d/` directory, so the
+  drop-in's `After=reach-serve.service` and `TimeoutStartSec=180` survive
+  every self-heal. `systemctl --user cat hermes-gateway` shows both
+  fragments merged.
+- The watchdog shape (`Type=notify`, `NotifyAccess=main`, `WatchdogSec=120`)
+  in our checked-in `hermes-gateway.service` only matters for the first
+  process start after a fresh install; from then on it's **hermes's own**
+  regenerated unit supplying those directives, driven entirely by
+  `gateway.systemd_watchdog_seconds: 120` in `~/.hermes/config.yaml` (added
+  by `integrations/hermes/config.snippet.yaml` / `hermes-setup.sh`) — per
+  hermes's docs, a plain `Type=simple` unit (the default when that config
+  key is `0`) never receives the `sd_notify` heartbeats and the watchdog
+  does nothing. `TimeoutStartSec=180` (from the drop-in) gives hermes room
+  to load its provider clients before sending `READY=1` — if
+  `systemctl --user status hermes-gateway` sits in `activating` past that,
+  hermes never sent `READY=1`; check `journalctl --user -u hermes-gateway`.
+
+**Also important — a real ordering cycle.** `reach-serve.service` originally
+had `After=default.target` alongside `WantedBy=default.target`; combined
+with `hermes-gateway.service`'s `After=reach-serve.service` (made durable by
+the drop-in above), this is a genuine cycle — a `.target` unit implicitly
+orders itself `After=` everything it `Wants=`, so
+`default.target → hermes-gateway → reach-serve → default.target`. Confirmed
+live: `limactl stop reach-lab && limactl start reach-lab` produced `Found
+ordering cycle` in the user journal and systemd deleted hermes-gateway's
+start job to break it — hermes-gateway never started on that boot.
+`reach-serve.service` no longer has `After=default.target`;
+`WantedBy=default.target` alone is enough to pull it in at boot.
 
 Check status:
 

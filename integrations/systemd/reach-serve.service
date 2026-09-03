@@ -6,6 +6,14 @@ Description=reach MCP server (Agent Computer)
 # hermes-gateway.service, also WantedBy=default.target) declares
 # After=reach-serve.service — observed on a real reach-lab reboot, which
 # silently dropped hermes-gateway's start job to break the cycle.
+#
+# After/Wants=docker.service: reach needs the rootless dockerd socket
+# (/run/user/%U/docker.sock) at start. docker.service isn't ordered after
+# default.target, so this doesn't reintroduce the cycle above. Without it,
+# reach-serve races dockerd on a cold boot and fails once before
+# Restart=always recovers it 3s later — observed on reach-lab.
+After=docker.service
+Wants=docker.service
 
 [Service]
 ExecStart=%h/.cargo/bin/reach serve --sandbox agent-computer
