@@ -4,7 +4,7 @@ set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PATH=/opt/homebrew/bin:$PATH
 limactl list -q | grep -qx reach-lab || limactl start --name=reach-lab --tty=false config/lima/reach-lab.yaml
-limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target /Users/'"$USER"'/repos/reach/ ~/src/reach/ && cd ~/src/reach && [ -x ~/.cargo/bin/reach ] || cargo install --path crates/reach-cli --locked'
+limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target /Users/'"$USER"'/repos/reach/ ~/src/reach/ && cd ~/src/reach && if [ ! -x ~/.cargo/bin/reach ]; then cargo install --path crates/reach-cli --locked; fi'
 limactl shell reach-lab docker image inspect reach:latest >/dev/null 2>&1 || make lab-load
 limactl shell reach-lab bash -lc '
   # rootless Docker CE listens on the per-user socket (uid-scoped), not

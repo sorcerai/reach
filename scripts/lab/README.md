@@ -18,8 +18,14 @@ Docker Desktop, `docker save | limactl shell reach-lab docker load`), writes
 `~/.config/reach/config.toml` inside the VM, and creates the `agent-computer`
 sandbox if it doesn't already exist.
 
-Re-run it any time the source, `config/lima/reach-lab.yaml`, or the sandbox
-image changes.
+Re-run it any time `config/lima/reach-lab.yaml` changes. For speed, the two
+expensive steps are skipped once done once: `cargo install` is skipped if
+`~/.cargo/bin/reach` already exists inside the VM, and `make lab-load` is
+skipped if `reach:latest` is already loaded there. If you change the `reach`
+CLI source or the sandbox image and need a rebuild, force it first:
+`limactl shell reach-lab rm -f ~/.cargo/bin/reach` (CLI) and/or
+`limactl shell reach-lab docker rmi reach:latest reach:arm64` (image),
+then re-run `up.sh`.
 
 ## Bring it down
 
