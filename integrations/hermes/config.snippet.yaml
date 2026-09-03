@@ -2,6 +2,11 @@
 mcp_servers:
   reach:
     url: http://127.0.0.1:4200/mcp
+gateway:
+  # Linux/systemd-only: makes `hermes gateway` send sd_notify heartbeats and
+  # lets the hermes-gateway.service unit run Type=notify with a matching
+  # WatchdogSec, so systemd restarts the process if its event loop stalls.
+  systemd_watchdog_seconds: 120
 # One browser only: the Agent Computer. Drop hermes's own browser ("browser") +
 # host desktop control ("computer_use") toolsets by omitting them here.
 # reach's MCP tools need no toolset entry: mcp_servers below enables them directly.

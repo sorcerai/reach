@@ -1,0 +1,12 @@
+[Unit]
+Description=reach MCP server (Agent Computer)
+After=default.target
+
+[Service]
+ExecStart=%h/.cargo/bin/reach serve --sandbox agent-computer
+Restart=always
+RestartSec=3
+Environment=DOCKER_HOST=unix:///run/user/%U/docker.sock
+
+[Install]
+WantedBy=default.target

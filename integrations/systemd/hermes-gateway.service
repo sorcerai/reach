@@ -1,0 +1,14 @@
+[Unit]
+Description=hermes gateway (cron + platforms)
+After=reach-serve.service
+
+[Service]
+Type=notify
+NotifyAccess=main
+ExecStart=%h/.local/bin/hermes gateway
+Restart=always
+RestartSec=5
+WatchdogSec=120
+
+[Install]
+WantedBy=default.target

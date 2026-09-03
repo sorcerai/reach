@@ -123,3 +123,63 @@ limactl shell reach-lab bash -lc 'nohup reach serve --sandbox agent-computer >/t
 limactl shell reach-lab hermes chat -q "Use page_text to read https://example.com and give me the heading."
 limactl shell reach-lab hermes chat -q "Log me into https://github.com/login using the agent computer, then read my profile name."
 ```
+
+## Always-on
+
+`reach serve` and `hermes gateway` run as systemd **user** units inside
+`reach-lab`, so they survive VM restarts without a login shell and without
+the manual `nohup reach serve ...` step above:
+
+```
+integrations/systemd/reach-serve.service
+integrations/systemd/hermes-gateway.service
+```
+
+Install (from the synced repo inside the guest):
+
+```
+limactl shell reach-lab bash -lc 'cd ~/src/reach && scripts/lab/install-units.sh'
+```
+
+This copies both units into `~/.config/systemd/user/`, runs
+`systemctl --user daemon-reload && systemctl --user enable --now reach-serve
+hermes-gateway`, and `loginctl enable-linger $USER` so the units start at
+boot even before anyone logs in — required because `reach-lab` is a
+headless VM.
+
+`reach-serve.service` sets `Environment=DOCKER_HOST=unix:///run/user/%U/docker.sock`
+directly (systemd user units don't source `~/.profile` or
+`~/.config/environment.d/`, so this mirrors the value `up.sh` exports for
+interactive shells — see "Rootless Docker socket" above).
+
+`hermes-gateway.service` opts into hermes's systemd watchdog: set
+`gateway.systemd_watchdog_seconds: 120` in `~/.hermes/config.yaml` (added by
+`integrations/hermes/config.snippet.yaml` / `hermes-setup.sh`) so hermes
+sends `sd_notify` heartbeats, and the unit runs `Type=notify` +
+`NotifyAccess=main` + `WatchdogSec=120` to match — per hermes's docs
+(`hermes gateway install --force` generates the same shape when this config
+key is set), a plain `Type=simple` unit would never receive the heartbeats
+and the watchdog would do nothing.
+
+Check status:
+
+```
+limactl shell reach-lab systemctl --user is-active reach-serve hermes-gateway   # => active active
+```
+
+### Mac mini autostart
+
+So `reach-lab` itself comes back after the mini reboots (e.g. a power
+outage), install the launchd agent on the mini (not inside the VM):
+
+```
+cp scripts/lab/launchd/ai.reach.lab.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.reach.lab.plist
+launchctl print gui/$(id -u)/ai.reach.lab | head
+```
+
+It runs `limactl start reach-lab` at login (`RunAtLoad`); logs go to
+`~/Library/Logs/reach-lab.{out,err}.log`. Once the VM is up, the systemd
+user units above bring `reach serve`, `hermes gateway`, and (via Docker's
+`unless-stopped` restart policy) the `agent-computer` container back on
+their own — no further manual steps.
