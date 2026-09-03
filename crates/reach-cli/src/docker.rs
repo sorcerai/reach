@@ -763,8 +763,15 @@ impl DockerClient {
         if let Some(image) = image {
             config.image = image;
         }
+        let name = config.name.clone();
         self.destroy(target).await?;
-        self.create(config).await
+        self.create(config).await.with_context(|| {
+            format!(
+                "destroyed sandbox '{name}' but failed to recreate it; its workspace and \
+                 profile directories are intact — rerun `reach recreate` with a valid --image, \
+                 or `reach create --name {name} ...`"
+            )
+        })
     }
 
     pub async fn wait_healthy(&self, target: &str, timeout: Duration) -> Result<()> {
