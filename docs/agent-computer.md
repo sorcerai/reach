@@ -25,7 +25,7 @@ Create `~/.config/reach/config.toml` to tune reach's behavior. All keys are opti
 public_host = "100.124.38.17"    # Host address reachable by humans; default localhost
 
 [sandbox]
-memory = 2684354560              # Memory limit per sandbox in bytes (default ~2.7 GiB)
+memory = 2684354560              # Hard memory cap in bytes (example: 2.5 GiB); default unlimited
 workspace_dir = "/srv/reach/workspaces"  # Host directory for --workspace mounts; default ~/.local/share/reach/workspaces
 shm_size = 536870912             # Shared memory size in bytes; default 512 MiB (536870912)
 profile_dir = "/home/user/.reach/profiles"  # Host directory for persistent Chrome profiles; default ~/.local/share/reach/profiles
