@@ -3,6 +3,7 @@ pub mod create;
 pub mod destroy;
 pub mod exec;
 pub mod list;
+pub mod recreate;
 pub mod screenshot;
 pub mod serve;
 pub mod vnc;
@@ -15,6 +16,8 @@ pub enum Command {
     Create(create::CreateArgs),
     /// Destroy a sandbox container
     Destroy(destroy::DestroyArgs),
+    /// Destroy and recreate a sandbox, keeping its workspace and profile volumes
+    Recreate(recreate::RecreateArgs),
     /// List running sandbox containers
     List,
     /// Attach MCP stdio bridge to a sandbox
@@ -33,6 +36,7 @@ pub async fn run(cmd: Command) -> anyhow::Result<()> {
     match cmd {
         Command::Create(args) => create::run(args).await,
         Command::Destroy(args) => destroy::run(args).await,
+        Command::Recreate(args) => recreate::run(args).await,
         Command::List => list::run().await,
         Command::Connect(args) => connect::run(args).await,
         Command::Exec(args) => exec::run(args).await,

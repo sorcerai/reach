@@ -903,6 +903,24 @@ HTTPServer(('127.0.0.1', 8765), H).serve_forever()
 }
 
 // ═══════════════════════════════════════════════════════════
+// 94. RECREATE (new container, same volumes)
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn t94_recreate_keeps_workspace() {
+    ensure_container();
+    sh_ok("echo keep > /workspace/keep.txt");
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_reach"))
+        .args(["recreate", CONTAINER])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert!(wait_for_health(30));
+    assert_eq!(sh_ok("cat /workspace/keep.txt"), "keep");
+}
+
+// ═══════════════════════════════════════════════════════════
 // 99. SHUTDOWN (must run last)
 // ═══════════════════════════════════════════════════════════
 

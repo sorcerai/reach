@@ -228,6 +228,148 @@ fn labels_for_sandbox_omits_profile_label_when_unset() {
     assert!(!labels.contains_key(Labels::PROFILE));
 }
 
+// ═══════════════════════════════════════════════════════════
+// config_from_inspect (recreate)
+// ═══════════════════════════════════════════════════════════
+
+fn fake_inspect(
+    labels: &[(&str, &str)],
+    image: &str,
+    port_bindings: &[(&str, &str)],
+    memory: Option<i64>,
+    shm_size: Option<i64>,
+    restart_unless_stopped: bool,
+) -> bollard::models::ContainerInspectResponse {
+    use bollard::models::{
+        ContainerConfig, ContainerInspectResponse, HostConfig, PortBinding, RestartPolicy,
+        RestartPolicyNameEnum,
+    };
+    use std::collections::HashMap;
+
+    let mut label_map = HashMap::new();
+    for (k, v) in labels {
+        label_map.insert(k.to_string(), v.to_string());
+    }
+
+    let mut pb_map: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
+    for (container_port, host_port) in port_bindings {
+        pb_map.insert(
+            container_port.to_string(),
+            Some(vec![PortBinding {
+                host_ip: Some("0.0.0.0".into()),
+                host_port: Some(host_port.to_string()),
+            }]),
+        );
+    }
+
+    ContainerInspectResponse {
+        config: Some(ContainerConfig {
+            image: Some(image.to_string()),
+            labels: Some(label_map),
+            ..Default::default()
+        }),
+        host_config: Some(HostConfig {
+            port_bindings: Some(pb_map),
+            memory,
+            shm_size,
+            restart_policy: restart_unless_stopped.then_some(RestartPolicy {
+                name: Some(RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
+            ..Default::default()
+        }),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn config_from_inspect_roundtrips_basic_fields() {
+    let resp = fake_inspect(
+        &[
+            (Labels::NAME, "reach-e2e"),
+            (Labels::RESOLUTION, "1280x720"),
+            (Labels::WORKSPACE, "/tmp/reach-e2e-ws"),
+        ],
+        "reach:latest",
+        &[
+            ("5900/tcp", "15900"),
+            ("6080/tcp", "16080"),
+            ("8400/tcp", "18400"),
+            ("9222/tcp", "19222"),
+        ],
+        Some(2560 * 1024 * 1024),
+        Some(512 * 1024 * 1024),
+        true,
+    );
+
+    let fallback = std::path::Path::new("/tmp/unused-profiles");
+    let config = config_from_inspect(&resp, fallback).unwrap();
+
+    assert_eq!(config.name, "reach-e2e");
+    assert_eq!(config.image, "reach:latest");
+    assert_eq!(config.resolution.to_string(), "1280x720");
+    assert_eq!(config.ports.vnc, 15900);
+    assert_eq!(config.ports.novnc, 16080);
+    assert_eq!(config.ports.health, 18400);
+    assert_eq!(config.ports.extra, vec![(19222, 9222)]);
+    assert_eq!(config.memory, Some(2560 * 1024 * 1024));
+    assert_eq!(config.shm_size, 512 * 1024 * 1024);
+    assert!(config.restart_unless_stopped);
+    assert_eq!(config.workspace, Some(PathBuf::from("/tmp/reach-e2e-ws")));
+    assert!(config.profile.is_none());
+}
+
+#[test]
+fn config_from_inspect_falls_back_to_profile_dir_when_host_missing() {
+    let resp = fake_inspect(
+        &[
+            (Labels::NAME, "reach-e2e"),
+            (Labels::RESOLUTION, "1280x720"),
+            (Labels::PROFILE, "default"),
+        ],
+        "reach:latest",
+        &[],
+        None,
+        None,
+        false,
+    );
+
+    let fallback = std::path::Path::new("/var/lib/reach/profiles");
+    let config = config_from_inspect(&resp, fallback).unwrap();
+
+    let profile = config.profile.expect("profile should round-trip");
+    assert_eq!(profile.name, "default");
+    assert_eq!(
+        profile.host_path,
+        PathBuf::from("/var/lib/reach/profiles/default")
+    );
+    assert!(!config.restart_unless_stopped);
+    assert_eq!(config.memory, None);
+}
+
+#[test]
+fn config_from_inspect_prefers_profile_host_label() {
+    let resp = fake_inspect(
+        &[
+            (Labels::NAME, "reach-e2e"),
+            (Labels::RESOLUTION, "1280x720"),
+            (Labels::PROFILE, "default"),
+            (Labels::PROFILE_HOST, "/custom/profiles/default"),
+        ],
+        "reach:latest",
+        &[],
+        None,
+        None,
+        false,
+    );
+
+    let fallback = std::path::Path::new("/var/lib/reach/profiles");
+    let config = config_from_inspect(&resp, fallback).unwrap();
+
+    let profile = config.profile.expect("profile should round-trip");
+    assert_eq!(profile.host_path, PathBuf::from("/custom/profiles/default"));
+}
+
 #[test]
 fn novnc_url_uses_localhost_pattern() {
     assert_eq!(

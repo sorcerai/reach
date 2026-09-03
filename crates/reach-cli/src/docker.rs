@@ -4,7 +4,9 @@ use bollard::container::{
     StopContainerOptions,
 };
 use bollard::exec::{CreateExecOptions, StartExecResults};
-use bollard::models::{HostConfig, Mount, MountTypeEnum, PortBinding};
+use bollard::models::{
+    ContainerInspectResponse, HostConfig, Mount, MountTypeEnum, PortBinding, RestartPolicyNameEnum,
+};
 use futures::StreamExt;
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -195,6 +197,7 @@ impl Labels {
     pub const CREATED: &str = "reach.created";
     pub const RESOLUTION: &str = "reach.resolution";
     pub const PROFILE: &str = "reach.profile";
+    pub const PROFILE_HOST: &str = "reach.profile_host";
     pub const WORKSPACE: &str = "reach.workspace";
 
     pub fn for_sandbox(config: &SandboxConfig) -> HashMap<String, String> {
@@ -205,6 +208,10 @@ impl Labels {
         labels.insert(Self::RESOLUTION.into(), config.resolution.to_string());
         if let Some(profile) = &config.profile {
             labels.insert(Self::PROFILE.into(), profile.name.clone());
+            labels.insert(
+                Self::PROFILE_HOST.into(),
+                profile.host_path.to_string_lossy().into_owned(),
+            );
         }
         if let Some(ws) = &config.workspace {
             labels.insert(Self::WORKSPACE.into(), ws.to_string_lossy().into_owned());
@@ -239,6 +246,112 @@ pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
         v.push(bind(ws, WORKSPACE_CONTAINER_PATH));
     }
     v
+}
+
+const KNOWN_PORTS: &[&str] = &["5900/tcp", "6080/tcp", "8400/tcp"];
+
+/// Rebuild a [`SandboxConfig`] from a live container's inspect output
+/// (labels + `HostConfig`), so `recreate` can tear a container down and
+/// recreate it with the same settings and volumes.
+///
+/// `fallback_profile_dir` is used only when the container predates the
+/// `reach.profile_host` label (i.e. it has `reach.profile` but not the
+/// host path) — the profile host path is then re-derived from the
+/// standard `<fallback_profile_dir>/<name>` layout.
+pub fn config_from_inspect(
+    resp: &ContainerInspectResponse,
+    fallback_profile_dir: &std::path::Path,
+) -> Result<SandboxConfig> {
+    let cfg = resp
+        .config
+        .as_ref()
+        .context("inspect response missing Config")?;
+    let host_config = resp
+        .host_config
+        .as_ref()
+        .context("inspect response missing HostConfig")?;
+    let labels = cfg.labels.clone().unwrap_or_default();
+
+    let name = labels
+        .get(Labels::NAME)
+        .cloned()
+        .context("container missing reach.name label")?;
+    let image = cfg.image.clone().context("container missing image")?;
+    let resolution = labels
+        .get(Labels::RESOLUTION)
+        .map(|s| Resolution::parse(s))
+        .transpose()?
+        .context("container missing reach.resolution label")?;
+
+    let port_bindings = host_config.port_bindings.clone().unwrap_or_default();
+    let host_port = |container_port: &str| -> Option<u16> {
+        port_bindings
+            .get(container_port)
+            .and_then(|v| v.as_ref())
+            .and_then(|v| v.first())
+            .and_then(|pb| pb.host_port.as_ref())
+            .and_then(|p| p.parse().ok())
+    };
+
+    let ports = SandboxPorts {
+        vnc: host_port("5900/tcp").unwrap_or(5900),
+        novnc: host_port("6080/tcp").unwrap_or(6080),
+        health: host_port("8400/tcp").unwrap_or(8400),
+        extra: port_bindings
+            .iter()
+            .filter(|(container_port, _)| !KNOWN_PORTS.contains(&container_port.as_str()))
+            .filter_map(|(container_port, bindings)| {
+                let host_port: u16 = bindings
+                    .as_ref()?
+                    .first()?
+                    .host_port
+                    .as_ref()?
+                    .parse()
+                    .ok()?;
+                let container_port: u16 = container_port.trim_end_matches("/tcp").parse().ok()?;
+                Some((host_port, container_port))
+            })
+            .collect(),
+    };
+
+    let memory = host_config.memory.filter(|m| *m > 0).map(|m| m as u64);
+    let shm_size = host_config
+        .shm_size
+        .filter(|s| *s > 0)
+        .map(|s| s as u64)
+        .unwrap_or(SandboxConfig::default().shm_size);
+    let restart_unless_stopped = host_config
+        .restart_policy
+        .as_ref()
+        .and_then(|rp| rp.name)
+        .map(|n| n == RestartPolicyNameEnum::UNLESS_STOPPED)
+        .unwrap_or(false);
+
+    let workspace = labels.get(Labels::WORKSPACE).map(PathBuf::from);
+
+    let profile = labels.get(Labels::PROFILE).map(|name| {
+        let host_path = labels
+            .get(Labels::PROFILE_HOST)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| ProfileMount::host_path_for(fallback_profile_dir, name));
+        ProfileMount {
+            name: name.clone(),
+            host_path,
+            container_path: ProfileMount::container_path_for(name),
+        }
+    });
+
+    Ok(SandboxConfig {
+        name,
+        image,
+        resolution,
+        shm_size,
+        ports,
+        profile,
+        workspace,
+        memory,
+        restart_unless_stopped,
+    })
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -624,6 +737,34 @@ impl DockerClient {
             "auth_handoff returned malformed output: {}",
             out.stdout.trim()
         ))
+    }
+
+    /// Rebuild the [`SandboxConfig`] that produced `target`, reading it back
+    /// from Docker's inspect output (labels + `HostConfig`).
+    pub async fn inspect_config(&self, target: &str) -> Result<SandboxConfig> {
+        let sandbox = self.find(target).await?;
+        let resp = self
+            .client
+            .inspect_container(&sandbox.container_id, None)
+            .await
+            .context("failed to inspect container")?;
+        let fallback_profile_dir = crate::config::ReachConfig::load()
+            .sandbox
+            .resolved_profile_dir();
+        config_from_inspect(&resp, &fallback_profile_dir)
+    }
+
+    /// Recreate `target`: read back its config and volumes, destroy the
+    /// container, and create a fresh one with the same settings (host
+    /// bind mounts for `/workspace` and any persisted profile are
+    /// untouched, since `destroy` only removes the container).
+    pub async fn recreate(&self, target: &str, image: Option<String>) -> Result<Sandbox> {
+        let mut config = self.inspect_config(target).await?;
+        if let Some(image) = image {
+            config.image = image;
+        }
+        self.destroy(target).await?;
+        self.create(config).await
     }
 
     pub async fn wait_healthy(&self, target: &str, timeout: Duration) -> Result<()> {
