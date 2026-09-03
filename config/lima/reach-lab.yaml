@@ -1,0 +1,32 @@
+# reach Agent Computer lab VM. Start: limactl start --name=reach-lab config/lima/reach-lab.yaml
+minimumLimaVersion: 2.0.0
+base:
+  - template:docker          # rootless Docker CE, Ubuntu LTS
+vmType: vz
+arch: aarch64
+cpus: 2
+memory: 4GiB
+disk: 30GiB
+mounts:
+  - location: "~/.local/share/reach-lab"   # host dir for /workspace + profiles
+    writable: true
+    mountPoint: /srv/reach
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux
+      apt-get update
+      apt-get install -y build-essential pkg-config libssl-dev curl git xdotool
+      loginctl enable-linger "$(id -un 1000)" || true
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux
+      command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y
+portForwards:
+  - guestPort: 6080
+    hostIP: "100.124.38.17"     # Tailscale only
+    hostPort: 6080
+  - guestPortRange: [1, 65535]
+    ignore: true                # nothing else leaves the VM

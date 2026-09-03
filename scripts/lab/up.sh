@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Bring up reach-lab on the Mac mini, install reach CLI + image, start the Agent Computer.
+set -euo pipefail
+cd "$(dirname "$0")/../.."
+export PATH=/opt/homebrew/bin:$PATH
+limactl list -q | grep -qx reach-lab || limactl start --name=reach-lab --tty=false config/lima/reach-lab.yaml
+limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target /Users/'"$USER"'/repos/reach/ ~/src/reach/ && cd ~/src/reach && [ -x ~/.cargo/bin/reach ] || cargo install --path crates/reach-cli --locked'
+limactl shell reach-lab docker image inspect reach:latest >/dev/null 2>&1 || make lab-load
+limactl shell reach-lab bash -lc '
+  # rootless Docker CE listens on the per-user socket (uid-scoped), not
+  # /var/run/docker.sock; reach (bollard) only reads DOCKER_HOST (config.toml
+  # has no socket wiring), so persist it for every future shell/unit and
+  # export it for this one. The uid must be derived, not hard-coded: Lima
+  # gives the guest user the *host* UID, which varies per machine.
+  sed -i "/^export DOCKER_HOST=/d" ~/.profile 2>/dev/null || true
+  echo "export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock" >> ~/.profile
+  export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
+  mkdir -p ~/.config/reach /srv/reach/workspaces /srv/reach/profiles
+  cat > ~/.config/reach/config.toml <<EOF
+[server]
+public_host = "100.124.38.17"
+[sandbox]
+memory = 2684354560
+workspace_dir = "/srv/reach/workspaces"
+profile_dir = "/srv/reach/profiles"
+EOF
+  reach list | grep -q agent-computer || reach create --name agent-computer --workspace --persist-profile default --memory 2.5g
+'
+echo "Live view: http://100.124.38.17:6080/vnc.html?autoconnect=1&resize=remote"
