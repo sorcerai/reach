@@ -124,6 +124,22 @@ limactl shell reach-lab hermes chat -q "Use page_text to read https://example.co
 limactl shell reach-lab hermes chat -q "Log me into https://github.com/login using the agent computer, then read my profile name."
 ```
 
+### Create and test a routine
+
+After authentication, create a cron job from the routine template and trigger it:
+
+```
+limactl shell reach-lab bash -lc 'cd ~/src/reach && bash integrations/hermes/routines/daily-check.sh'
+```
+
+This outputs a job ID. To trigger it manually (for testing, since it's scheduled for 08:00):
+
+```
+limactl shell reach-lab hermes cron trigger <job-id>
+```
+
+Results land in `/srv/reach/workspaces/agent-computer/reports/` (mounted from `/workspace/reports/` inside the sandbox) and are delivered back to the creating chat via `--deliver origin`.
+
 ## Always-on
 
 `reach serve` and `hermes gateway` run as systemd **user** units inside

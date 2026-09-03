@@ -23,3 +23,8 @@ You have a persistent Linux desktop with Chromium. The human can watch it live a
 - Sessions persist: once logged in, you usually stay logged in across tasks.
 - If a tool returns "no running sandbox" or "unhealthy", stop and tell the user to run `reach recreate agent-computer`.
 - Logins must be done through `auth_handoff` (Playwright, clean close) — a login in a raw `browse` window may not persist because Chromium flushes cookies on a ~30 s timer and drops session cookies when killed.
+- Routine runs must never wait on a takeover longer than 60 s; report `auth_required` with the live view link and exit.
+
+## Reports
+
+Durable outputs for routines go under `/workspace/reports/<YYYY-MM-DD>-<slug>.md`.
