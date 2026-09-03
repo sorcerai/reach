@@ -83,3 +83,44 @@ and persists it two ways: in the guest's `~/.profile` for interactive login
 shells, and in `~/.config/environment.d/60-docker-host.conf` for systemd
 user units (a later task's `reach serve` unit included), since those don't
 source shell rc files.
+
+## hermes
+
+`scripts/lab/hermes-setup.sh` installs hermes inside `reach-lab` (guest-only,
+under the guest's own `~/.hermes` — never touches the mini's own `~/.hermes`,
+which runs the live WhatsApp hermes on macOS) and merges
+`integrations/hermes/config.snippet.yaml` into the guest's
+`~/.hermes/config.yaml`, plus copies `integrations/hermes/skills/agent-computer/`
+into the guest's `~/.hermes/skills/`. It re-syncs `~/src/reach` on the mini
+itself; sync the mini first (`rsync -a --delete --exclude target
+--exclude .superpowers --exclude .beads /Users/ahpramesi/repos/reach/
+ariaserver@100.124.38.17:repos/reach/`) if you're running it from the Mac
+mini's own checkout in `~/repos/reach`.
+
+Known issue found while wiring this up: `reach serve`'s MCP `initialize`
+response uses snake_case field names (`protocol_version`, `server_info`)
+where the MCP spec (and every real MCP client, hermes's Python SDK included)
+requires camelCase (`protocolVersion`, `serverInfo`). This is a bug in
+`crates/reach-cli/src/mcp.rs`'s `McpInitializeResult` (missing `#[serde(rename
+= "...")]` on those two fields), not something this script works around.
+Until it's fixed, `hermes mcp test reach` (and any real MCP-SDK client) fails
+initialize with a Pydantic validation error, even though the raw JSON-RPC
+`tools/list` call over `curl` works fine.
+
+### Next: authenticate hermes
+
+hermes needs an interactive login this script cannot do for you:
+
+```
+export PATH=/opt/homebrew/bin:$PATH
+limactl shell reach-lab hermes auth      # pick a hosted provider (e.g. openai-codex / zai / openrouter)
+limactl shell reach-lab hermes model     # select the model to use
+```
+
+Once fixed and authenticated, verify with:
+
+```
+limactl shell reach-lab bash -lc 'nohup reach serve --sandbox agent-computer >/tmp/reach-serve.log 2>&1 &'
+limactl shell reach-lab hermes chat -q "Use page_text to read https://example.com and give me the heading."
+limactl shell reach-lab hermes chat -q "Log me into https://github.com/login using the agent computer, then read my profile name."
+```
