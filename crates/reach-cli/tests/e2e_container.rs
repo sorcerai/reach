@@ -114,6 +114,18 @@ impl Drop for ChildGuard {
     }
 }
 
+/// Kills a process matching `pattern` inside the container on drop (even if
+/// a later assertion panics), so backgrounded helper processes (servers
+/// started with `nohup ... & disown`) don't leak into later tests. Use the
+/// bracket-class idiom (e.g. `"[c]ookie.py"`) so the pkill invocation's own
+/// argv doesn't self-match.
+struct ContainerProcGuard(&'static str);
+impl Drop for ContainerProcGuard {
+    fn drop(&mut self) {
+        let _ = sh(&format!("pkill -f '{}' || true", self.0));
+    }
+}
+
 fn mcp_call(port: u16, name: &str, args: serde_json::Value) -> String {
     let body = serde_json::json!({
         "jsonrpc": "2.0",
@@ -824,7 +836,12 @@ HTTPServer(('127.0.0.1', 8765), H).serve_forever()
         assert!(cp.status.success(), "docker cp failed: {}", stderr(&cp));
         let _ = std::fs::remove_file(&tmp);
     }
+    // Clear any stale server from a previous aborted run before claiming
+    // the port, and guarantee this one is gone by the time the test exits
+    // (pass or panic) so it doesn't linger for later tests.
+    let _ = sh("pkill -f '[c]ookie.py' || true");
     sh_ok("nohup python3 /tmp/cookie.py >/dev/null 2>&1 & disown");
+    let _guard = ContainerProcGuard("[c]ookie.py");
     sleep_ms(500);
 
     let profile = "/home/sandbox/.config/google-chrome-profiles/default";
