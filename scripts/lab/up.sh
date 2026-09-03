@@ -7,13 +7,18 @@ limactl list -q | grep -qx reach-lab || limactl start --name=reach-lab --tty=fal
 limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target /Users/'"$USER"'/repos/reach/ ~/src/reach/ && cd ~/src/reach && if [ ! -x ~/.cargo/bin/reach ]; then cargo install --path crates/reach-cli --locked; fi'
 limactl shell reach-lab docker image inspect reach:latest >/dev/null 2>&1 || make lab-load
 limactl shell reach-lab bash -lc '
+  set -e
   # rootless Docker CE listens on the per-user socket (uid-scoped), not
   # /var/run/docker.sock; reach (bollard) only reads DOCKER_HOST (config.toml
   # has no socket wiring), so persist it for every future shell/unit and
   # export it for this one. The uid must be derived, not hard-coded: Lima
   # gives the guest user the *host* UID, which varies per machine.
+  # ~/.profile covers interactive login shells; systemd user units (a later
+  # task) do not source it, so also drop it in environment.d for those.
   sed -i "/^export DOCKER_HOST=/d" ~/.profile 2>/dev/null || true
   echo "export DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock" >> ~/.profile
+  mkdir -p ~/.config/environment.d
+  echo "DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock" > ~/.config/environment.d/60-docker-host.conf
   export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
   mkdir -p ~/.config/reach /srv/reach/workspaces /srv/reach/profiles
   cat > ~/.config/reach/config.toml <<EOF

@@ -79,5 +79,7 @@ mini it's 501. `reach` (via bollard) connects with
 env var — `sandbox.socket` in `config.toml` is parsed but not currently
 wired up (a candidate small fix for a later task). `up.sh` derives the uid
 with `id -u`, exports `DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock`,
-and persists it in the guest's `~/.profile` so every future login shell (and
-any systemd user unit that sources it) picks it up too.
+and persists it two ways: in the guest's `~/.profile` for interactive login
+shells, and in `~/.config/environment.d/60-docker-host.conf` for systemd
+user units (a later task's `reach serve` unit included), since those don't
+source shell rc files.
