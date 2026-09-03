@@ -3,7 +3,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 export PATH=/opt/homebrew/bin:$PATH
-limactl list -q | grep -qx reach-lab || limactl start --name=reach-lab --tty=false config/lima/reach-lab.yaml
+if limactl list reach-lab --format '{{.Status}}' 2>/dev/null | grep -qx Running; then
+  :
+elif limactl list -q | grep -qx reach-lab; then
+  limactl start reach-lab
+else
+  limactl start --name=reach-lab --tty=false config/lima/reach-lab.yaml
+fi
 limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target /Users/'"$USER"'/repos/reach/ ~/src/reach/ && cd ~/src/reach && if [ ! -x ~/.cargo/bin/reach ]; then cargo install --path crates/reach-cli --locked; fi'
 limactl shell reach-lab docker image inspect reach:latest >/dev/null 2>&1 || make lab-load
 limactl shell reach-lab bash -lc '

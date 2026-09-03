@@ -63,7 +63,12 @@ pub struct CreateArgs {
     #[arg(long, value_parser = parse_memory)]
     pub memory: Option<u64>,
 
-    /// Do not set the `unless-stopped` restart policy
+    /// Do not set the `unless-stopped` restart policy.
+    ///
+    /// The restart policy is only applied when `--workspace` is set (an
+    /// ephemeral sandbox without a workspace has nothing durable to survive
+    /// a restart into, so it defaults off). Pass this flag to opt out even
+    /// when `--workspace` is set.
     #[arg(long)]
     pub no_restart: bool,
 
@@ -104,6 +109,9 @@ pub fn parse_memory(s: &str) -> Result<u64, String> {
     let n: f64 = num
         .parse()
         .map_err(|_| format!("invalid memory size {s:?}"))?;
+    if !n.is_finite() || n < 0.0 {
+        return Err(format!("invalid memory size {s:?}"));
+    }
     Ok((n * mult) as u64)
 }
 
@@ -151,7 +159,7 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         profile,
         workspace: workspace.clone(),
         memory,
-        restart_unless_stopped: !args.no_restart,
+        restart_unless_stopped: workspace.is_some() && !args.no_restart,
         vnc_password: vnc_password.clone(),
     };
 
@@ -277,5 +285,8 @@ mod tests {
         assert_eq!(parse_memory("2.5G").unwrap(), 2_684_354_560);
         assert_eq!(parse_memory("1024").unwrap(), 1024);
         assert!(parse_memory("lots").is_err());
+        assert!(parse_memory("-5g").is_err());
+        assert!(parse_memory("nan").is_err());
+        assert!(parse_memory("inf").is_err());
     }
 }

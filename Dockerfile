@@ -71,7 +71,8 @@ RUN pip install --break-system-packages \
     websockify \
     && playwright install-deps chromium \
     && playwright install chromium \
-    && scrapling install
+    && scrapling install \
+    && rm -rf /var/lib/apt/lists/*
 
 # Layer 5: noVNC
 RUN git_url="https://github.com/novnc/noVNC.git" && \
