@@ -8,7 +8,7 @@ reach is an AI-drivable containerized desktop sandbox. It provides three things:
 2. A Rust CLI (`reach`) that manages sandbox containers from the host
 3. An MCP server (`reach serve`) that exposes sandbox tools to AI agents via SSE
 
-Current phase: **Phase 1 -- container desktop (complete), entering Phase 2**. All 8 CLI commands are implemented, the type system is designed (5 layers, 1197 lines), 10 MCP tools are implemented (including `page_text` and `auth_handoff` for JS-heavy SPAs and login handoffs), and e2e tests pass (Phase 1: 88 tests, +3 e2e tests for the new tools).
+Current phase: **Phase 1 -- container desktop (complete), entering Phase 2**. All 9 CLI commands are implemented (including `recreate`, which replaces a sandbox's container while keeping its /workspace and profile volumes), the type system is designed (5 layers, 1197 lines), 11 MCP tools are implemented (including `page_text` and `auth_handoff` for JS-heavy SPAs and login handoffs), and e2e tests pass (99 unit + 45 e2e).
 
 ## Tech Stack
 

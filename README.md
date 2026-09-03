@@ -17,10 +17,10 @@ reach gives AI agents a full Linux desktop inside Docker -- with a browser, scre
 | Area | Status |
 |------|--------|
 | Type system | Done -- 5 layers, 1197 lines |
-| CLI commands | All 8 implemented and working |
+| CLI commands | All 9 implemented and working |
 | MCP tools | All 11 implemented |
 | Docker image | Builds and runs (e2e tested) |
-| Tests | 88 passing (52 unit + 36 e2e) |
+| Tests | 144 passing (99 unit + 45 e2e) |
 | Scrapling | Compatible with 0.4.3 API (Fetcher/StealthyFetcher with `.get()`) |
 
 **Coming next (Phase 2):**
@@ -77,16 +77,17 @@ reach destroy my-sandbox
 reach serve --port 4200
 
 # Run tests
-make test                     # 52 unit tests
-cargo test --workspace -- --ignored   # 36 e2e tests (requires Docker)
+make test                     # 99 unit tests
+cargo test --workspace -- --ignored   # 45 e2e tests (requires Docker)
 ```
 
-## CLI Commands (all 8 implemented)
+## CLI Commands (all 9 implemented)
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
-| `reach create` | Create a new sandbox container | `--name`, `--resolution`, `--workspace`, `--memory`, `--no-restart` |
+| `reach create` | Create a new sandbox container | `--name`, `--resolution`, `--workspace`, `--memory`, `--no-restart`, `--vnc-password` |
 | `reach destroy` | Destroy a sandbox container | `<target>` |
+| `reach recreate` | Replace a sandbox's container, keeping /workspace and profile volumes | `<target>`, `--image` |
 | `reach list` | List running sandbox containers | -- |
 | `reach connect` | Attach MCP stdio bridge to a sandbox | `<target>` |
 | `reach exec` | Run a command inside a sandbox | `<target> -- <command>` |

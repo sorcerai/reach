@@ -131,12 +131,29 @@ Phase 3 (agent API, the hermes contract):
 Phase 1 (no code in hermes):
 
 ```yaml
-# ~/.hermes/config.yaml in reach-lab
+# Merge into ~/.hermes/config.yaml inside reach-lab.
 mcp_servers:
   reach:
     url: http://127.0.0.1:4200/mcp
-    transport: sse
+gateway:
+  # Linux/systemd-only: makes `hermes gateway` send sd_notify heartbeats and
+  # lets the hermes-gateway.service unit run Type=notify with a matching
+  # WatchdogSec, so systemd restarts the process if its event loop stalls.
+  systemd_watchdog_seconds: 120
+# One browser only: the Agent Computer. Drop hermes's own browser ("browser") +
+# host desktop control ("computer_use") toolsets by omitting them here.
+# reach's MCP tools need no toolset entry: mcp_servers below enables them directly.
+platform_toolsets:
+  cli: [web, terminal, file, skills, todo, cronjob, memory, vision, delegation]
+terminal:
+  backend: local
+  cwd: /srv/reach/workspaces/agent-computer
 ```
+
+Superseded during implementation: hermes has no `mcp` toolset, the coding
+toolset is `delegation`, and reach's `/mcp` is used as Streamable HTTP (no
+`transport` key). See `integrations/hermes/config.snippet.yaml` for the
+shipped config.
 
 Built-in `browser` toolset disabled for this profile so the model has one
 browser, the Agent Computer. `computer_use` (cua-driver) disabled.
