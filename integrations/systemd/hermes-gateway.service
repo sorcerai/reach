@@ -9,6 +9,9 @@ ExecStart=%h/.local/bin/hermes gateway
 Restart=always
 RestartSec=5
 WatchdogSec=120
+# Type=notify's default start timeout is short; hermes can take a while to
+# load its provider clients and send READY=1, so give it more room.
+TimeoutStartSec=180
 
 [Install]
 WantedBy=default.target

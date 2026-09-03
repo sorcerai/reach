@@ -152,6 +152,11 @@ directly (systemd user units don't source `~/.profile` or
 `~/.config/environment.d/`, so this mirrors the value `up.sh` exports for
 interactive shells — see "Rootless Docker socket" above).
 
+`hermes-gateway.service`'s `After=reach-serve.service` is ordering only, not
+a dependency (`Wants=`) — a fresh `systemctl --user start` can start
+hermes-gateway before reach-serve is ready; `Restart=always` on both units
+converges shortly after either fails.
+
 `hermes-gateway.service` opts into hermes's systemd watchdog: set
 `gateway.systemd_watchdog_seconds: 120` in `~/.hermes/config.yaml` (added by
 `integrations/hermes/config.snippet.yaml` / `hermes-setup.sh`) so hermes
@@ -159,7 +164,22 @@ sends `sd_notify` heartbeats, and the unit runs `Type=notify` +
 `NotifyAccess=main` + `WatchdogSec=120` to match — per hermes's docs
 (`hermes gateway install --force` generates the same shape when this config
 key is set), a plain `Type=simple` unit would never receive the heartbeats
-and the watchdog would do nothing.
+and the watchdog would do nothing. `TimeoutStartSec=180` gives hermes room
+to load its provider clients before sending `READY=1` — if
+`systemctl --user status hermes-gateway` sits in `activating` past that,
+hermes never sent `READY=1`; check `journalctl --user -u hermes-gateway`.
+
+**Important:** hermes's own `run_gateway()` entrypoint calls
+`refresh_systemd_unit_if_needed()` on every `hermes gateway` startup
+(`hermes_cli/gateway.py`) and silently rewrites `~/.config/systemd/user/hermes-gateway.service`
+back to its own generated shape whenever ours differs — wiping our custom
+`Description=`, `After=reach-serve.service`, and `TimeoutStartSec=180`
+within seconds of the process starting. `install-units.sh` therefore also
+installs `integrations/systemd/hermes-gateway.service.d/override.conf` as a
+systemd drop-in: hermes only ever writes the single `hermes-gateway.service`
+file, never a `<unit>.d/` directory, so the drop-in's `After=` and
+`TimeoutStartSec=` survive every hermes self-heal. `systemctl --user cat
+hermes-gateway` shows both fragments merged.
 
 Check status:
 

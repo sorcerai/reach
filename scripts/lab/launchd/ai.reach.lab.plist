@@ -12,6 +12,11 @@
 	</array>
 	<key>RunAtLoad</key>
 	<true/>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+	</dict>
 	<key>StandardOutPath</key>
 	<string>/Users/ariaserver/Library/Logs/reach-lab.out.log</string>
 	<key>StandardErrorPath</key>

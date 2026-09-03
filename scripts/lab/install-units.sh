@@ -8,9 +8,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
-mkdir -p ~/.config/systemd/user
+mkdir -p ~/.config/systemd/user ~/.config/systemd/user/hermes-gateway.service.d
 cp integrations/systemd/reach-serve.service ~/.config/systemd/user/
 cp integrations/systemd/hermes-gateway.service ~/.config/systemd/user/
+# Drop-in for settings hermes's own self-heal (run_gateway() calls
+# refresh_systemd_unit_if_needed() on every start) would otherwise wipe from
+# the base unit above — see the comment in the drop-in file itself.
+cp integrations/systemd/hermes-gateway.service.d/override.conf \
+  ~/.config/systemd/user/hermes-gateway.service.d/
 
 systemctl --user daemon-reload
 systemctl --user enable --now reach-serve hermes-gateway

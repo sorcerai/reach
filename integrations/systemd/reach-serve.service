@@ -1,6 +1,11 @@
 [Unit]
 Description=reach MCP server (Agent Computer)
-After=default.target
+# No After=default.target: WantedBy=default.target below already pulls this
+# unit in and default.target waits for it, so After=default.target here
+# would create an ordering cycle the moment anything else (e.g.
+# hermes-gateway.service, also WantedBy=default.target) declares
+# After=reach-serve.service — observed on a real reach-lab reboot, which
+# silently dropped hermes-gateway's start job to break the cycle.
 
 [Service]
 ExecStart=%h/.cargo/bin/reach serve --sandbox agent-computer
