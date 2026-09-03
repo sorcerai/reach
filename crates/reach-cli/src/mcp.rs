@@ -68,6 +68,7 @@ impl JsonRpcResponse {
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct McpInitializeResult {
     pub protocol_version: String,
     pub capabilities: ServerCapabilities,
@@ -75,16 +76,19 @@ pub struct McpInitializeResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerCapabilities {
     pub tools: ToolCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ToolCapabilities {
     pub list_changed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ServerInfo {
     pub name: String,
     pub version: String,

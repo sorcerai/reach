@@ -56,6 +56,15 @@ fn mcp_initialize_default_has_correct_protocol_version() {
     assert_eq!(init.server_info.name, "reach");
 }
 
+#[test]
+fn initialize_result_serializes_camel_case_per_mcp_spec() {
+    let v = serde_json::to_value(McpInitializeResult::default()).unwrap();
+    assert_eq!(v["protocolVersion"], "2024-11-05");
+    assert!(v["serverInfo"]["name"].is_string());
+    assert_eq!(v["capabilities"]["tools"]["listChanged"], false);
+    assert!(v.get("protocol_version").is_none());
+}
+
 // ═══════════════════════════════════════════════════════════
 // Tool definitions — completeness and schema correctness
 // ═══════════════════════════════════════════════════════════
