@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Install the reach-serve + hermes-gateway user units inside reach-lab and
-# enable them so they (a) start now and (b) survive VM restarts, plus linger
-# so they start at boot even with no interactive login session.
+# Run INSIDE reach-lab (unlike hermes-setup.sh, which runs on the mini and
+# shells in): limactl shell reach-lab bash -lc 'cd ~/src/reach && scripts/lab/install-units.sh'
+#
+# Installs the reach-serve + hermes-gateway user units and enables them so
+# they (a) start now and (b) survive VM restarts, plus linger so they start
+# at boot even with no interactive login session.
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
