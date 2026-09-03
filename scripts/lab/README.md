@@ -97,15 +97,14 @@ itself; sync the mini first (`rsync -a --delete --exclude target
 ariaserver@100.124.38.17:repos/reach/`) if you're running it from the Mac
 mini's own checkout in `~/repos/reach`.
 
-Known issue found while wiring this up: `reach serve`'s MCP `initialize`
-response uses snake_case field names (`protocol_version`, `server_info`)
-where the MCP spec (and every real MCP client, hermes's Python SDK included)
-requires camelCase (`protocolVersion`, `serverInfo`). This is a bug in
-`crates/reach-cli/src/mcp.rs`'s `McpInitializeResult` (missing `#[serde(rename
-= "...")]` on those two fields), not something this script works around.
-Until it's fixed, `hermes mcp test reach` (and any real MCP-SDK client) fails
-initialize with a Pydantic validation error, even though the raw JSON-RPC
-`tools/list` call over `curl` works fine.
+`reach serve`'s MCP `initialize` response previously serialized snake_case
+field names (`protocol_version`, `server_info`), which broke the MCP spec's
+required camelCase and failed the handshake for every real MCP client,
+hermes's Python SDK included. Fixed in `crates/reach-cli/src/mcp.rs`
+(`McpInitializeResult` now serializes `protocolVersion`/`serverInfo`); confirm
+your guest has it with `cargo install --path crates/reach-cli --locked
+--force` after syncing, then `hermes mcp test reach` should report
+`✓ Connected` with 11 tools discovered.
 
 ### Next: authenticate hermes
 
@@ -117,7 +116,7 @@ limactl shell reach-lab hermes auth      # pick a hosted provider (e.g. openai-c
 limactl shell reach-lab hermes model     # select the model to use
 ```
 
-Once fixed and authenticated, verify with:
+Once authenticated, verify with:
 
 ```
 limactl shell reach-lab bash -lc 'nohup reach serve --sandbox agent-computer >/tmp/reach-serve.log 2>&1 &'
