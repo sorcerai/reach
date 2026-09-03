@@ -168,6 +168,10 @@ Navigate Chrome to a URL.
     "url": {
       "type": "string",
       "description": "URL to navigate to"
+    },
+    "use_profile": {
+      "type": "string",
+      "description": "Persistent Chrome profile name (see `reach create --persist-profile`); defaults to 'default'"
     }
   },
   "required": ["url"]
@@ -180,12 +184,13 @@ Navigate Chrome to a URL.
 {
   "name": "browse",
   "arguments": {
-    "url": "https://example.com"
+    "url": "https://example.com",
+    "use_profile": "default"
   }
 }
 ```
 
-**Implementation:** Launches or navigates the headed Chrome instance on the virtual display. The page is visible through VNC/noVNC.
+**Implementation:** Launches or navigates the headed Chrome instance on the virtual display through the `reach-chrome` wrapper (Google Chrome on amd64, Playwright Chromium on arm64). The page is visible through VNC/noVNC.
 
 ---
 
@@ -462,5 +467,52 @@ Run a shell command inside the sandbox.
   "stdout": "total 4\ndrwxr-xr-x 2 sandbox sandbox 4096 ...",
   "stderr": "",
   "exit_code": 0
+}
+```
+
+---
+
+## live_view
+
+Get the noVNC URL and display information for watching the sandbox's screen.
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "sandbox": {
+      "type": "string",
+      "description": "Sandbox name (optional)"
+    },
+    "screen": {
+      "type": "integer",
+      "description": "Screen number (optional; must be 0 for now)"
+    }
+  },
+  "required": []
+}
+```
+
+**Example call:**
+
+```json
+{
+  "name": "live_view",
+  "arguments": {
+    "screen": 0
+  }
+}
+```
+
+**Returns:** JSON with the noVNC URL, display information, and server status.
+
+```json
+{
+  "novnc_url": "http://localhost:6080/vnc.html?autoconnect=1&resize=remote",
+  "screen": 0,
+  "display": ":99",
+  "busy": false
 }
 ```

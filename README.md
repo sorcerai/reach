@@ -18,7 +18,7 @@ reach gives AI agents a full Linux desktop inside Docker -- with a browser, scre
 |------|--------|
 | Type system | Done -- 5 layers, 1197 lines |
 | CLI commands | All 8 implemented and working |
-| MCP tools | All 8 implemented |
+| MCP tools | All 11 implemented |
 | Docker image | Builds and runs (e2e tested) |
 | Tests | 88 passing (52 unit + 36 e2e) |
 | Scrapling | Compatible with 0.4.3 API (Fetcher/StealthyFetcher with `.get()`) |
@@ -85,16 +85,16 @@ cargo test --workspace -- --ignored   # 36 e2e tests (requires Docker)
 
 | Command | Description | Key Flags |
 |---------|-------------|-----------|
-| `reach create` | Create a new sandbox container | `--name`, `--resolution` |
+| `reach create` | Create a new sandbox container | `--name`, `--resolution`, `--workspace`, `--memory`, `--no-restart` |
 | `reach destroy` | Destroy a sandbox container | `<target>` |
 | `reach list` | List running sandbox containers | -- |
 | `reach connect` | Attach MCP stdio bridge to a sandbox | `<target>` |
 | `reach exec` | Run a command inside a sandbox | `<target> -- <command>` |
-| `reach serve` | Start MCP SSE server | `--port` (default: 4200) |
+| `reach serve` | Start MCP SSE server | `--port` (default: 4200), `--public-host` |
 | `reach vnc` | Open noVNC in browser | `<target>` |
 | `reach screenshot` | Capture a screenshot | `<target>`, `-o/--output` |
 
-## MCP Tools (all 8 implemented)
+## MCP Tools (all 11 implemented)
 
 These tools are exposed by `reach serve` to AI agents:
 
@@ -104,10 +104,13 @@ These tools are exposed by `reach serve` to AI agents:
 | `click` | Click at screen coordinates | `x`, `y`, `button` |
 | `type` | Type text via keyboard | `text` |
 | `key` | Send a key combination | `keys` (e.g. "ctrl+c") |
-| `browse` | Navigate Chrome to a URL | `url` |
+| `browse` | Navigate Chrome to a URL | `url`, `use_profile` |
 | `scrape` | Extract structured content from a page (Scrapling Fetcher/StealthyFetcher `.get()`) | `url`, `selector` |
 | `playwright_eval` | Execute Playwright script | `script` |
+| `page_text` | Load URL with Playwright and extract visible text | `url`, `use_profile` |
+| `auth_handoff` | Pause at login screen and return noVNC URL | `url`, `wait_for_selector`, `use_profile` |
 | `exec` | Run a shell command in the sandbox | `command` |
+| `live_view` | Get noVNC URL and display information | `screen` |
 
 ## Ports
 

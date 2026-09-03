@@ -107,10 +107,11 @@ GitHub Actions workflows in `.github/workflows/`:
 7. When adding a new CLI command, add the variant to `commands/mod.rs` and create the corresponding module.
 8. When adding a new supervised process, add it to `processes.rs` in reach-supervisor.
 9. Python helpers that run inside the container should be embedded as `pub const` strings in `docker.rs` (see `PAGE_TEXT_SCRIPT` / `AUTH_HANDOFF_SCRIPT`) so the binary stays self-contained.
+10. All MCP tools are dispatched from `crates/reach-cli/src/tools.rs`; `serve` and `connect` are transports only.
 
 ## Persistent Chrome Profiles
 
-`reach create --persist-profile <name>` mounts `~/.local/share/reach/profiles/<name>` (host) into the container at `/home/sandbox/.config/google-chrome-profiles/<name>`. The host root is overridable via `sandbox.profile_dir` in `~/.config/reach/config.toml`. Pass the same profile name to `page_text` / `auth_handoff` via `use_profile` so a one-time login carries across sandbox restarts.
+`reach create --persist-profile <name>` mounts `~/.local/share/reach/profiles/<name>` (host) into the container at `/home/sandbox/.config/google-chrome-profiles/<name>`. The host root is overridable via `sandbox.profile_dir` in `~/.config/reach/config.toml`. Pass the same profile name to `page_text` / `auth_handoff` via `use_profile` so a one-time login carries across sandbox restarts. The tools `browse`, `page_text`, and `auth_handoff` all default to the persistent profile `default`, so logins are automatically shared across these tools.
 
 
 <!-- BEGIN BEADS INTEGRATION v:1 profile:minimal hash:1105d646 -->
