@@ -136,6 +136,11 @@ impl AgentState {
             *count > 0
         };
 
+        const MAX_SCREENS: u32 = 64;
+        if screen >= MAX_SCREENS {
+            return;
+        }
+
         let mut screens = self.screens.lock().unwrap();
         if (screen as usize) >= screens.len() {
             for id in (screens.len() as u32)..=screen {
@@ -180,6 +185,11 @@ impl AgentState {
             }
         }
         let is_busy = self.is_busy(screen);
+        const MAX_SCREENS: u32 = 64;
+        if screen >= MAX_SCREENS {
+            return;
+        }
+
         let mut screens = self.screens.lock().unwrap();
         if (screen as usize) >= screens.len() {
             for id in (screens.len() as u32)..=screen {
