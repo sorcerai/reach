@@ -1036,6 +1036,102 @@ fn rfb_security_types(port: u16) -> Vec<u8> {
 }
 
 // ═══════════════════════════════════════════════════════════
+// 96. COOKIE SHARING ACROSS SCREENS VIA STORAGE_STATE
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+#[ignore]
+fn t96_cookie_set_on_screen0_visible_on_screen1() {
+    ensure_container();
+    let _ = sh("pkill -f chrome");
+    sleep_ms(500);
+
+    // Setup local cookie server on 8766
+    let cookie_server = r#"
+from http.server import BaseHTTPRequestHandler, HTTPServer
+class H(BaseHTTPRequestHandler):
+    def do_GET(self):
+        c = self.headers.get('Cookie', '')
+        self.send_response(200)
+        self.send_header('Set-Cookie', 'reach=yes; Path=/; Max-Age=86400')
+        self.send_header('Content-Type', 'text/html')
+        self.end_headers()
+        self.wfile.write(('<body>cookie=[%s]</body>' % c).encode())
+HTTPServer(('127.0.0.1', 8766), H).serve_forever()
+"#;
+    {
+        use std::io::Write;
+        let mut tmp = std::env::temp_dir();
+        tmp.push("reach_e2e_cookie_server_8766.py");
+        std::fs::File::create(&tmp)
+            .unwrap()
+            .write_all(cookie_server.as_bytes())
+            .unwrap();
+        let cp = docker(&[
+            "cp",
+            &tmp.to_string_lossy(),
+            &format!("{CONTAINER}:/tmp/cookie_8766.py"),
+        ]);
+        assert!(cp.status.success(), "docker cp failed: {}", stderr(&cp));
+        let _ = std::fs::remove_file(&tmp);
+    }
+    let _ = sh("pkill -f '[c]ookie_8766.py' || true");
+    sh_ok("nohup python3 /tmp/cookie_8766.py >/dev/null 2>&1 & disown");
+    let _guard = ContainerProcGuard("[c]ookie_8766.py");
+    sleep_ms(500);
+
+    // Clean any prior state file
+    sh_ok("rm -f /workspace/.reach/state.json");
+
+    // Authenticate on screen 0 via auth_handoff
+    let payload_auth = serde_json::json!({
+        "url": "http://127.0.0.1:8766/",
+        "wait_for_url_contains": "/",
+        "timeout_seconds": 15,
+        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/default",
+    });
+    let stdout_auth = run_embedded_python(
+        "REACH_AUTH_HANDOFF_PAYLOAD",
+        &payload_auth,
+        reach_cli::docker::AUTH_HANDOFF_SCRIPT,
+    );
+    let parsed_auth = last_json(&stdout_auth);
+    assert_eq!(
+        parsed_auth["status"], "authenticated",
+        "auth_handoff failed: {stdout_auth}"
+    );
+
+    // Verify /workspace/.reach/state.json exists
+    assert_eq!(
+        sh_code("test -f /workspace/.reach/state.json"),
+        0,
+        "state.json was not created"
+    );
+
+    // Now on screen 1, read using page_text with a fresh profile (default-screen1)
+    let payload_page = serde_json::json!({
+        "url": "http://127.0.0.1:8766/",
+        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/default-screen1",
+        "timeout_ms": 15000,
+    });
+    let stdout_page = run_embedded_python(
+        "REACH_PAGE_TEXT_PAYLOAD",
+        &payload_page,
+        reach_cli::docker::PAGE_TEXT_SCRIPT,
+    );
+    let parsed_page = last_json(&stdout_page);
+    assert_eq!(
+        parsed_page["status"], "ok",
+        "page_text not ok: {stdout_page}"
+    );
+    let text = parsed_page["text"].as_str().unwrap_or_default();
+    assert!(
+        text.contains("reach=yes"),
+        "cookie not shared across screens: {text}"
+    );
+}
+
+// ═══════════════════════════════════════════════════════════
 // 99. SHUTDOWN (must run last)
 // ═══════════════════════════════════════════════════════════
 

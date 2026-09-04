@@ -1,0 +1,64 @@
+#!/usr/bin/env bash
+# Start or stop the persistent Reach Home Screen in Chromium.
+# Keeps the desktop screen lit 24/7 in noVNC with an interactive dashboard.
+set -euo pipefail
+
+DISPLAY_VAL="${DISPLAY:-:99}"
+HOME_HTML="/opt/reach/home.html"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Fallback path if running from repo clone
+if [ ! -f "$HOME_HTML" ]; then
+    if [ -f "$SCRIPT_DIR/../assets/home.html" ]; then
+        HOME_HTML="$SCRIPT_DIR/../assets/home.html"
+    fi
+fi
+
+ACTION="${1:-start}"
+
+case "$ACTION" in
+    stop)
+        echo "Stopping Reach Home Screen..."
+        pkill -f "chrome.*home.html" 2>/dev/null || true
+        echo "Reach Home Screen stopped."
+        ;;
+    start|--daemon|-d|--background)
+        # Check if already running
+        if pgrep -f "chrome.*home.html" >/dev/null 2>&1; then
+            echo "Reach Home Screen is already running."
+            exit 0
+        fi
+
+        echo "Starting Reach Home Screen on display $DISPLAY_VAL..."
+        CHROME_BIN="reach-chrome"
+        if ! command -v "$CHROME_BIN" >/dev/null 2>&1; then
+            if [ -x "$SCRIPT_DIR/reach-chrome" ]; then
+                CHROME_BIN="$SCRIPT_DIR/reach-chrome"
+            fi
+        fi
+
+        URL="file://${HOME_HTML}"
+        if [ ! -f "$HOME_HTML" ]; then
+            URL="data:text/html,<html><head><title>Reach%20Agent%20Computer</title><style>body{background:%231e1e2e;color:%23cdd6f4;font-family:sans-serif;display:flex;flex-direction:column;align-items:center;justify-content:center;height:100vh;margin:0;}h1{margin-bottom:8px;}p{color:%23a6adc8;}</style></head><body><h1>Reach Agent Computer</h1><p>Display $DISPLAY_VAL &bull; noVNC Active</p></body></html>"
+        fi
+
+        FLAGS=(
+            "--app=${URL}"
+            "--start-maximized"
+            "--window-position=0,0"
+            "--window-size=1280,720"
+            "--no-sandbox"
+            "--disable-dev-shm-usage"
+            "--no-first-run"
+            "--no-default-browser-check"
+            "--disable-gpu"
+        )
+
+        DISPLAY="$DISPLAY_VAL" nohup "$CHROME_BIN" "${FLAGS[@]}" >/dev/null 2>&1 &
+        echo "Reach Home Screen launched (PID: $!)."
+        ;;
+    *)
+        echo "Usage: reach-home [start|stop|--daemon]"
+        exit 1
+        ;;
+esac

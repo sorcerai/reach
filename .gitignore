@@ -33,3 +33,8 @@ tarpaulin-report.html
 .beads-credential-key
 .beads/proxieddb/
 *.gate.lock*
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/

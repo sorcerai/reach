@@ -76,7 +76,7 @@ fn process_health_failed_status() {
 
 #[test]
 fn supervisor_new_starts_empty() {
-    let sup = Supervisor::new();
+    let sup = Supervisor::new(99, 1280, 720);
     assert!(sup.all_healthy()); // vacuously true — no processes
     assert!(sup.health().is_empty());
 }
@@ -118,4 +118,45 @@ fn ready_check_variants_are_constructible() {
     let _file = ReadyCheck::FileExists("/tmp/.X99-lock".into());
     let _tcp = ReadyCheck::TcpPort(5900);
     let _imm = ReadyCheck::Immediate;
+}
+
+// ═══════════════════════════════════════════════════════════
+// ScreenInfo & multi-screen
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+fn screen_info_serialization_matches_spec() {
+    let info = ScreenInfo {
+        id: 0,
+        display: ":99".into(),
+        vnc_port: 5900,
+        novnc_port: 6080,
+    };
+    let json = serde_json::to_value(&info).unwrap();
+    assert_eq!(json["id"], 0);
+    assert_eq!(json["display"], ":99");
+    assert_eq!(json["vnc_port"], 5900);
+    assert_eq!(json["novnc_port"], 6080);
+}
+
+#[test]
+fn supervisor_screens_returns_correct_mappings() {
+    let sup = Supervisor::new(99, 1280, 720).with_screens(3);
+    let screens = sup.screens();
+    assert_eq!(screens.len(), 3);
+
+    assert_eq!(screens[0].id, 0);
+    assert_eq!(screens[0].display, ":99");
+    assert_eq!(screens[0].vnc_port, 5900);
+    assert_eq!(screens[0].novnc_port, 6080);
+
+    assert_eq!(screens[1].id, 1);
+    assert_eq!(screens[1].display, ":100");
+    assert_eq!(screens[1].vnc_port, 5901);
+    assert_eq!(screens[1].novnc_port, 6081);
+
+    assert_eq!(screens[2].id, 2);
+    assert_eq!(screens[2].display, ":101");
+    assert_eq!(screens[2].vnc_port, 5902);
+    assert_eq!(screens[2].novnc_port, 6082);
 }

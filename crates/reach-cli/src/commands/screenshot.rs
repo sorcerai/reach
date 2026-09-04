@@ -8,6 +8,10 @@ pub struct ScreenshotArgs {
     /// Sandbox name or container ID
     pub target: String,
 
+    /// Screen index (0, 1, ...)
+    #[arg(long, default_value = "0")]
+    pub screen: u32,
+
     /// Output file path (default: stdout as base64)
     #[arg(long, short)]
     pub output: Option<String>,
@@ -15,7 +19,8 @@ pub struct ScreenshotArgs {
 
 pub async fn run(args: ScreenshotArgs) -> anyhow::Result<()> {
     let docker = DockerClient::new()?;
-    let png_bytes = docker.screenshot(&args.target).await?;
+    let display = reach_cli::tools::display_for(args.screen);
+    let png_bytes = docker.screenshot(&args.target, &display).await?;
 
     match args.output {
         Some(path) => {

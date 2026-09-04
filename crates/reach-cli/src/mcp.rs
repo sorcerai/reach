@@ -147,6 +147,8 @@ pub enum ToolCall {
     PageText(PageTextParams),
     #[serde(rename = "auth_handoff")]
     AuthHandoff(AuthHandoffParams),
+    #[serde(rename = "live_view")]
+    LiveView(LiveViewParams),
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -159,6 +161,8 @@ pub struct ScreenshotParams {
     pub sandbox: Option<String>,
     #[serde(default = "default_format")]
     pub format: ImageFormat,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -181,6 +185,8 @@ pub struct ClickParams {
     pub button: MouseButton,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
@@ -197,6 +203,8 @@ pub struct TypeParams {
     pub text: String,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -204,6 +212,8 @@ pub struct KeyParams {
     pub combo: String,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -213,6 +223,8 @@ pub struct BrowseParams {
     pub headed: bool,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -225,6 +237,8 @@ pub struct ScrapeParams {
     pub stealth: bool,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -245,6 +259,8 @@ pub struct PlaywrightEvalParams {
     pub script: String,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +272,8 @@ pub struct ExecParams {
     pub timeout: u32,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -271,6 +289,8 @@ pub struct PageTextParams {
     pub use_profile: Option<String>,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,6 +306,16 @@ pub struct AuthHandoffParams {
     pub use_profile: Option<String>,
     #[serde(default)]
     pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct LiveViewParams {
+    #[serde(default)]
+    pub sandbox: Option<String>,
+    #[serde(default)]
+    pub screen: u32,
 }
 
 fn default_true() -> bool {
@@ -424,7 +454,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "type": "object",
                 "properties": {
                     "sandbox": { "type": "string", "description": "Sandbox name" },
-                    "format": { "type": "string", "enum": ["png", "jpeg"], "default": "png" }
+                    "format": { "type": "string", "enum": ["png", "jpeg"], "default": "png" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -438,7 +469,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "x": { "type": "integer" },
                     "y": { "type": "integer" },
                     "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -450,7 +482,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["text"],
                 "properties": {
                     "text": { "type": "string" },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -462,7 +495,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["combo"],
                 "properties": {
                     "combo": { "type": "string" },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -475,7 +509,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "url": { "type": "string" },
                     "headed": { "type": "boolean", "default": true },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -490,7 +525,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "selector": { "type": "string", "description": "CSS selector" },
                     "extract": { "type": "string", "enum": ["text", "html"], "default": "text" },
                     "stealth": { "type": "boolean", "default": true },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -502,7 +538,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "required": ["script"],
                 "properties": {
                     "script": { "type": "string", "description": "Python script using playwright sync_api" },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -516,7 +553,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "command": { "type": "string" },
                     "cwd": { "type": "string" },
                     "timeout": { "type": "integer", "default": 30 },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -548,7 +586,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Persistent Chrome profile name (see `reach create --persist-profile`)"
                     },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },
@@ -581,7 +620,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "type": "string",
                         "description": "Persistent Chrome profile name (see `reach create --persist-profile`)"
                     },
-                    "sandbox": { "type": "string" }
+                    "sandbox": { "type": "string" },
+                    "screen": { "type": "integer", "default": 0 }
                 }
             }),
         },

@@ -19,6 +19,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     let ctx = ToolContext {
         docker: &docker,
         public_host: ReachConfig::load().server.effective_public_host(),
+        agent: None,
     };
 
     tracing::info!(target = args.target, "MCP stdio bridge started");

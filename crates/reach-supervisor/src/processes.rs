@@ -12,13 +12,21 @@ use tokio::time;
 
 #[derive(Debug, Clone)]
 pub struct ProcessSpec {
-    pub name: &'static str,
+    pub name: String,
     pub command: &'static str,
     pub args: Vec<String>,
     pub env: Vec<(&'static str, String)>,
     pub restart: RestartPolicy,
-    pub depends_on: Vec<&'static str>,
+    pub depends_on: Vec<String>,
     pub ready_check: ReadyCheck,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ScreenInfo {
+    pub id: u32,
+    pub display: String,
+    pub vnc_port: u16,
+    pub novnc_port: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -143,24 +151,46 @@ pub struct Supervisor {
     display: u32,
     width: u32,
     height: u32,
+    screens: u32,
     vnc_password: Option<String>,
 }
 
 impl Default for Supervisor {
     fn default() -> Self {
-        Self::new()
+        Self::new(99, 1280, 720)
     }
 }
 
 impl Supervisor {
-    pub fn new() -> Self {
+    pub fn new(display: u32, width: u32, height: u32) -> Self {
         Self {
             processes: Vec::new(),
-            display: 99,
-            width: 1280,
-            height: 720,
+            display,
+            width,
+            height,
+            screens: 1,
             vnc_password: None,
         }
+    }
+
+    pub fn with_screens(mut self, screens: u32) -> Self {
+        self.screens = screens.max(1);
+        self
+    }
+
+    pub fn display(&self) -> u32 {
+        self.display
+    }
+
+    pub fn screens(&self) -> Vec<ScreenInfo> {
+        (0..self.screens)
+            .map(|i| ScreenInfo {
+                id: i,
+                display: format!(":{}", self.display + i),
+                vnc_port: 5900 + i as u16,
+                novnc_port: 6080 + i as u16,
+            })
+            .collect()
     }
 
     /// Set (or clear) the VNC password. When set, `x11vnc` runs with
@@ -193,32 +223,36 @@ impl Supervisor {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(720);
+        let screens = std::env::var("REACH_SCREENS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1);
         let vnc_password = std::env::var("VNC_PASSWORD").ok().filter(|s| !s.is_empty());
 
-        Self {
-            processes: Vec::new(),
-            display,
-            width,
-            height,
-            vnc_password: None,
-        }
-        .with_vnc_password(vnc_password)
+        Self::new(display, width, height)
+            .with_screens(screens)
+            .with_vnc_password(vnc_password)
     }
 
     /// Build the process table — defines what runs and in what order.
     pub(crate) fn process_table(&self) -> Vec<ProcessSpec> {
-        let display = format!(":{}", self.display);
         let resolution = format!("{}x{}x24", self.width, self.height);
+        let mut specs = Vec::with_capacity((self.screens * 4) as usize);
 
-        vec![
-            ProcessSpec {
-                name: "xvfb",
+        for i in 0..self.screens {
+            let display_num = self.display + i;
+            let display = format!(":{display_num}");
+            let vnc_port = 5900 + i as u16;
+            let novnc_port = 6080 + i as u16;
+
+            specs.push(ProcessSpec {
+                name: format!("xvfb-{i}"),
                 command: "Xvfb",
                 args: vec![
                     display.clone(),
                     "-screen".into(),
                     "0".into(),
-                    resolution,
+                    resolution.clone(),
                     "-nolisten".into(),
                     "tcp".into(),
                 ],
@@ -228,10 +262,11 @@ impl Supervisor {
                     backoff: Duration::from_secs(1),
                 },
                 depends_on: vec![],
-                ready_check: ReadyCheck::FileExists(format!("/tmp/.X11-unix/X{}", self.display)),
-            },
-            ProcessSpec {
-                name: "openbox",
+                ready_check: ReadyCheck::FileExists(format!("/tmp/.X11-unix/X{display_num}")),
+            });
+
+            specs.push(ProcessSpec {
+                name: format!("openbox-{i}"),
                 command: "openbox",
                 args: vec!["--sm-disable".into()],
                 env: vec![("DISPLAY", display.clone())],
@@ -239,11 +274,12 @@ impl Supervisor {
                     max_restarts: 5,
                     backoff: Duration::from_secs(1),
                 },
-                depends_on: vec!["xvfb"],
+                depends_on: vec![format!("xvfb-{i}")],
                 ready_check: ReadyCheck::Immediate,
-            },
-            ProcessSpec {
-                name: "x11vnc",
+            });
+
+            specs.push(ProcessSpec {
+                name: format!("x11vnc-{i}"),
                 command: "x11vnc",
                 args: {
                     let mut args = vec!["-display".to_string(), display.clone(), "-forever".into()];
@@ -251,7 +287,7 @@ impl Supervisor {
                         Some(pw) => args.extend(["-passwd".into(), pw.clone()]),
                         None => args.push("-nopw".into()),
                     }
-                    args.extend(["-rfbport".into(), "5900".into(), "-shared".into()]);
+                    args.extend(["-rfbport".into(), vnc_port.to_string(), "-shared".into()]);
                     args
                 },
                 env: vec![],
@@ -259,27 +295,30 @@ impl Supervisor {
                     max_restarts: 10,
                     backoff: Duration::from_millis(500),
                 },
-                depends_on: vec!["xvfb"],
-                ready_check: ReadyCheck::TcpPort(5900),
-            },
-            ProcessSpec {
-                name: "novnc",
+                depends_on: vec![format!("xvfb-{i}")],
+                ready_check: ReadyCheck::TcpPort(vnc_port),
+            });
+
+            specs.push(ProcessSpec {
+                name: format!("novnc-{i}"),
                 command: "websockify",
                 args: vec![
                     "--web".into(),
                     "/opt/noVNC".into(),
-                    "6080".into(),
-                    "localhost:5900".into(),
+                    novnc_port.to_string(),
+                    format!("localhost:{vnc_port}"),
                 ],
                 env: vec![],
                 restart: RestartPolicy::Always {
                     max_restarts: 5,
                     backoff: Duration::from_secs(1),
                 },
-                depends_on: vec!["x11vnc"],
-                ready_check: ReadyCheck::TcpPort(6080),
-            },
-        ]
+                depends_on: vec![format!("x11vnc-{i}")],
+                ready_check: ReadyCheck::TcpPort(novnc_port),
+            });
+        }
+
+        specs
     }
 
     /// Start all processes in dependency order.
@@ -317,7 +356,12 @@ impl Supervisor {
         // Wait for ready check
         self.wait_ready(&spec.ready_check).await?;
 
-        tracing::info!(name = spec.name, pid, "process ready");
+        tracing::info!(name = %spec.name, pid, "process ready");
+
+        if spec.name.starts_with("xvfb-") {
+            let display = spec.args.first().cloned().unwrap_or_else(|| ":99".into());
+            set_root_background(&display).await;
+        }
 
         // Transition to Running
         self.processes[idx] = ManagedProcess {
@@ -362,20 +406,20 @@ impl Supervisor {
     pub async fn stop_all(&mut self) -> Result<()> {
         for proc in self.processes.iter_mut().rev() {
             if let ProcessState::Running { child, pid, .. } = &mut proc.state {
-                tracing::info!(name = proc.spec.name, pid, "sending SIGTERM");
+                tracing::info!(name = %proc.spec.name, pid, "sending SIGTERM");
                 let nix_pid = Pid::from_raw(*pid as i32);
                 let _ = nix::sys::signal::kill(nix_pid, Signal::SIGTERM);
 
                 match time::timeout(Duration::from_secs(5), child.wait()).await {
                     Ok(Ok(status)) => {
                         tracing::info!(
-                            name = proc.spec.name,
+                            name = %proc.spec.name,
                             code = ?status.code(),
                             "exited cleanly"
                         );
                     }
                     _ => {
-                        tracing::warn!(name = proc.spec.name, "SIGKILL after timeout");
+                        tracing::warn!(name = %proc.spec.name, "SIGKILL after timeout");
                         let _ = child.kill().await;
                     }
                 }
@@ -391,11 +435,11 @@ impl Supervisor {
         let mut restarted = 0;
 
         // Snapshot which processes are running before mutable iteration
-        let running_names: Vec<&'static str> = self
+        let running_names: Vec<String> = self
             .processes
             .iter()
             .filter(|p| p.state.is_running())
-            .map(|p| p.spec.name)
+            .map(|p| p.spec.name.clone())
             .collect();
 
         for proc in &mut self.processes {
@@ -412,7 +456,7 @@ impl Supervisor {
                         let count = *restart_count;
 
                         tracing::warn!(
-                            name = proc.spec.name,
+                            name = %proc.spec.name,
                             exit_code = ?code,
                             restart_count = count,
                             "process exited unexpectedly"
@@ -426,7 +470,7 @@ impl Supervisor {
                             } => {
                                 if count >= *max_restarts {
                                     tracing::error!(
-                                        name = proc.spec.name,
+                                        name = %proc.spec.name,
                                         "max restarts ({max_restarts}) exceeded"
                                     );
                                     proc.state = ProcessState::Failed {
@@ -452,7 +496,7 @@ impl Supervisor {
 
                                 if !deps_ok {
                                     tracing::warn!(
-                                        name = proc.spec.name,
+                                        name = %proc.spec.name,
                                         "dependency not running, marking failed"
                                     );
                                     proc.state = ProcessState::Failed {
@@ -465,7 +509,7 @@ impl Supervisor {
 
                                 // Restart
                                 tracing::info!(
-                                    name = proc.spec.name,
+                                    name = %proc.spec.name,
                                     attempt = count + 1,
                                     "restarting process"
                                 );
@@ -485,6 +529,15 @@ impl Supervisor {
                                             started_at: std::time::Instant::now(),
                                             restart_count: count + 1,
                                         };
+                                        if proc.spec.name.starts_with("xvfb-") {
+                                            let display = proc
+                                                .spec
+                                                .args
+                                                .first()
+                                                .cloned()
+                                                .unwrap_or_else(|| ":99".into());
+                                            set_root_background(&display).await;
+                                        }
                                         restarted += 1;
                                     }
                                     Err(e) => {
@@ -500,7 +553,7 @@ impl Supervisor {
                     }
                     Ok(None) => {} // still running
                     Err(e) => {
-                        tracing::error!(name = proc.spec.name, error = %e, "failed to check process");
+                        tracing::error!(name = %proc.spec.name, error = %e, "failed to check process");
                     }
                 }
             }
@@ -514,7 +567,7 @@ impl Supervisor {
         self.processes
             .iter()
             .map(|p| ProcessHealth {
-                name: p.spec.name.to_string(),
+                name: p.spec.name.clone(),
                 status: match &p.state {
                     ProcessState::Running { .. } => ProcessStatus::Running,
                     ProcessState::Starting => ProcessStatus::Starting,
@@ -536,10 +589,84 @@ impl Supervisor {
     }
 }
 
+/// Set root window background color so noVNC never shows pitch black.
+pub async fn set_root_background(disp: &str) {
+    let color = std::env::var("REACH_BG_COLOR").unwrap_or_else(|_| "#1e1e2e".to_string());
+
+    // 1. Try xsetroot
+    if let Ok(mut child) = Command::new("xsetroot")
+        .args(["-display", disp, "-solid", &color])
+        .spawn()
+        && let Ok(status) = child.wait().await
+        && status.success()
+    {
+        tracing::info!(disp, %color, "root window background set via xsetroot");
+        return;
+    }
+
+    // 2. Try reach-wallpaper script
+    if let Ok(mut child) = Command::new("reach-wallpaper")
+        .args([disp])
+        .env("REACH_BG_COLOR", &color)
+        .spawn()
+        && let Ok(status) = child.wait().await
+        && status.success()
+    {
+        tracing::info!(disp, %color, "root window background set via reach-wallpaper");
+        return;
+    }
+
+    // 3. Fallback to python ctypes using libX11.so.6
+    let py_script = r#"
+import ctypes, sys
+class XColor(ctypes.Structure):
+    _fields_ = [("pixel", ctypes.c_ulong), ("red", ctypes.c_ushort), ("green", ctypes.c_ushort), ("blue", ctypes.c_ushort), ("flags", ctypes.c_byte), ("pad", ctypes.c_byte)]
+try:
+    x11 = ctypes.cdll.LoadLibrary("libX11.so.6")
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XDefaultColormap.restype = ctypes.c_ulong
+    x11.XDefaultColormap.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XAllocNamedColor.restype = ctypes.c_int
+    x11.XAllocNamedColor.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_char_p, ctypes.POINTER(XColor), ctypes.POINTER(XColor)]
+    x11.XSetWindowBackground.restype = ctypes.c_int
+    x11.XSetWindowBackground.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+    x11.XClearWindow.restype = ctypes.c_int
+    x11.XClearWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XFlush.restype = ctypes.c_int
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.restype = ctypes.c_int
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    display = sys.argv[1].encode()
+    color = sys.argv[2].encode()
+    dpy = x11.XOpenDisplay(display)
+    if dpy:
+        screen = x11.XDefaultScreen(dpy)
+        cmap = x11.XDefaultColormap(dpy, screen)
+        root = x11.XDefaultRootWindow(dpy)
+        exact, closest = XColor(), XColor()
+        if x11.XAllocNamedColor(dpy, cmap, color, ctypes.byref(exact), ctypes.byref(closest)):
+            x11.XSetWindowBackground(dpy, root, exact.pixel)
+            x11.XClearWindow(dpy, root)
+            x11.XFlush(dpy)
+            x11.XCloseDisplay(dpy)
+except Exception:
+    pass
+"#;
+    let _ = Command::new("python3")
+        .args(["-c", py_script, disp, &color])
+        .status()
+        .await;
+}
+
 /// Remove stale X11 lock files that prevent Xvfb from starting.
 pub fn clean_x11_locks() -> Result<()> {
-    {
-        let display = 99;
+    for display in 99..116 {
         let lock = format!("/tmp/.X{display}-lock");
         let path = Path::new(&lock);
         if path.exists() {
@@ -552,15 +679,15 @@ pub fn clean_x11_locks() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::Supervisor;
+    use super::*;
 
     #[test]
     fn x11vnc_uses_password_when_env_set() {
-        let sup = Supervisor::new().with_vnc_password(Some("s3cret".into()));
+        let sup = Supervisor::new(99, 1280, 720).with_vnc_password(Some("s3cret".into()));
         let x = sup
             .process_table()
             .into_iter()
-            .find(|p| p.name == "x11vnc")
+            .find(|p| p.name == "x11vnc-0")
             .unwrap();
         assert!(x.args.windows(2).any(|w| w == ["-passwd", "s3cret"]));
         assert!(!x.args.iter().any(|a| a == "-nopw"));
@@ -568,13 +695,27 @@ mod tests {
 
     #[test]
     fn x11vnc_uses_nopw_when_unset() {
-        let sup = Supervisor::new();
+        let sup = Supervisor::new(99, 1280, 720);
         let x = sup
             .process_table()
             .into_iter()
-            .find(|p| p.name == "x11vnc")
+            .find(|p| p.name == "x11vnc-0")
             .unwrap();
         assert!(x.args.iter().any(|a| a == "-nopw"));
         assert!(!x.args.iter().any(|a| a == "-passwd"));
+    }
+
+    #[test]
+    fn two_screens_produce_two_stacks_on_distinct_ports() {
+        let sup = Supervisor::new(99, 1280, 720).with_screens(2);
+        let t = sup.process_table();
+        assert_eq!(t.len(), 8);
+        let vnc: Vec<&ProcessSpec> = t.iter().filter(|p| p.name.starts_with("x11vnc")).collect();
+        assert!(vnc[0].args.contains(&"5900".to_string()));
+        assert!(vnc[1].args.contains(&"5901".to_string()));
+        assert!(
+            t.iter()
+                .any(|p| p.name == "xvfb-1" && p.args.contains(&":100".to_string()))
+        );
     }
 }

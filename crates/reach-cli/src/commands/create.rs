@@ -80,6 +80,10 @@ pub struct CreateArgs {
     /// `reach list`.
     #[arg(long, value_name = "PW")]
     pub vnc_password: Option<String>,
+
+    /// Number of virtual screens / displays (default: 1)
+    #[arg(long, default_value = "1")]
+    pub screens: u32,
 }
 
 /// Parse a `HOST:CONTAINER` port pair, or a single `PORT` shorthand for
@@ -156,6 +160,7 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
             health: args.health_port.unwrap_or(cfg.sandbox.health_port),
             extra: args.extra_ports.clone(),
         },
+        screens: args.screens.max(1),
         profile,
         workspace: workspace.clone(),
         memory,
@@ -186,6 +191,12 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         "\u{2713}".green(),
         "Resolution".dimmed(),
         args.resolution
+    );
+    println!(
+        "  {} {}  {}",
+        "\u{2713}".green(),
+        "Screens   ".dimmed(),
+        sandbox.ports.screens
     );
 
     if let Some(name) = &args.persist_profile {
@@ -243,11 +254,18 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
 
     println!();
     if let Some(p) = sandbox.ports.novnc {
-        println!(
-            "    {}     {}",
-            "VNC:".bold(),
-            format!("http://localhost:{}", p).cyan()
-        );
+        for i in 0..sandbox.ports.screens {
+            let label = if sandbox.ports.screens > 1 {
+                format!("VNC (screen {i}):")
+            } else {
+                "VNC:".to_string()
+            };
+            println!(
+                "    {:<18} {}",
+                label.bold(),
+                format!("http://localhost:{}", p + i as u16).cyan()
+            );
+        }
     }
     if let Some(p) = sandbox.ports.health {
         println!(

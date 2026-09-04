@@ -89,6 +89,17 @@ fn all_tools_are_registered() {
 }
 
 #[test]
+fn every_tool_accepts_screen() {
+    for t in tool_definitions() {
+        assert!(
+            t.input_schema["properties"].get("screen").is_some(),
+            "{} lacks screen",
+            t.name
+        );
+    }
+}
+
+#[test]
 fn live_view_tool_is_registered_and_has_no_required_fields() {
     let tool = tool_definitions()
         .into_iter()

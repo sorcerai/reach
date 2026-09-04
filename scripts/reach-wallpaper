@@ -1,0 +1,72 @@
+#!/usr/bin/env bash
+# Set the root window background color for Reach displays.
+# Prevents pitch-black dark screen in noVNC when no windows are open.
+set -euo pipefail
+
+DISPLAY_VAL="${1:-${DISPLAY:-:99}}"
+BG_COLOR="${REACH_BG_COLOR:-#1e1e2e}"
+
+# 1. Prefer xsetroot if available
+if command -v xsetroot >/dev/null 2>&1; then
+    xsetroot -display "$DISPLAY_VAL" -solid "$BG_COLOR"
+    exit 0
+fi
+
+# 2. Fallback to python ctypes libX11
+python3 -c "
+import ctypes, sys
+
+class XColor(ctypes.Structure):
+    _fields_ = [
+        ('pixel', ctypes.c_ulong),
+        ('red', ctypes.c_ushort),
+        ('green', ctypes.c_ushort),
+        ('blue', ctypes.c_ushort),
+        ('flags', ctypes.c_byte),
+        ('pad', ctypes.c_byte),
+    ]
+
+try:
+    x11 = ctypes.cdll.LoadLibrary('libX11.so.6')
+    x11.XOpenDisplay.restype = ctypes.c_void_p
+    x11.XOpenDisplay.argtypes = [ctypes.c_char_p]
+    x11.XDefaultScreen.restype = ctypes.c_int
+    x11.XDefaultScreen.argtypes = [ctypes.c_void_p]
+    x11.XDefaultColormap.restype = ctypes.c_ulong
+    x11.XDefaultColormap.argtypes = [ctypes.c_void_p, ctypes.c_int]
+    x11.XDefaultRootWindow.restype = ctypes.c_ulong
+    x11.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+    x11.XAllocNamedColor.restype = ctypes.c_int
+    x11.XAllocNamedColor.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_ulong,
+        ctypes.c_char_p,
+        ctypes.POINTER(XColor),
+        ctypes.POINTER(XColor),
+    ]
+    x11.XSetWindowBackground.restype = ctypes.c_int
+    x11.XSetWindowBackground.argtypes = [ctypes.c_void_p, ctypes.c_ulong, ctypes.c_ulong]
+    x11.XClearWindow.restype = ctypes.c_int
+    x11.XClearWindow.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+    x11.XFlush.restype = ctypes.c_int
+    x11.XFlush.argtypes = [ctypes.c_void_p]
+    x11.XCloseDisplay.restype = ctypes.c_int
+    x11.XCloseDisplay.argtypes = [ctypes.c_void_p]
+
+    display_arg = sys.argv[1].encode()
+    color_arg = sys.argv[2].encode()
+
+    dpy = x11.XOpenDisplay(display_arg)
+    if dpy:
+        screen = x11.XDefaultScreen(dpy)
+        cmap = x11.XDefaultColormap(dpy, screen)
+        root = x11.XDefaultRootWindow(dpy)
+        exact, closest = XColor(), XColor()
+        if x11.XAllocNamedColor(dpy, cmap, color_arg, ctypes.byref(exact), ctypes.byref(closest)):
+            x11.XSetWindowBackground(dpy, root, exact.pixel)
+            x11.XClearWindow(dpy, root)
+            x11.XFlush(dpy)
+            x11.XCloseDisplay(dpy)
+except Exception as e:
+    sys.stderr.write(f'reach-wallpaper python fallback warning: {e}\n')
+" "$DISPLAY_VAL" "$BG_COLOR"

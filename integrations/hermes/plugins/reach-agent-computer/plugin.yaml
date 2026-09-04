@@ -1,0 +1,63 @@
+name: reach-agent-computer
+version: "0.1.0"
+description: "Lease a reach Agent Computer screen per hermes profile, route reach tools to it, provide reach_drive CUA capabilities, and surface takeovers."
+author: "Reach Team"
+enabled_by_default: true
+
+tools:
+  - name: reach_lease_screen
+    description: "Lease an Agent Computer screen for this hermes profile or specified owner."
+    parameters:
+      type: object
+      properties:
+        screen:
+          type: integer
+          description: "Optional specific screen ID to lease. If omitted, leases first free screen."
+        owner:
+          type: string
+          description: "Optional lease owner identifier. Defaults to HERMES_PROFILE or 'default'."
+
+  - name: reach_release_screen
+    description: "Release the leased Agent Computer screen."
+    parameters:
+      type: object
+      properties:
+        screen:
+          type: integer
+          description: "Screen ID to release. Defaults to currently leased screen."
+        owner:
+          type: string
+          description: "Lease owner identifier. Defaults to HERMES_PROFILE or 'default'."
+
+  - name: reach_drive
+    description: "Run the CUA vision loop (Gemini 3.8 Flash via agy) to achieve a browser or desktop goal on Reach."
+    parameters:
+      type: object
+      required:
+        - goal
+      properties:
+        goal:
+          type: string
+          description: "Objective or task to accomplish on the desktop/browser."
+        screen:
+          type: integer
+          description: "Screen ID to drive. Defaults to currently leased screen or 0."
+        max_steps:
+          type: integer
+          default: 15
+          description: "Maximum number of vision-action steps to execute."
+        api_url:
+          type: string
+          description: "Reach server URL (default from REACH_AGENT_URL or http://127.0.0.1:4200)."
+        initial_url:
+          type: string
+          description: "Optional URL to navigate to before beginning the loop."
+
+  - name: reach_status
+    description: "Inspect the status of Reach Agent Computer screens, lease ownership, and live view URLs."
+    parameters:
+      type: object
+      properties:
+        screen:
+          type: integer
+          description: "Optional specific screen ID to inspect. If omitted, returns all screens."

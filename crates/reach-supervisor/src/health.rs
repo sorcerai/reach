@@ -2,7 +2,7 @@ use axum::{Json, Router, extract::State, routing::get};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
-use crate::processes::{ProcessHealth, ProcessStatus, Supervisor};
+use crate::processes::{ProcessHealth, ProcessStatus, ScreenInfo, Supervisor};
 
 // ═══════════════════════════════════════════════════════════
 // Health API response types
@@ -39,6 +39,7 @@ pub async fn serve(port: u16, supervisor: SharedSupervisor) -> anyhow::Result<()
     let app = Router::new()
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .route("/screens", get(screens_handler))
         .with_state(supervisor);
 
     let addr = format!("0.0.0.0:{port}");
@@ -48,6 +49,11 @@ pub async fn serve(port: u16, supervisor: SharedSupervisor) -> anyhow::Result<()
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+async fn screens_handler(State(sup): State<SharedSupervisor>) -> Json<Vec<ScreenInfo>> {
+    let sup = sup.read().await;
+    Json(sup.screens())
 }
 
 async fn health_handler(State(sup): State<SharedSupervisor>) -> Json<HealthResponse> {
@@ -67,7 +73,7 @@ async fn health_handler(State(sup): State<SharedSupervisor>) -> Json<HealthRespo
         status,
         service: "reach-supervisor",
         version: env!("CARGO_PKG_VERSION"),
-        display: std::env::var("DISPLAY").unwrap_or_else(|_| ":99".into()),
+        display: std::env::var("DISPLAY").unwrap_or_else(|_| format!(":{}", sup.display())),
         processes,
     })
 }

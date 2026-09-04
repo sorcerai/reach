@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reach Agent Computer</title>
+  <style>
+    :root {
+      --bg: #1e1e2e;
+      --surface: #181825;
+      --card: #313244;
+      --text: #cdd6f4;
+      --subtext: #a6adc8;
+      --accent: #89b4fa;
+      --green: #a6e3a1;
+      --mauve: #cba6f7;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      align-items: center;
+      padding: 2rem;
+      user-select: none;
+    }
+    .container {
+      max-width: 800px;
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      border-radius: 16px;
+      padding: 2.5rem;
+      box-shadow: 0 20px 50px rgba(0, 0, 0, 0.4);
+      text-align: center;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      background: rgba(166, 227, 161, 0.15);
+      color: var(--green);
+      font-size: 0.85rem;
+      font-weight: 600;
+      margin-bottom: 1.5rem;
+      border: 1px solid rgba(166, 227, 161, 0.3);
+    }
+    .dot {
+      width: 8px;
+      height: 8px;
+      background: var(--green);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--green);
+    }
+    h1 {
+      font-size: 2.5rem;
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, #cdd6f4 0%, #89b4fa 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+    }
+    p.subtitle {
+      color: var(--subtext);
+      font-size: 1.1rem;
+      margin-bottom: 2rem;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1rem;
+      margin-bottom: 2rem;
+      text-align: left;
+    }
+    .card {
+      background: var(--card);
+      border-radius: 12px;
+      padding: 1.25rem;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+    .card-title {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--subtext);
+      margin-bottom: 0.35rem;
+    }
+    .card-value {
+      font-size: 1.25rem;
+      font-weight: 600;
+      color: var(--text);
+    }
+    .status-bar {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding-top: 1.5rem;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      font-size: 0.9rem;
+      color: var(--subtext);
+    }
+    .clock {
+      font-variant-numeric: tabular-nums;
+      font-weight: 600;
+      color: var(--mauve);
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="badge">
+      <span class="dot"></span>
+      Agent Computer Active
+    </div>
+    <h1>Reach Sandbox Desktop</h1>
+    <p class="subtitle">Clean, persistent microVM environment with live video stream</p>
+    
+    <div class="grid">
+      <div class="card">
+        <div class="card-title">Display Stack</div>
+        <div class="card-value" id="display-val">Xvfb :99</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Live Stream</div>
+        <div class="card-value">noVNC :6080</div>
+      </div>
+      <div class="card">
+        <div class="card-title">Supervisor</div>
+        <div class="card-value">Port 8400</div>
+      </div>
+    </div>
+
+    <div class="status-bar">
+      <span>Ready for human takeover or automated tasks</span>
+      <span class="clock" id="clock">--:--:-- UTC</span>
+    </div>
+  </div>
+
+  <script>
+    function updateClock() {
+      const now = new Date();
+      document.getElementById("clock").textContent = now.toTimeString().split(" ")[0] + " UTC";
+    }
+    setInterval(updateClock, 1000);
+    updateClock();
+  </script>
+</body>
+</html>

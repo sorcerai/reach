@@ -27,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdotool \
     scrot \
     xclip \
+    x11-xserver-utils \
     fonts-noto-core \
     fonts-noto-mono \
     dbus-x11 \
@@ -85,9 +86,13 @@ RUN git_url="https://github.com/novnc/noVNC.git" && \
 COPY --from=builder /build/target/release/reach-supervisor /usr/local/bin/reach-supervisor
 
 COPY scripts/reach-chrome /usr/local/bin/reach-chrome
-RUN chmod +x /usr/local/bin/reach-chrome \
-    && mkdir -p /etc/chromium/policies/managed \
+COPY scripts/reach-wallpaper /usr/local/bin/reach-wallpaper
+COPY scripts/reach-home /usr/local/bin/reach-home
+RUN chmod +x /usr/local/bin/reach-chrome /usr/local/bin/reach-wallpaper /usr/local/bin/reach-home \
+    && mkdir -p /etc/chromium/policies/managed /opt/reach \
     && chmod -R a+rX /opt/ms-playwright
+COPY assets/home.html /opt/reach/home.html
+RUN chmod -R a+rX /opt/reach
 COPY config/chrome-policies.json /etc/chromium/policies/managed/reach.json
 
 # Layer 7: User + permissions + X11 socket dir

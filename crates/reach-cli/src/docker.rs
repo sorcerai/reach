@@ -26,6 +26,7 @@ pub struct SandboxConfig {
     pub resolution: Resolution,
     pub shm_size: u64,
     pub ports: SandboxPorts,
+    pub screens: u32,
     /// Optional persistent Chrome profile mount.
     pub profile: Option<ProfileMount>,
     /// Host directory bind-mounted at `/workspace` (durable files).
@@ -130,6 +131,7 @@ impl Default for SandboxConfig {
             },
             shm_size: 512 * 1024 * 1024,
             ports: SandboxPorts::default(),
+            screens: 1,
             profile: None,
             workspace: None,
             memory: None,
@@ -179,6 +181,7 @@ pub struct SandboxPortMapping {
     pub vnc: Option<u16>,
     pub novnc: Option<u16>,
     pub health: Option<u16>,
+    pub screens: u32,
     /// Extra (host_port, container_port) pairs published by the user via
     /// `--extra-port`. Empty when no extras were requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -203,6 +206,7 @@ impl Labels {
     pub const NAME: &str = "reach.name";
     pub const CREATED: &str = "reach.created";
     pub const RESOLUTION: &str = "reach.resolution";
+    pub const SCREENS: &str = "reach.screens";
     pub const PROFILE: &str = "reach.profile";
     pub const PROFILE_HOST: &str = "reach.profile_host";
     pub const WORKSPACE: &str = "reach.workspace";
@@ -213,6 +217,7 @@ impl Labels {
         labels.insert(Self::NAME.into(), config.name.clone());
         labels.insert(Self::CREATED.into(), chrono::Utc::now().to_rfc3339());
         labels.insert(Self::RESOLUTION.into(), config.resolution.to_string());
+        labels.insert(Self::SCREENS.into(), config.screens.to_string());
         if let Some(profile) = &config.profile {
             labels.insert(Self::PROFILE.into(), profile.name.clone());
             labels.insert(
@@ -255,7 +260,11 @@ pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
     v
 }
 
-const KNOWN_PORTS: &[&str] = &["5900/tcp", "6080/tcp", "8400/tcp"];
+fn is_known_port(port: u16, screens: u32) -> bool {
+    port == 8400
+        || (5900..5900 + screens as u16).contains(&port)
+        || (6080..6080 + screens as u16).contains(&port)
+}
 
 /// Rebuild a [`SandboxConfig`] from a live container's inspect output
 /// (labels + `HostConfig`), so `recreate` can tear a container down and
@@ -289,6 +298,10 @@ pub fn config_from_inspect(
         .map(|s| Resolution::parse(s))
         .transpose()?
         .context("container missing reach.resolution label")?;
+    let screens: u32 = labels
+        .get(Labels::SCREENS)
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1);
 
     let port_bindings = host_config.port_bindings.clone().unwrap_or_default();
     let host_port = |container_port: &str| -> Option<u16> {
@@ -306,8 +319,11 @@ pub fn config_from_inspect(
         health: host_port("8400/tcp").unwrap_or(8400),
         extra: port_bindings
             .iter()
-            .filter(|(container_port, _)| !KNOWN_PORTS.contains(&container_port.as_str()))
             .filter_map(|(container_port, bindings)| {
+                let cp: u16 = container_port.trim_end_matches("/tcp").parse().ok()?;
+                if is_known_port(cp, screens) {
+                    return None;
+                }
                 let host_port: u16 = bindings
                     .as_ref()?
                     .first()?
@@ -315,8 +331,7 @@ pub fn config_from_inspect(
                     .as_ref()?
                     .parse()
                     .ok()?;
-                let container_port: u16 = container_port.trim_end_matches("/tcp").parse().ok()?;
-                Some((host_port, container_port))
+                Some((host_port, cp))
             })
             .collect(),
     };
@@ -362,6 +377,7 @@ pub fn config_from_inspect(
         resolution,
         shm_size,
         ports,
+        screens,
         profile,
         workspace,
         memory,
@@ -393,20 +409,27 @@ impl DockerClient {
 
         let port_bindings = {
             let mut map: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
-            map.insert(
-                "5900/tcp".into(),
-                Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".into()),
-                    host_port: Some(config.ports.vnc.to_string()),
-                }]),
-            );
-            map.insert(
-                "6080/tcp".into(),
-                Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".into()),
-                    host_port: Some(config.ports.novnc.to_string()),
-                }]),
-            );
+            for i in 0..config.screens {
+                let vnc_container = 5900 + i;
+                let novnc_container = 6080 + i;
+                let vnc_host = config.ports.vnc + i as u16;
+                let novnc_host = config.ports.novnc + i as u16;
+
+                map.insert(
+                    format!("{vnc_container}/tcp"),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".into()),
+                        host_port: Some(vnc_host.to_string()),
+                    }]),
+                );
+                map.insert(
+                    format!("{novnc_container}/tcp"),
+                    Some(vec![PortBinding {
+                        host_ip: Some("0.0.0.0".into()),
+                        host_port: Some(novnc_host.to_string()),
+                    }]),
+                );
+            }
             map.insert(
                 "8400/tcp".into(),
                 Some(vec![PortBinding {
@@ -458,6 +481,7 @@ impl DockerClient {
         let mut env = vec![
             format!("WIDTH={}", config.resolution.width),
             format!("HEIGHT={}", config.resolution.height),
+            format!("REACH_SCREENS={}", config.screens),
         ];
         if config.workspace.is_some() {
             env.push(format!("REACH_WORKSPACE={WORKSPACE_CONTAINER_PATH}"));
@@ -473,8 +497,10 @@ impl DockerClient {
             env: Some(env),
             exposed_ports: Some({
                 let mut m = HashMap::new();
-                m.insert("5900/tcp".into(), HashMap::new());
-                m.insert("6080/tcp".into(), HashMap::new());
+                for i in 0..config.screens {
+                    m.insert(format!("{}/tcp", 5900 + i), HashMap::new());
+                    m.insert(format!("{}/tcp", 6080 + i), HashMap::new());
+                }
                 m.insert("8400/tcp".into(), HashMap::new());
                 for (_, container_port) in &config.ports.extra {
                     m.insert(format!("{}/tcp", container_port), HashMap::new());
@@ -511,6 +537,7 @@ impl DockerClient {
                 vnc: Some(config.ports.vnc),
                 novnc: Some(config.ports.novnc),
                 health: Some(config.ports.health),
+                screens: config.screens,
                 extra: config.ports.extra.clone(),
             },
             created_at: chrono::Utc::now().to_rfc3339(),
@@ -563,7 +590,12 @@ impl DockerClient {
                     .map(SandboxStatus::from)
                     .unwrap_or(SandboxStatus::Unknown);
 
-                let ports = extract_ports(&c.ports.unwrap_or_default());
+                let screens: u32 = labels
+                    .get(Labels::SCREENS)
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(1);
+                let mut ports = extract_ports(&c.ports.unwrap_or_default());
+                ports.screens = screens;
 
                 Sandbox {
                     name,
@@ -634,14 +666,16 @@ impl DockerClient {
         })
     }
 
-    pub async fn screenshot(&self, target: &str) -> Result<Vec<u8>> {
+    pub async fn screenshot(&self, target: &str, display: &str) -> Result<Vec<u8>> {
         let out = self
             .exec(
                 target,
                 &[
                     "bash".into(),
                     "-c".into(),
-                    "scrot -z /tmp/_reach_shot.png && base64 -w 0 /tmp/_reach_shot.png && rm /tmp/_reach_shot.png".into(),
+                    format!(
+                        "DISPLAY={display} scrot -z /tmp/_reach_shot.png && base64 -w 0 /tmp/_reach_shot.png && rm /tmp/_reach_shot.png"
+                    ),
                 ],
             )
             .await?;
@@ -679,8 +713,13 @@ impl DockerClient {
             serde_json::to_string(&payload).context("failed to serialize page_text payload")?;
 
         // Pass the JSON via stdin-style env var to dodge shell quoting hell.
+        let display_prefix = opts
+            .display
+            .as_deref()
+            .map(|d| format!("DISPLAY={d} "))
+            .unwrap_or_default();
         let cmd = format!(
-            "REACH_PAGE_TEXT_PAYLOAD={} python3 -c {}",
+            "{display_prefix}REACH_PAGE_TEXT_PAYLOAD={} python3 -c {}",
             shell_single_quote(&payload_str),
             shell_single_quote(PAGE_TEXT_SCRIPT),
         );
@@ -730,8 +769,13 @@ impl DockerClient {
         let payload_str =
             serde_json::to_string(&payload).context("failed to serialize auth_handoff payload")?;
 
+        let display_prefix = opts
+            .display
+            .as_deref()
+            .map(|d| format!("DISPLAY={d} "))
+            .unwrap_or_default();
         let cmd = format!(
-            "REACH_AUTH_HANDOFF_PAYLOAD={} python3 -c {}",
+            "{display_prefix}REACH_AUTH_HANDOFF_PAYLOAD={} python3 -c {}",
             shell_single_quote(&payload_str),
             shell_single_quote(AUTH_HANDOFF_SCRIPT),
         );
@@ -827,6 +871,7 @@ fn extract_ports(ports: &[bollard::models::Port]) -> SandboxPortMapping {
         vnc: None,
         novnc: None,
         health: None,
+        screens: 1,
         extra: Vec::new(),
     };
 
@@ -859,6 +904,7 @@ pub struct PageTextOptions {
     pub timeout_ms: u64,
     /// Persistent Chrome user data dir inside the container.
     pub user_data_dir: Option<String>,
+    pub display: Option<String>,
 }
 
 /// Parsed output from the embedded `page_text` Python helper.
@@ -883,6 +929,7 @@ pub struct AuthHandoffOptions {
     pub wait_for_url_contains: Option<String>,
     pub timeout_seconds: u64,
     pub user_data_dir: Option<String>,
+    pub display: Option<String>,
 }
 
 /// Parsed output from the embedded `auth_handoff` Python helper.
@@ -977,6 +1024,22 @@ try:
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
             )
+            has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
+            state_file = "/workspace/.reach/state.json"
+            if not has_cookies and os.path.exists(state_file):
+                try:
+                    with open(state_file) as f:
+                        state = json.load(f)
+                    cookies = state.get("cookies", [])
+                    if cookies:
+                        import time
+                        now = time.time()
+                        for c in cookies:
+                            if c.get("expires", -1) <= 0:
+                                c["expires"] = int(now + 86400 * 30)
+                        ctx.add_cookies(cookies)
+                except Exception:
+                    pass
             page = ctx.new_page() if not ctx.pages else ctx.pages[0]
             owner = ctx
         else:
@@ -984,7 +1047,15 @@ try:
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
             )
-            page = browser.new_page()
+            state_file = "/workspace/.reach/state.json"
+            if os.path.exists(state_file):
+                try:
+                    ctx = browser.new_context(storage_state=state_file)
+                except Exception:
+                    ctx = browser.new_context()
+            else:
+                ctx = browser.new_context()
+            page = ctx.new_page()
             owner = browser
 
         try:
@@ -1060,6 +1131,22 @@ try:
             headless=False,
             args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
         )
+        has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
+        state_file = "/workspace/.reach/state.json"
+        if not has_cookies and os.path.exists(state_file):
+            try:
+                with open(state_file) as f:
+                    state = json.load(f)
+                cookies = state.get("cookies", [])
+                if cookies:
+                    now = time.time()
+                    for c in cookies:
+                        if c.get("expires", -1) <= 0:
+                            c["expires"] = int(now + 86400 * 30)
+                    ctx.add_cookies(cookies)
+            except Exception:
+                pass
+
         page = ctx.new_page() if not ctx.pages else ctx.pages[0]
 
         try:
@@ -1096,6 +1183,13 @@ try:
             except Exception:
                 pass
             time.sleep(1)
+
+        if matched:
+            try:
+                os.makedirs("/workspace/.reach", exist_ok=True)
+                ctx.storage_state(path="/workspace/.reach/state.json")
+            except Exception:
+                pass
 
         result = {
             "status": "authenticated" if matched else "timeout",

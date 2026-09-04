@@ -158,6 +158,7 @@ fn sandbox_serializes_to_json() {
             vnc: Some(5900),
             novnc: Some(6080),
             health: Some(8400),
+            screens: 1,
             extra: Vec::new(),
         },
         created_at: "2026-04-02T00:00:00Z".into(),
@@ -167,6 +168,35 @@ fn sandbox_serializes_to_json() {
     assert_eq!(json["name"], "test");
     assert_eq!(json["status"], "running");
     assert_eq!(json["ports"]["vnc"], 5900);
+    assert_eq!(json["ports"]["screens"], 1);
+}
+
+#[test]
+fn port_mapping_and_inspect_for_two_screens() {
+    let resp = fake_inspect(
+        &[
+            (Labels::MANAGED, "true"),
+            (Labels::NAME, "two-screens"),
+            (Labels::RESOLUTION, "1280x720"),
+            (Labels::SCREENS, "2"),
+        ],
+        "reach:latest",
+        &[
+            ("5900/tcp", "5900"),
+            ("5901/tcp", "5901"),
+            ("6080/tcp", "6080"),
+            ("6081/tcp", "6081"),
+            ("8400/tcp", "8400"),
+            ("9222/tcp", "9222"),
+        ],
+        None,
+        None,
+        false,
+    );
+    let config = config_from_inspect(&resp, std::path::Path::new("/tmp")).unwrap();
+    assert_eq!(config.screens, 2);
+    // 5900, 5901, 6080, 6081, 8400 should be recognized as known ports, only 9222 is extra
+    assert_eq!(config.ports.extra, vec![(9222, 9222)]);
 }
 
 // ═══════════════════════════════════════════════════════════
