@@ -14,11 +14,12 @@ pub struct ConnectArgs {
 }
 
 pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
-    let docker = DockerClient::new()?;
+    let cfg = ReachConfig::load();
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     let _sandbox = docker.find(&args.target).await?;
     let ctx = ToolContext {
         docker: &docker,
-        public_host: ReachConfig::load().server.effective_public_host(),
+        public_host: cfg.server.effective_public_host(),
         agent: None,
     };
 

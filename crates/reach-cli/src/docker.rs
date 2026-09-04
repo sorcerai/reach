@@ -390,13 +390,49 @@ pub fn config_from_inspect(
 // Docker client
 // ═══════════════════════════════════════════════════════════
 
+/// Resolve the Docker socket/host address by priority:
+/// 1. Explicit socket from config or CLI (if Some and non-empty)
+/// 2. `DOCKER_HOST` environment variable (if set and non-empty)
+/// 3. Default local socket (returns None)
+pub fn resolve_docker_socket(explicit: Option<&str>) -> Option<String> {
+    resolve_docker_socket_with_env(explicit, std::env::var("DOCKER_HOST").ok().as_deref())
+}
+
+pub fn resolve_docker_socket_with_env(
+    explicit: Option<&str>,
+    env_docker_host: Option<&str>,
+) -> Option<String> {
+    if let Some(s) = explicit {
+        let trimmed = s.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    if let Some(host) = env_docker_host {
+        let trimmed = host.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
 pub struct DockerClient {
     client: bollard::Docker,
 }
 
 impl DockerClient {
-    pub fn new() -> Result<Self> {
-        let client = bollard::Docker::connect_with_local_defaults()?;
+    pub fn new(socket: Option<&str>) -> Result<Self> {
+        let resolved = resolve_docker_socket(socket);
+        let client = match resolved {
+            Some(ref addr) if addr.starts_with("tcp://") || addr.starts_with("http://") => {
+                bollard::Docker::connect_with_http(addr, 120, bollard::API_DEFAULT_VERSION)?
+            }
+            Some(ref addr) => {
+                bollard::Docker::connect_with_socket(addr, 120, bollard::API_DEFAULT_VERSION)?
+            }
+            None => bollard::Docker::connect_with_local_defaults()?,
+        };
         Ok(Self { client })
     }
 

@@ -44,11 +44,12 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let port = args.port;
     let host = args.host.clone();
 
+    let cfg = ReachConfig::load();
     let public_host = args
         .public_host
-        .unwrap_or_else(|| ReachConfig::load().server.effective_public_host());
+        .unwrap_or_else(|| cfg.server.effective_public_host());
 
-    let docker = DockerClient::new()?;
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     let screens_count = match resolve_sandbox_name(&docker, args.sandbox.as_deref()).await {
         Ok(name) => match docker.find(&name).await {
             Ok(sb) => sb.ports.screens.max(1),
@@ -133,6 +134,7 @@ async fn agent_screens_handler(
             takeover_url: s.takeover_url,
             leased_at: s.leased_at,
             novnc_url: novnc_url(&state.public_host, novnc_base + s.id as u16),
+            busy: s.busy,
         })
         .collect();
 

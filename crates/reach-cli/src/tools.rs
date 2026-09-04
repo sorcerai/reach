@@ -62,6 +62,47 @@ pub fn browse_command(url: &str, profile_dir: &str) -> String {
     )
 }
 
+pub const SCRAPE_SCRIPT: &str = r#"
+import json
+import os
+
+payload = json.loads(os.environ.get("REACH_SCRAPE_PAYLOAD", "{}"))
+url = payload.get("url", "")
+selector = payload.get("selector", "body")
+stealth = payload.get("stealth", True)
+
+from scrapling import Fetcher, StealthyFetcher
+cls = StealthyFetcher if stealth else Fetcher
+r = cls().get(url)
+elems = r.css(selector)
+print(json.dumps([{'content': e.text, 'tag': e.tag} for e in elems]))
+"#;
+
+pub fn build_scrape_command(screen: u32, payload_json: &str) -> String {
+    let display = display_for(screen);
+    format!(
+        "DISPLAY={display} REACH_SCRAPE_PAYLOAD={} python3 -c {}",
+        crate::docker::shell_single_quote(payload_json),
+        crate::docker::shell_single_quote(SCRAPE_SCRIPT),
+    )
+}
+
+/// Returns whether a tool performs active work on a screen.
+pub fn is_active_tool(tool: &str) -> bool {
+    matches!(
+        tool,
+        "click"
+            | "type"
+            | "key"
+            | "browse"
+            | "scrape"
+            | "page_text"
+            | "auth_handoff"
+            | "playwright_eval"
+            | "exec"
+    )
+}
+
 pub async fn dispatch(
     ctx: &ToolContext<'_>,
     tool: &str,
@@ -70,6 +111,12 @@ pub async fn dispatch(
 ) -> ToolResponse {
     let screen = screen_for(args);
     let display = display_for(screen);
+
+    let _busy_guard = if is_active_tool(tool) {
+        ctx.agent.map(|a| a.mark_busy(screen))
+    } else {
+        None
+    };
 
     match tool {
         "screenshot" => match ctx.docker.screenshot(target, &display).await {
@@ -148,22 +195,25 @@ pub async fn dispatch(
                 .get("stealth")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
-            let f = if stealth {
-                "StealthyFetcher"
-            } else {
-                "Fetcher"
+            let payload = serde_json::json!({
+                "url": url,
+                "selector": sel,
+                "stealth": stealth,
+            });
+            let payload_str = match serde_json::to_string(&payload) {
+                Ok(s) => s,
+                Err(e) => return ToolResponse::error(e.to_string()),
             };
-            py(
-                ctx,
-                target,
-                screen,
-                &format!(
-                    "from scrapling import {f}; r = {f}().get('{url}'); \
-                     elems = r.css('{sel}'); \
-                     import json; print(json.dumps([{{'content': e.text, 'tag': e.tag}} for e in elems]))"
-                ),
-            )
-            .await
+            let cmd = build_scrape_command(screen, &payload_str);
+            match ctx
+                .docker
+                .exec(target, &["bash".into(), "-c".into(), cmd])
+                .await
+            {
+                Ok(out) if out.exit_code == 0 => ToolResponse::text(out.stdout),
+                Ok(out) => ToolResponse::error(format!("exit {}: {}", out.exit_code, out.stderr)),
+                Err(e) => ToolResponse::error(e.to_string()),
+            }
         }
         "playwright_eval" => {
             let script = args.get("script").and_then(|v| v.as_str()).unwrap_or("");
@@ -280,19 +330,22 @@ pub async fn dispatch(
         }
         "live_view" => match ctx.docker.find(target).await {
             Ok(sb) => {
-                let busy = ctx
-                    .docker
-                    .exec(
-                        target,
-                        &[
-                            "bash".into(),
-                            "-c".into(),
-                            format!("DISPLAY={display} xdotool getactivewindow"),
-                        ],
-                    )
-                    .await
-                    .map(|o| o.exit_code == 0)
-                    .unwrap_or(false);
+                let busy = if let Some(agent) = ctx.agent {
+                    agent.is_busy(screen)
+                } else {
+                    ctx.docker
+                        .exec(
+                            target,
+                            &[
+                                "bash".into(),
+                                "-c".into(),
+                                format!("DISPLAY={display} xdotool getactivewindow"),
+                            ],
+                        )
+                        .await
+                        .map(|o| o.exit_code == 0)
+                        .unwrap_or(false)
+                };
                 ToolResponse::text(
                     serde_json::json!({
                         "novnc_url": novnc_url_for_screen(ctx, &sb, screen),
@@ -389,5 +442,76 @@ mod tests {
         );
         assert!(cmd.contains("%27c%27"));
         assert!(cmd.ends_with(" &"));
+    }
+
+    #[test]
+    fn active_tool_identification() {
+        assert!(is_active_tool("click"));
+        assert!(is_active_tool("type"));
+        assert!(is_active_tool("key"));
+        assert!(is_active_tool("browse"));
+        assert!(is_active_tool("scrape"));
+        assert!(is_active_tool("page_text"));
+        assert!(is_active_tool("auth_handoff"));
+        assert!(is_active_tool("playwright_eval"));
+        assert!(is_active_tool("exec"));
+
+        assert!(!is_active_tool("live_view"));
+        assert!(!is_active_tool("screenshot"));
+    }
+
+    #[test]
+    fn scrape_script_is_valid_python_syntax() {
+        let output = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(format!("import ast; ast.parse({:?})", SCRAPE_SCRIPT))
+            .output()
+            .expect("python3 must be available on host");
+        assert!(
+            output.status.success(),
+            "SCRAPE_SCRIPT must be valid Python syntax: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    #[test]
+    fn scrape_payload_handles_quotes_and_special_characters_without_syntax_error() {
+        let tricky_url = "https://example.com/search?q='hello'&test=\"world\"&sym=`$()\\#!@#%^&*";
+        let tricky_selector =
+            "div[data-title='it\\'s \"great\"'][aria-label=\"foo'bar\"] > span:first-child";
+        let payload = serde_json::json!({
+            "url": tricky_url,
+            "selector": tricky_selector,
+            "stealth": true,
+        });
+        let payload_str = serde_json::to_string(&payload).unwrap();
+        let cmd = build_scrape_command(0, &payload_str);
+
+        // Verify the generated command string contains the single-quoted payload and display prefix
+        assert!(cmd.starts_with("DISPLAY=:99 REACH_SCRAPE_PAYLOAD="));
+        assert!(cmd.contains("python3 -c"));
+
+        // Execute bash with the exact generated environment string to verify Python safely decodes it
+        let test_cmd = format!(
+            "REACH_SCRAPE_PAYLOAD={} python3 -c 'import json, os; p = json.loads(os.environ[\"REACH_SCRAPE_PAYLOAD\"]); print(json.dumps(p))'",
+            crate::docker::shell_single_quote(&payload_str),
+        );
+        let output = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(test_cmd)
+            .output()
+            .expect("failed to execute bash command");
+
+        assert!(
+            output.status.success(),
+            "Python script failed with exit code {:?}: {}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let decoded: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(decoded["url"], tricky_url);
+        assert_eq!(decoded["selector"], tricky_selector);
+        assert_eq!(decoded["stealth"], true);
     }
 }

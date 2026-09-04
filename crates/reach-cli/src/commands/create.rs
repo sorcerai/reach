@@ -168,7 +168,7 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         vnc_password: vnc_password.clone(),
     };
 
-    let docker = DockerClient::new()?;
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     let sandbox = docker.create(config).await?;
 
     println!();

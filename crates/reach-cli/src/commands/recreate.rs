@@ -1,5 +1,6 @@
 use clap::Args;
 use colored::Colorize;
+use reach_cli::config::ReachConfig;
 use reach_cli::docker::DockerClient;
 use std::time::Duration;
 
@@ -14,7 +15,8 @@ pub struct RecreateArgs {
 }
 
 pub async fn run(args: RecreateArgs) -> anyhow::Result<()> {
-    let docker = DockerClient::new()?;
+    let cfg = ReachConfig::load();
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     let sandbox = docker.recreate(&args.target, args.image).await?;
     docker
         .wait_healthy(&sandbox.name, Duration::from_secs(45))

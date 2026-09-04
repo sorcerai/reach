@@ -485,3 +485,58 @@ fn novnc_url_uses_localhost_pattern() {
         "http://localhost:6080/vnc.html?autoconnect=1&resize=remote"
     );
 }
+
+// ═══════════════════════════════════════════════════════════
+// Docker socket resolution
+// ═══════════════════════════════════════════════════════════
+
+#[test]
+fn resolve_docker_socket_prioritizes_explicit_config() {
+    let resolved = resolve_docker_socket_with_env(
+        Some("unix:///custom/docker.sock"),
+        Some("unix:///env/docker.sock"),
+    );
+    assert_eq!(resolved.as_deref(), Some("unix:///custom/docker.sock"));
+}
+
+#[test]
+fn resolve_docker_socket_falls_back_to_env_when_explicit_is_none() {
+    let resolved = resolve_docker_socket_with_env(None, Some("unix:///env/docker.sock"));
+    assert_eq!(resolved.as_deref(), Some("unix:///env/docker.sock"));
+}
+
+#[test]
+fn resolve_docker_socket_falls_back_to_env_when_explicit_is_whitespace() {
+    let resolved = resolve_docker_socket_with_env(Some("   "), Some("unix:///env/docker.sock"));
+    assert_eq!(resolved.as_deref(), Some("unix:///env/docker.sock"));
+}
+
+#[test]
+fn resolve_docker_socket_returns_none_when_both_unset() {
+    let resolved = resolve_docker_socket_with_env(None, None);
+    assert_eq!(resolved, None);
+}
+
+#[test]
+fn resolve_docker_socket_returns_none_when_both_whitespace() {
+    let resolved = resolve_docker_socket_with_env(Some("  "), Some("  "));
+    assert_eq!(resolved, None);
+}
+
+#[test]
+fn docker_config_socket_path_method() {
+    use reach_cli::config::ReachConfig;
+
+    let toml = r#"
+[docker]
+socket = "unix:///run/user/1000/docker.sock"
+"#;
+    let cfg: ReachConfig = toml::from_str(toml).unwrap();
+    assert_eq!(
+        cfg.docker.socket_path(),
+        Some("unix:///run/user/1000/docker.sock")
+    );
+
+    let default_cfg = ReachConfig::default();
+    assert_eq!(default_cfg.docker.socket_path(), None);
+}

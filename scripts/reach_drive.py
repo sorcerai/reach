@@ -11,10 +11,12 @@ from __future__ import annotations
 
 import argparse
 import base64
+import html
 import json
 import logging
 import os
 import re
+import secrets
 import shutil
 import subprocess
 import sys
@@ -24,7 +26,9 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 logger = logging.getLogger("reach_drive")
 
@@ -32,6 +36,14 @@ DEFAULT_API_URL = os.environ.get("REACH_AGENT_URL", "http://127.0.0.1:4200")
 DEFAULT_MODEL = "gemini-3.8-flash-high"
 DEFAULT_AGY_BIN = os.environ.get("AGY_BIN", "/Users/ahpramesi/.local/bin/agy")
 DEFAULT_TIMEOUT_SEC = 120
+
+DEFAULT_MUTATION_PATTERNS = [
+    r"\b(delete|destroy|remove|drop\s+table|wipe|purge|truncate)\b",
+    r"\b(pay|purchase|order|checkout|buy\s+now|confirm\s+payment|authorize\s+charge)\b",
+    r"\b(transfer|wire|send\s+money)\b",
+    r"\b(terminate\s+account|delete\s+account|close\s+account|cancel\s+subscription|deactivate\s+account)\b",
+    r"\b(rm\s+-rf|format\s+disk|drop\s+database)\b",
+]
 
 # Gauntlet-style control instruction delimiters
 AGY_CONTROL_PREFIX = [
@@ -81,6 +93,7 @@ class ReachAction:
     key: Optional[str] = None
     button: str = "left"
     description: str = ""
+    requires_approval: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -98,6 +111,8 @@ class ReachAction:
             d["key"] = self.key
         if self.button != "left":
             d["button"] = self.button
+        if self.requires_approval:
+            d["requires_approval"] = True
         return d
 
 
@@ -107,11 +122,13 @@ class StepRecord:
     action: ReachAction
     observation_summary: str
     screenshot_path: Optional[str] = None
+    after_screenshot_path: Optional[str] = None
+    timestamp: Optional[str] = None
     result: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "step_index": self.step_index,
             "action": self.action.to_dict(),
             "observation_summary": self.observation_summary,
@@ -119,19 +136,26 @@ class StepRecord:
             "result": self.result,
             "error": self.error,
         }
+        if self.after_screenshot_path is not None:
+            d["after_screenshot_path"] = self.after_screenshot_path
+        if self.timestamp is not None:
+            d["timestamp"] = self.timestamp
+        return d
 
 
 @dataclass
 class DriveResult:
     success: bool
-    status: str  # "completed" | "auth_required" | "max_steps_exceeded" | "failed"
+    status: str  # "completed" | "auth_required" | "approval_required" | "max_steps_exceeded" | "failed"
     steps: List[StepRecord] = field(default_factory=list)
     final_description: str = ""
     takeover_url: Optional[str] = None
+    task_id: Optional[str] = None
+    audit_report_path: Optional[str] = None
     error: Optional[str] = None
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "success": self.success,
             "status": self.status,
             "final_description": self.final_description,
@@ -139,6 +163,459 @@ class DriveResult:
             "error": self.error,
             "steps": [s.to_dict() for s in self.steps],
         }
+        if self.task_id is not None:
+            d["task_id"] = self.task_id
+        if self.audit_report_path is not None:
+            d["audit_report_path"] = self.audit_report_path
+        return d
+
+
+class ApprovalGate:
+    """Policy interceptor for dangerous mutations requiring explicit approval."""
+
+    def __init__(
+        self,
+        patterns: Optional[List[str]] = None,
+        allow_mutations: bool = False,
+        require_approval: bool = False,
+        interactive: Optional[bool] = None,
+        approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
+    ) -> None:
+        raw_patterns = patterns if patterns is not None else DEFAULT_MUTATION_PATTERNS
+        self.regexes = [re.compile(p, re.IGNORECASE) for p in raw_patterns]
+        self.allow_mutations = allow_mutations
+        self.require_approval = require_approval
+        self.interactive = interactive if interactive is not None else sys.stdin.isatty()
+        self.approval_callback = approval_callback
+
+    def check_action(self, action: ReachAction) -> Tuple[bool, Optional[str]]:
+        """Check whether an action matches dangerous mutation policies."""
+        if str(action.action_class).lower() in (
+            "dangerous",
+            "irreversible_mutation",
+            "requires_approval",
+        ):
+            return True, f"Action class '{action.action_class}' is marked dangerous"
+
+        parts = [
+            action.target or "",
+            action.value or "",
+            action.description or "",
+            action.key or "",
+        ]
+        text_to_scan = " ".join(parts)
+        for rx in self.regexes:
+            m = rx.search(text_to_scan)
+            if m:
+                return True, f"Matches dangerous pattern '{m.group(0)}'"
+
+        return False, None
+
+    def evaluate(self, action: ReachAction) -> Tuple[bool, Optional[str], bool]:
+        """Evaluate action. Returns (is_dangerous, reason, approved)."""
+        is_dangerous, reason = self.check_action(action)
+        if not is_dangerous:
+            return False, None, True
+
+        action.action_class = "REQUIRES_APPROVAL"
+        action.requires_approval = True
+
+        if self.allow_mutations:
+            logger.info("Dangerous action approved via allow_mutations: %s", reason)
+            return True, reason, True
+
+        if self.approval_callback is not None:
+            approved = bool(self.approval_callback(action, reason or ""))
+            return True, reason, approved
+
+        if not self.interactive or self.require_approval:
+            return True, reason, False
+
+        return True, reason, self._prompt_user(action, reason or "")
+
+    def _prompt_user(self, action: ReachAction, reason: str) -> bool:
+        sys.stderr.write(
+            f"\n[APPROVAL GATE] Dangerous action detected: {reason}\n"
+            f"Action: {json.dumps(action.to_dict())}\n"
+            f"Approve and proceed? [y/N]: "
+        )
+        sys.stderr.flush()
+        try:
+            ans = sys.stdin.readline().strip().lower()
+            return ans in ("y", "yes")
+        except Exception:
+            return False
+
+
+def _generate_task_id() -> str:
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    rand_suffix = secrets.token_hex(3)
+    return f"task_{ts}_{rand_suffix}"
+
+
+def _resolve_audit_dir(custom_dir: Optional[Union[str, Path]], task_id: str) -> Path:
+    if custom_dir:
+        return Path(custom_dir)
+    workspace = Path("/workspace")
+    if workspace.exists() and os.access(workspace, os.W_OK):
+        return workspace / "reports" / task_id
+    return Path.home() / ".reach" / "audit" / task_id
+
+
+def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> str:
+    """Generate an HTML visual audit report showing step-by-step diffs and reel."""
+    audit_path = Path(audit_dir)
+    audit_path.mkdir(parents=True, exist_ok=True)
+    report_file = audit_path / "report.html"
+
+    task_id = html.escape(str(meta.get("task_id", "unknown")))
+    goal = html.escape(str(meta.get("goal", "No goal specified")))
+    status = str(meta.get("status", "unknown")).upper()
+    success = bool(meta.get("success", False))
+    duration = meta.get("duration_sec", 0.0)
+    start_time = html.escape(str(meta.get("start_time", "")))
+    steps_data = meta.get("steps", [])
+
+    status_class = "status-completed" if success else f"status-{status.lower()}"
+
+    steps_html = []
+    for step in steps_data:
+        idx = step.get("step_index", 0)
+        action = step.get("action", {})
+        kind = html.escape(str(action.get("kind", "unknown")).upper())
+        act_desc = html.escape(str(action.get("description", "")))
+        act_class = action.get("action_class", "read_only")
+        req_approval = bool(action.get("requires_approval", False) or act_class == "REQUIRES_APPROVAL")
+        obs = html.escape(str(step.get("observation_summary", "")))
+        timestamp = html.escape(str(step.get("timestamp", "")))
+        point = action.get("point")
+        target = html.escape(str(action.get("target", ""))) if action.get("target") else ""
+        val = html.escape(str(action.get("value", ""))) if action.get("value") else ""
+        key = html.escape(str(action.get("key", ""))) if action.get("key") else ""
+
+        approval_badge = '<span class="badge badge-warning">⚠️ MUTATION APPROVAL REQUIRED</span>' if req_approval else ""
+
+        details = []
+        if point:
+            details.append(f"<strong>Point:</strong> ({point[0]}, {point[1]})")
+        if target:
+            details.append(f"<strong>Target:</strong> <code>{target}</code>")
+        if val:
+            details.append(f"<strong>Value:</strong> <code>{val}</code>")
+        if key:
+            details.append(f"<strong>Key:</strong> <code>{key}</code>")
+        details_html = " &nbsp;|&nbsp; ".join(details) if details else ""
+
+        before_file = f"step_{idx:03d}_before.png"
+        after_file = f"step_{idx:03d}_after.png"
+        has_before = (audit_path / before_file).exists()
+        has_after = (audit_path / after_file).exists()
+
+        marker_html = ""
+        if point and len(point) >= 2:
+            marker_html = f'<div class="click-marker" style="left: {point[0]}px; top: {point[1]}px;" title="Click ({point[0]}, {point[1]})"></div>'
+
+        before_img_tag = (
+            f'<div class="img-container"><img src="{before_file}" alt="Before Step {idx}" loading="lazy"/>{marker_html}</div>'
+            if has_before
+            else '<div class="img-placeholder">No Before Screenshot</div>'
+        )
+        after_img_tag = (
+            f'<div class="img-container"><img src="{after_file}" alt="After Step {idx}" loading="lazy"/></div>'
+            if has_after
+            else '<div class="img-placeholder">No After Screenshot</div>'
+        )
+
+        res = step.get("result", {})
+        err = step.get("error")
+        res_text = html.escape(str(err or res.get("status") or "ok"))
+        res_class = "result-err" if err else "result-ok"
+
+        steps_html.append(f"""
+        <div class="step-card">
+          <div class="step-header">
+            <div class="step-title">
+              <span class="step-number">Step #{idx}</span>
+              <span class="badge badge-kind">{kind}</span>
+              {approval_badge}
+            </div>
+            <div class="step-time">{timestamp}</div>
+          </div>
+          <div class="step-body">
+            <div class="step-desc">{act_desc}</div>
+            {f'<div class="step-meta">{details_html}</div>' if details_html else ''}
+            {f'<div class="step-obs"><em>Observation:</em> {obs}</div>' if obs else ''}
+            <div class="diff-container">
+              <div class="diff-pane">
+                <div class="diff-label">BEFORE ACTION</div>
+                {before_img_tag}
+              </div>
+              <div class="diff-pane">
+                <div class="diff-label">AFTER ACTION</div>
+                {after_img_tag}
+              </div>
+            </div>
+          </div>
+          <div class="step-footer">
+            <span class="result-badge {res_class}">Outcome: {res_text}</span>
+          </div>
+        </div>
+        """)
+
+    rendered_steps = "\n".join(steps_html) if steps_html else '<div class="empty-state">No steps recorded.</div>'
+
+    html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Reach Visual Audit - {task_id}</title>
+  <style>
+    :root {{
+      --bg-main: #090d16;
+      --bg-card: #131b2e;
+      --bg-card-header: #1b2640;
+      --border-color: #243452;
+      --text-main: #f1f5f9;
+      --text-muted: #94a3b8;
+      --color-primary: #38bdf8;
+      --color-success: #10b981;
+      --color-warning: #f59e0b;
+      --color-danger: #ef4444;
+      --color-purple: #a855f7;
+    }}
+    * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background-color: var(--bg-main);
+      color: var(--text-main);
+      line-height: 1.5;
+      padding: 24px;
+    }}
+    .container {{ max-width: 1200px; margin: 0 auto; }}
+    .header {{
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 12px;
+      padding: 24px;
+      margin-bottom: 24px;
+    }}
+    .header-top {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 16px;
+      flex-wrap: wrap;
+      gap: 12px;
+    }}
+    .brand {{
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--color-primary);
+    }}
+    .task-title {{
+      font-size: 24px;
+      font-weight: 700;
+      color: var(--text-main);
+      margin-top: 4px;
+    }}
+    .status-badge {{
+      display: inline-block;
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 13px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+    }}
+    .status-completed {{ background: rgba(16, 185, 129, 0.15); color: #34d399; border: 1px solid #059669; }}
+    .status-approval_required {{ background: rgba(168, 85, 247, 0.15); color: #c084fc; border: 1px solid #9333ea; }}
+    .status-auth_required {{ background: rgba(245, 158, 11, 0.15); color: #fbbf24; border: 1px solid #d97706; }}
+    .status-failed, .status-max_steps_exceeded {{ background: rgba(239, 68, 68, 0.15); color: #f87171; border: 1px solid #dc2626; }}
+    .goal-box {{
+      background: rgba(15, 23, 42, 0.7);
+      border-left: 4px solid var(--color-primary);
+      border-radius: 4px;
+      padding: 12px 16px;
+      margin-bottom: 20px;
+    }}
+    .goal-label {{ font-size: 11px; text-transform: uppercase; font-weight: 700; color: var(--color-primary); margin-bottom: 4px; }}
+    .goal-text {{ font-size: 15px; color: var(--text-main); font-weight: 500; }}
+    .metrics-grid {{
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      gap: 16px;
+    }}
+    .metric-card {{
+      background: rgba(15, 23, 42, 0.5);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 12px 16px;
+    }}
+    .metric-label {{ font-size: 11px; text-transform: uppercase; color: var(--text-muted); font-weight: 600; }}
+    .metric-value {{ font-size: 18px; font-weight: 700; color: var(--text-main); margin-top: 4px; }}
+    .timeline-title {{
+      font-size: 18px;
+      font-weight: 700;
+      color: var(--text-main);
+      margin: 32px 0 16px 0;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }}
+    .step-card {{
+      background: var(--bg-card);
+      border: 1px solid var(--border-color);
+      border-radius: 10px;
+      margin-bottom: 20px;
+      overflow: hidden;
+    }}
+    .step-header {{
+      background: var(--bg-card-header);
+      border-bottom: 1px solid var(--border-color);
+      padding: 12px 18px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 8px;
+    }}
+    .step-title {{ display: flex; align-items: center; gap: 10px; }}
+    .step-number {{ font-weight: 700; font-size: 15px; color: var(--text-main); }}
+    .badge {{
+      display: inline-block;
+      padding: 3px 8px;
+      border-radius: 4px;
+      font-size: 11px;
+      font-weight: 700;
+    }}
+    .badge-kind {{ background: #1e293b; color: var(--color-primary); border: 1px solid #334155; }}
+    .badge-warning {{ background: rgba(245, 158, 11, 0.2); color: #fbbf24; border: 1px solid #d97706; }}
+    .step-time {{ font-size: 12px; color: var(--text-muted); }}
+    .step-body {{ padding: 18px; }}
+    .step-desc {{ font-size: 15px; font-weight: 600; color: var(--text-main); margin-bottom: 8px; }}
+    .step-meta {{ font-size: 13px; color: var(--text-muted); margin-bottom: 8px; }}
+    .step-meta code {{ background: #0f172a; padding: 2px 6px; border-radius: 4px; color: #38bdf8; }}
+    .step-obs {{ font-size: 13px; color: var(--text-muted); background: rgba(15, 23, 42, 0.6); padding: 8px 12px; border-radius: 6px; margin-bottom: 14px; }}
+    .diff-container {{
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+      margin-top: 12px;
+    }}
+    @media (max-width: 768px) {{ .diff-container {{ grid-template-columns: 1fr; }} }}
+    .diff-pane {{
+      background: #090d16;
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 10px;
+    }}
+    .diff-label {{
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }}
+    .img-container {{
+      position: relative;
+      display: block;
+      width: 100%;
+      overflow: hidden;
+      border-radius: 4px;
+      background: #000;
+    }}
+    .img-container img {{
+      display: block;
+      width: 100%;
+      height: auto;
+    }}
+    .img-placeholder {{
+      height: 160px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: var(--text-muted);
+      font-size: 13px;
+      font-style: italic;
+      background: #090d16;
+    }}
+    .click-marker {{
+      position: absolute;
+      width: 20px;
+      height: 20px;
+      margin-left: -10px;
+      margin-top: -10px;
+      border: 2px solid #ef4444;
+      background: rgba(239, 68, 68, 0.4);
+      border-radius: 50%;
+      pointer-events: none;
+      box-shadow: 0 0 8px #ef4444;
+    }}
+    .step-footer {{
+      background: var(--bg-card-header);
+      border-top: 1px solid var(--border-color);
+      padding: 10px 18px;
+      font-size: 12px;
+    }}
+    .result-badge {{ font-weight: 600; }}
+    .result-ok {{ color: var(--color-success); }}
+    .result-err {{ color: var(--color-danger); }}
+    .empty-state {{ text-align: center; padding: 48px; color: var(--text-muted); }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="header-top">
+        <div>
+          <div class="brand">Reach + Hermes Visual Audit Reel</div>
+          <div class="task-title">{task_id}</div>
+        </div>
+        <div>
+          <span class="status-badge {status_class}">{status}</span>
+        </div>
+      </div>
+      <div class="goal-box">
+        <div class="goal-label">Task Objective / Goal</div>
+        <div class="goal-text">{goal}</div>
+      </div>
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-label">Status</div>
+          <div class="metric-value">{status}</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Total Steps</div>
+          <div class="metric-value">{len(steps_data)}</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Duration</div>
+          <div class="metric-value">{duration}s</div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-label">Recorded At</div>
+          <div class="metric-value" style="font-size: 13px; font-weight: normal; margin-top: 6px;">{start_time or "N/A"}</div>
+        </div>
+      </div>
+    </div>
+
+    <div class="timeline-title">
+      <span>Visual Diff Step Reel</span>
+    </div>
+
+    <div class="timeline-list">
+      {rendered_steps}
+    </div>
+  </div>
+</body>
+</html>
+"""
+    with open(report_file, "w", encoding="utf-8") as f:
+        f.write(html_content)
+
+    return str(report_file.resolve())
 
 
 class ReachDriver:
@@ -155,6 +632,13 @@ class ReachDriver:
         max_steps: int = 20,
         timeout_sec: int = DEFAULT_TIMEOUT_SEC,
         workdir: Optional[str] = None,
+        task_id: Optional[str] = None,
+        audit_dir: Optional[Union[str, Path]] = None,
+        enable_audit: bool = True,
+        allow_mutations: bool = False,
+        require_approval: bool = False,
+        approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
+        interactive: Optional[bool] = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.screen = screen
@@ -165,7 +649,67 @@ class ReachDriver:
         self.max_steps = max_steps
         self.timeout_sec = timeout_sec
         self.workdir = workdir
+        self.task_id = task_id or _generate_task_id()
+        self.audit_dir = _resolve_audit_dir(audit_dir, self.task_id)
+        self.enable_audit = enable_audit
+        self.approval_gate = ApprovalGate(
+            allow_mutations=allow_mutations,
+            require_approval=require_approval,
+            interactive=interactive,
+            approval_callback=approval_callback,
+        )
         self._temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]] = None
+
+    def _archive_screenshot(self, src_path: str, filename: str) -> Optional[str]:
+        """Save a screenshot into the visual audit directory."""
+        if not self.enable_audit:
+            return None
+        try:
+            self.audit_dir.mkdir(parents=True, exist_ok=True)
+            dst_path = self.audit_dir / filename
+            if os.path.isfile(src_path):
+                shutil.copyfile(src_path, dst_path)
+            else:
+                dst_path.touch()
+            return str(dst_path.resolve())
+        except Exception as e:
+            logger.debug("Failed to archive screenshot %s: %s", filename, e)
+            return None
+
+    def _finalize_audit(
+        self, result: DriveResult, goal: str, start_time: float, end_time: float
+    ) -> Optional[str]:
+        """Write audit_meta.json and generate HTML visual audit report."""
+        if not self.enable_audit:
+            return None
+        try:
+            self.audit_dir.mkdir(parents=True, exist_ok=True)
+            meta = {
+                "task_id": self.task_id,
+                "goal": goal,
+                "screen": self.screen,
+                "model": self.model,
+                "status": result.status,
+                "success": result.success,
+                "final_description": result.final_description,
+                "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time)),
+                "end_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_time)),
+                "duration_sec": round(max(0.0, end_time - start_time), 2),
+                "takeover_url": result.takeover_url,
+                "error": result.error,
+                "steps": [s.to_dict() for s in result.steps],
+            }
+            meta_file = self.audit_dir / "audit_meta.json"
+            with open(meta_file, "w", encoding="utf-8") as f:
+                json.dump(meta, f, indent=2)
+
+            report_file = generate_html_report(self.audit_dir, meta)
+            result.audit_report_path = report_file
+            result.task_id = self.task_id
+            return report_file
+        except Exception as e:
+            logger.warning("Failed to finalize visual audit report: %s", e)
+            return None
 
     def _resolve_agy(self, custom_path: Optional[str]) -> str:
         if (
@@ -645,10 +1189,14 @@ class ReachDriver:
         initial_url: Optional[str] = None,
     ) -> DriveResult:
         """Run the Gauntlet-style vision loop until termination or takeover."""
+        start_time = time.time()
         steps: List[StepRecord] = []
         current_url = initial_url
         logger.info(
-            "Starting Reach CUA Driver. Goal: %s (Screen: %s)", goal, self.screen
+            "Starting Reach CUA Driver. Goal: %s (Screen: %s, Task: %s)",
+            goal,
+            self.screen,
+            self.task_id,
         )
 
         if initial_url:
@@ -669,8 +1217,13 @@ class ReachDriver:
 
         try:
             for step_idx in range(1, self.max_steps + 1):
+                step_timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
                 remaining = self.max_steps - step_idx + 1
                 screenshot_path = self.capture_screenshot(step_idx)
+                # Archive before-screenshot into audit reel
+                self._archive_screenshot(
+                    screenshot_path, f"step_{step_idx:03d}_before.png"
+                )
                 page_text = self.capture_page_text(current_url)
 
                 # Heuristic 2FA check on DOM
@@ -687,16 +1240,20 @@ class ReachDriver:
                             action=action,
                             observation_summary=page_text[:160],
                             screenshot_path=screenshot_path,
+                            timestamp=step_timestamp,
                             result={"status": "auth_required", "vnc_url": vnc_url},
                         )
                     )
-                    return DriveResult(
+                    res = DriveResult(
                         success=False,
                         status="auth_required",
                         steps=steps,
                         takeover_url=vnc_url,
                         final_description=action.description,
+                        task_id=self.task_id,
                     )
+                    self._finalize_audit(res, goal, start_time, time.time())
+                    return res
 
                 prompt = self.build_prompt(
                     goal=goal,
@@ -721,15 +1278,19 @@ class ReachDriver:
                             ),
                             observation_summary="",
                             screenshot_path=screenshot_path,
+                            timestamp=step_timestamp,
                             error=str(model_err),
                         )
                     )
-                    return DriveResult(
+                    res = DriveResult(
                         success=False,
                         status="failed",
                         steps=steps,
                         error=f"Model failure at step {step_idx}: {model_err}",
+                        task_id=self.task_id,
                     )
+                    self._finalize_audit(res, goal, start_time, time.time())
+                    return res
 
                 logger.info(
                     "Step %s -> %s: %s (%s)",
@@ -751,16 +1312,20 @@ class ReachDriver:
                             if page_text
                             else "Auth required",
                             screenshot_path=screenshot_path,
+                            timestamp=step_timestamp,
                             result={"status": "auth_required", "vnc_url": vnc_url},
                         )
                     )
-                    return DriveResult(
+                    res = DriveResult(
                         success=False,
                         status="auth_required",
                         steps=steps,
                         takeover_url=vnc_url,
                         final_description=action.description,
+                        task_id=self.task_id,
                     )
+                    self._finalize_audit(res, goal, start_time, time.time())
+                    return res
 
                 # Handle termination
                 if action.kind == "terminate":
@@ -772,15 +1337,51 @@ class ReachDriver:
                             if page_text
                             else "Terminated",
                             screenshot_path=screenshot_path,
+                            timestamp=step_timestamp,
                             result={"status": "completed"},
                         )
                     )
-                    return DriveResult(
+                    res = DriveResult(
                         success=True,
                         status="completed",
                         steps=steps,
                         final_description=action.description or "Goal achieved",
+                        task_id=self.task_id,
                     )
+                    self._finalize_audit(res, goal, start_time, time.time())
+                    return res
+
+                # Check Dangerous Mutation Approval Gate
+                is_dangerous, danger_reason, approved = self.approval_gate.evaluate(action)
+                if is_dangerous and not approved:
+                    logger.warning("Dangerous action paused for approval: %s", danger_reason)
+                    approval_notice = {
+                        "status": "approval_required",
+                        "action": action.to_dict(),
+                        "reason": danger_reason,
+                    }
+                    print(json.dumps(approval_notice), file=sys.stderr)
+                    steps.append(
+                        StepRecord(
+                            step_index=step_idx,
+                            action=action,
+                            observation_summary=page_text[:160]
+                            if page_text
+                            else "Dangerous mutation intercepted",
+                            screenshot_path=screenshot_path,
+                            timestamp=step_timestamp,
+                            result=approval_notice,
+                        )
+                    )
+                    res = DriveResult(
+                        success=False,
+                        status="approval_required",
+                        steps=steps,
+                        final_description=f"Action requires approval: {danger_reason}",
+                        task_id=self.task_id,
+                    )
+                    self._finalize_audit(res, goal, start_time, time.time())
+                    return res
 
                 # Update current_url if navigating
                 if action.kind == "navigate":
@@ -795,12 +1396,25 @@ class ReachDriver:
                     step_error = str(ex)
                     logger.warning("Step %s action execution error: %s", step_idx, ex)
 
+                # Capture after-screenshot for visual diff reel
+                after_shot_path: Optional[str] = None
+                if self.enable_audit:
+                    try:
+                        raw_after = self.capture_screenshot(f"{step_idx}_after")
+                        after_shot_path = self._archive_screenshot(
+                            raw_after, f"step_{step_idx:03d}_after.png"
+                        )
+                    except Exception as shot_err:
+                        logger.debug("After screenshot capture skipped: %s", shot_err)
+
                 steps.append(
                     StepRecord(
                         step_index=step_idx,
                         action=action,
                         observation_summary=page_text[:160] if page_text else "",
                         screenshot_path=screenshot_path,
+                        after_screenshot_path=after_shot_path,
+                        timestamp=step_timestamp,
                         result=exec_result,
                         error=step_error,
                     )
@@ -810,12 +1424,15 @@ class ReachDriver:
                 time.sleep(1.0)
 
             # Reached max steps without termination
-            return DriveResult(
+            res = DriveResult(
                 success=False,
                 status="max_steps_exceeded",
                 steps=steps,
                 final_description=f"Exceeded maximum steps ({self.max_steps})",
+                task_id=self.task_id,
             )
+            self._finalize_audit(res, goal, start_time, time.time())
+            return res
         finally:
             pass
 
@@ -827,6 +1444,12 @@ def drive_goal(
     model: str = DEFAULT_MODEL,
     max_steps: int = 20,
     initial_url: Optional[str] = None,
+    task_id: Optional[str] = None,
+    audit_dir: Optional[Union[str, Path]] = None,
+    enable_audit: bool = True,
+    allow_mutations: bool = False,
+    require_approval: bool = False,
+    approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
 ) -> DriveResult:
     """Convenience helper to drive a goal to completion."""
     driver = ReachDriver(
@@ -834,6 +1457,12 @@ def drive_goal(
         screen=screen,
         model=model,
         max_steps=max_steps,
+        task_id=task_id,
+        audit_dir=audit_dir,
+        enable_audit=enable_audit,
+        allow_mutations=allow_mutations,
+        require_approval=require_approval,
+        approval_callback=approval_callback,
     )
     return driver.drive(goal=goal, initial_url=initial_url)
 
@@ -866,6 +1495,29 @@ def main() -> None:
         "--initial-url", default=None, help="Optional initial URL to open"
     )
     parser.add_argument("--workdir", default=None, help="Directory to save screenshots")
+    parser.add_argument("--task-id", default=None, help="Task ID for visual audit reel")
+    parser.add_argument("--audit-dir", default=None, help="Directory to save audit reel report")
+    parser.add_argument(
+        "--no-audit",
+        action="store_false",
+        dest="enable_audit",
+        help="Disable visual diff audit reel generation",
+    )
+    parser.add_argument(
+        "--allow-mutations",
+        action="store_true",
+        help="Allow dangerous mutations without approval pause",
+    )
+    parser.add_argument(
+        "--require-approval",
+        action="store_true",
+        help="Always pause and require approval on dangerous mutations",
+    )
+    parser.add_argument(
+        "--non-interactive",
+        action="store_true",
+        help="Run non-interactively without prompting stdin",
+    )
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose debug logging"
@@ -886,6 +1538,12 @@ def main() -> None:
         sandbox=args.sandbox,
         max_steps=args.max_steps,
         workdir=args.workdir,
+        task_id=args.task_id,
+        audit_dir=args.audit_dir,
+        enable_audit=args.enable_audit,
+        allow_mutations=args.allow_mutations,
+        require_approval=args.require_approval,
+        interactive=not args.non_interactive,
     )
 
     result = driver.drive(goal=args.goal, initial_url=args.initial_url)
@@ -899,6 +1557,9 @@ def main() -> None:
         if result.takeover_url:
             print("\n[!] Human Takeover Required:")
             print(f"    Live view: {result.takeover_url}")
+        if result.audit_report_path:
+            print("\n[+] Visual Diff Audit Reel:")
+            print(f"    Report: {result.audit_report_path}")
         if result.error:
             print(f"Error: {result.error}")
         print(f"Steps executed: {len(result.steps)}")

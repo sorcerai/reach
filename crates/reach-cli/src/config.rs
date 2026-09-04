@@ -116,6 +116,18 @@ pub struct DockerConfig {
     pub socket: String,
 }
 
+impl DockerConfig {
+    /// Returns the configured socket path if set and non-empty.
+    pub fn socket_path(&self) -> Option<&str> {
+        let trimmed = self.socket.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    }
+}
+
 // ═══════════════════════════════════════════════════════════
 // Defaults
 // ═══════════════════════════════════════════════════════════

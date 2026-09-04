@@ -1,4 +1,5 @@
 use clap::Args;
+use reach_cli::config::ReachConfig;
 use reach_cli::docker::DockerClient;
 
 #[derive(Args)]
@@ -14,7 +15,8 @@ pub struct ExecArgs {
 pub async fn run(args: ExecArgs) -> anyhow::Result<()> {
     anyhow::ensure!(!args.command.is_empty(), "no command specified");
 
-    let docker = DockerClient::new()?;
+    let cfg = ReachConfig::load();
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     let output = docker.exec(&args.target, &args.command).await?;
 
     if !output.stdout.is_empty() {

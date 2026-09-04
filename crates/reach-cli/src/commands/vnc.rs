@@ -1,5 +1,6 @@
 use clap::Args;
 use colored::Colorize;
+use reach_cli::config::ReachConfig;
 use reach_cli::docker::DockerClient;
 
 #[derive(Args)]
@@ -9,7 +10,8 @@ pub struct VncArgs {
 }
 
 pub async fn run(args: VncArgs) -> anyhow::Result<()> {
-    let docker = DockerClient::new()?;
+    let cfg = ReachConfig::load();
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     let sandbox = docker.find(&args.target).await?;
 
     let port = sandbox

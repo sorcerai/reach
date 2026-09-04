@@ -1,5 +1,6 @@
 use clap::Args;
 use colored::Colorize;
+use reach_cli::config::ReachConfig;
 use reach_cli::docker::DockerClient;
 
 #[derive(Args)]
@@ -9,7 +10,8 @@ pub struct DestroyArgs {
 }
 
 pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
-    let docker = DockerClient::new()?;
+    let cfg = ReachConfig::load();
+    let docker = DockerClient::new(cfg.docker.socket_path())?;
     docker.destroy(&args.target).await?;
     println!(
         "{} {}",
