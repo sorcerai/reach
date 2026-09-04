@@ -10,7 +10,7 @@ elif limactl list -q | grep -qx reach-lab; then
 else
   limactl start --name=reach-lab --tty=false config/lima/reach-lab.yaml
 fi
-limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target /Users/'"$USER"'/repos/reach/ ~/src/reach/ && cd ~/src/reach && if [ ! -x ~/.cargo/bin/reach ]; then cargo install --path crates/reach-cli --locked; fi'
+limactl shell reach-lab bash -lc 'mkdir -p ~/src && rsync -a --delete --exclude target "'"$HOME"'/repos/reach/" ~/src/reach/ && cd ~/src/reach && if [ ! -x ~/.cargo/bin/reach ]; then cargo install --path crates/reach-cli --locked; fi'
 limactl shell reach-lab docker image inspect reach:latest >/dev/null 2>&1 || make lab-load
 limactl shell reach-lab bash -lc '
   set -e
@@ -22,7 +22,8 @@ limactl shell reach-lab bash -lc '
   echo "DOCKER_HOST=unix:///run/user/$(id -u)/docker.sock" > ~/.config/environment.d/60-docker-host.conf
   export DOCKER_HOST="unix:///run/user/$(id -u)/docker.sock"
   mkdir -p ~/.config/reach /srv/reach/workspaces /srv/reach/profiles
-  cat > ~/.config/reach/config.toml <<EOF
+  if [ ! -f ~/.config/reach/config.toml ]; then
+    cat > ~/.config/reach/config.toml <<EOF
 [server]
 public_host = "100.124.38.17"
 [sandbox]
@@ -32,6 +33,14 @@ profile_dir = "/srv/reach/profiles"
 [docker]
 socket = "unix:///run/user/$(id -u)/docker.sock"
 EOF
-  reach list | grep -q agent-computer || reach create --name agent-computer --workspace --persist-profile default --memory 2.5g
+  fi
+  container_status="$(docker inspect -f '\''{{.State.Status}}'\'' agent-computer 2>/dev/null || true)"
+  if [ "$container_status" = "running" ]; then
+    :
+  elif [ -n "$container_status" ]; then
+    docker start agent-computer
+  else
+    reach create --name agent-computer --workspace --persist-profile default --memory 2.5g
+  fi
 '
 echo "Live view: http://100.124.38.17:6080/vnc.html?autoconnect=1&resize=remote"

@@ -18,8 +18,8 @@
 		<string>/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
 	</dict>
 	<key>StandardOutPath</key>
-	<string>/Users/ariaserver/Library/Logs/reach-lab.out.log</string>
+	<string>$HOME/Library/Logs/reach-lab.out.log</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/ariaserver/Library/Logs/reach-lab.err.log</string>
+	<string>$HOME/Library/Logs/reach-lab.err.log</string>
 </dict>
 </plist>

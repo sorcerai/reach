@@ -60,7 +60,7 @@ at the same host:port.
 | `~/.local/share/reach-lab`          | `/srv/reach`             | -                              |
 | `/srv/reach/workspaces`             | (same, writable)         | `/srv/reach/workspaces/<name>` mounted as the sandbox's `--workspace` |
 | `/srv/reach/profiles`               | (same, writable)         | `<profile>` bind-mounted for `--persist-profile default` |
-| `~/repos/reach` (mini, via Lima's default home mount, read-only) | `/Users/ariaserver/repos/reach` | - (source only, rsync'd into `~/src/reach` inside the VM before building) |
+| `~/repos/reach` (mini, via Lima's default home mount, read-only) | `$HOME/repos/reach` | - (source only, rsync'd into `~/src/reach` inside the VM before building) |
 
 `reach` itself (the CLI managing Docker containers) runs inside the Lima
 guest, talking to the guest's rootless Docker CE. The `agent-computer`
@@ -231,7 +231,7 @@ So `reach-lab` itself comes back after the mini reboots (e.g. a power
 outage), install the launchd agent on the mini (not inside the VM):
 
 ```
-cp scripts/lab/launchd/ai.reach.lab.plist ~/Library/LaunchAgents/
+sed "s|\$HOME|$HOME|g" scripts/lab/launchd/ai.reach.lab.plist > ~/Library/LaunchAgents/ai.reach.lab.plist
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/ai.reach.lab.plist
 launchctl print gui/$(id -u)/ai.reach.lab | head
 ```
