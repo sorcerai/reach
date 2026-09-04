@@ -454,14 +454,14 @@ impl DockerClient {
                 map.insert(
                     format!("{vnc_container}/tcp"),
                     Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".into()),
+                        host_ip: Some("127.0.0.1".into()),
                         host_port: Some(vnc_host.to_string()),
                     }]),
                 );
                 map.insert(
                     format!("{novnc_container}/tcp"),
                     Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".into()),
+                        host_ip: Some("127.0.0.1".into()),
                         host_port: Some(novnc_host.to_string()),
                     }]),
                 );
@@ -469,7 +469,7 @@ impl DockerClient {
             map.insert(
                 "8400/tcp".into(),
                 Some(vec![PortBinding {
-                    host_ip: Some("0.0.0.0".into()),
+                    host_ip: Some("127.0.0.1".into()),
                     host_port: Some(config.ports.health.to_string()),
                 }]),
             );
@@ -477,7 +477,7 @@ impl DockerClient {
                 map.insert(
                     format!("{}/tcp", container_port),
                     Some(vec![PortBinding {
-                        host_ip: Some("0.0.0.0".into()),
+                        host_ip: Some("127.0.0.1".into()),
                         host_port: Some(host_port.to_string()),
                     }]),
                 );
@@ -703,6 +703,9 @@ impl DockerClient {
     }
 
     pub async fn screenshot(&self, target: &str, display: &str) -> Result<Vec<u8>> {
+        let shot_id = uuid::Uuid::new_v4().simple();
+        let disp_clean = display.replace(':', "_");
+        let shot_file = format!("/tmp/_reach_shot_{disp_clean}_{shot_id}.png");
         let out = self
             .exec(
                 target,
@@ -710,7 +713,7 @@ impl DockerClient {
                     "bash".into(),
                     "-c".into(),
                     format!(
-                        "DISPLAY={display} scrot -z /tmp/_reach_shot.png && base64 -w 0 /tmp/_reach_shot.png && rm /tmp/_reach_shot.png"
+                        "DISPLAY={display} scrot -z '{shot_file}' && base64 -w 0 '{shot_file}' && rm -f '{shot_file}'"
                     ),
                 ],
             )
