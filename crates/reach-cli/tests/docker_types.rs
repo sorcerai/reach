@@ -271,6 +271,36 @@ fn labels_for_sandbox_never_carries_vnc_password() {
     );
 }
 
+#[test]
+fn sandbox_config_debug_redacts_vnc_password_when_set() {
+    let config = SandboxConfig {
+        vnc_password: Some("s3cret-password".into()),
+        ..SandboxConfig::default()
+    };
+    let debug_str = format!("{config:?}");
+    assert!(
+        !debug_str.contains("s3cret-password"),
+        "debug output must never contain the plaintext vnc_password: {debug_str}"
+    );
+    assert!(
+        debug_str.contains("vnc_password: Some(\"<redacted>\")"),
+        "debug output must display redacted placeholder: {debug_str}"
+    );
+}
+
+#[test]
+fn sandbox_config_debug_shows_none_when_vnc_password_unset() {
+    let config = SandboxConfig {
+        vnc_password: None,
+        ..SandboxConfig::default()
+    };
+    let debug_str = format!("{config:?}");
+    assert!(
+        debug_str.contains("vnc_password: None"),
+        "debug output should display None when vnc_password is None: {debug_str}"
+    );
+}
+
 // ═══════════════════════════════════════════════════════════
 // config_from_inspect (recreate)
 // ═══════════════════════════════════════════════════════════

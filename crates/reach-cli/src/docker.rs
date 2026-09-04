@@ -19,7 +19,7 @@ use std::time::Duration;
 /// Path inside the container where the durable workspace mount lands.
 pub const WORKSPACE_CONTAINER_PATH: &str = "/workspace";
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SandboxConfig {
     pub name: String,
     pub image: String,
@@ -40,7 +40,32 @@ pub struct SandboxConfig {
     ///
     /// Never logged, never put in a container label — round-tripped for
     /// `recreate` via the container's `VNC_PASSWORD` env var instead.
+    ///
+    /// Note: because the password is passed via the container's `VNC_PASSWORD`
+    /// environment variable, it is visible to any process or user with access
+    /// to `docker inspect`.
     pub vnc_password: Option<String>,
+}
+
+impl std::fmt::Debug for SandboxConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SandboxConfig")
+            .field("name", &self.name)
+            .field("image", &self.image)
+            .field("resolution", &self.resolution)
+            .field("shm_size", &self.shm_size)
+            .field("ports", &self.ports)
+            .field("screens", &self.screens)
+            .field("profile", &self.profile)
+            .field("workspace", &self.workspace)
+            .field("memory", &self.memory)
+            .field("restart_unless_stopped", &self.restart_unless_stopped)
+            .field(
+                "vnc_password",
+                &self.vnc_password.as_ref().map(|_| "<redacted>"),
+            )
+            .finish()
+    }
 }
 
 /// Bind mount that backs a persistent Chrome profile.
