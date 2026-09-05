@@ -80,6 +80,8 @@ pub struct TraceStep {
     pub selector: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aria_tag: Option<String>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_frame: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,6 +139,8 @@ pub struct CompiledAction {
     pub point: Option<(i32, i32)>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub normalized_point: Option<(f64, f64)>,
+    #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
+    pub reference: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,7 +276,9 @@ pub fn compile_trace(
         });
 
         let mut desc = format!("{} action", step.action_type);
-        if let Some(sel) = &step.selector {
+        if let Some(r) = &step.reference {
+            desc = format!("{} on ref '{}'", step.action_type, r);
+        } else if let Some(sel) = &step.selector {
             desc = format!("{} on '{}'", step.action_type, sel);
         } else if let Some((x, y)) = point {
             desc = format!("{} at ({}, {})", step.action_type, x, y);
@@ -282,6 +288,7 @@ pub fn compile_trace(
             kind: step.action_type.clone(),
             point,
             normalized_point,
+            reference: step.reference.clone(),
             url: step.url.clone(),
             selector: step.selector.clone(),
             aria: step.aria_tag.clone(),
@@ -394,6 +401,7 @@ mod tests {
             url: Some("https://www.google.com".to_string()),
             selector: None,
             aria_tag: None,
+            reference: None,
             before_frame: None,
             after_frame: Some("frames/step_001_after.png".to_string()),
             dom_snapshot: None,
@@ -411,6 +419,7 @@ mod tests {
             url: Some("https://www.google.com".to_string()),
             selector: Some("input[name='q']".to_string()),
             aria_tag: Some("Search query".to_string()),
+            reference: Some("@e2".to_string()),
             before_frame: None,
             after_frame: None,
             dom_snapshot: None,
@@ -432,5 +441,7 @@ mod tests {
             Some("{{query}}".to_string())
         );
         assert_eq!(compiled.steps[1].action.normalized_point, Some((0.5, 0.5)));
+        assert_eq!(compiled.steps[1].action.reference, Some("@e2".to_string()));
+        assert_eq!(compiled.steps[1].action.description, "type on ref '@e2'");
     }
 }

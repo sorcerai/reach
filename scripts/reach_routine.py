@@ -15,14 +15,19 @@ Implements:
 from __future__ import annotations
 
 import argparse
+import base64
 import copy
 import json
 import logging
 import os
 import re
 import shutil
+import socket
 import sys
+import threading
 import time
+import urllib.parse
+import urllib.request
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -67,13 +72,17 @@ class TraceStep:
     url: Optional[str] = None
     selector: Optional[str] = None
     aria_tag: Optional[str] = None
+    reference: Optional[str] = None  # Semantic ref, e.g. @e1, @e2
     before_frame: Optional[str] = None  # Relative path under routine dir
     after_frame: Optional[str] = None  # Relative path under routine dir
     dom_snapshot: Optional[str] = None
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        return asdict(self)
+        d = asdict(self)
+        if self.reference is not None:
+            d["ref"] = self.reference
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> TraceStep:
@@ -88,6 +97,7 @@ class TraceStep:
             url=d.get("url"),
             selector=d.get("selector"),
             aria_tag=d.get("aria_tag"),
+            reference=d.get("ref") or d.get("reference"),
             before_frame=d.get("before_frame"),
             after_frame=d.get("after_frame"),
             dom_snapshot=d.get("dom_snapshot"),
@@ -158,6 +168,7 @@ class CompiledAction:
     kind: str  # click, type, navigate, key, scroll, wait
     point: Optional[Tuple[int, int]] = None
     normalized_point: Optional[Tuple[float, float]] = None
+    reference: Optional[str] = None  # Semantic ref, e.g. @e1, @e2
     url: Optional[str] = None
     selector: Optional[str] = None
     aria: Optional[str] = None
@@ -167,7 +178,7 @@ class CompiledAction:
     description: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "kind": self.kind,
             "point": list(self.point) if self.point else None,
             "normalized_point": (
@@ -181,6 +192,9 @@ class CompiledAction:
             "button": self.button,
             "description": self.description,
         }
+        if self.reference is not None:
+            d["ref"] = self.reference
+        return d
 
     @classmethod
     def from_dict(cls, d: Dict[str, Any]) -> CompiledAction:
@@ -194,6 +208,7 @@ class CompiledAction:
             kind=d.get("kind", "click"),
             point=point,
             normalized_point=norm_point,
+            reference=d.get("ref") or d.get("reference"),
             url=d.get("url"),
             selector=d.get("selector"),
             aria=d.get("aria"),
@@ -336,9 +351,395 @@ def hash_distance(hex1: str, hex2: str) -> float:
         return 1.0
 
 
-# ==============================================================================
-# 1. Routine Trace Recorder
-# ==============================================================================
+class SimpleCDPClient:
+    """Minimal, pure-Python RFC 6455 WebSocket client for Chrome DevTools Protocol."""
+
+    def __init__(self, ws_url: str, timeout: float = 5.0) -> None:
+        self.ws_url = ws_url
+        self.timeout = timeout
+        parsed = urllib.parse.urlparse(ws_url)
+        self.host = parsed.hostname or "127.0.0.1"
+        self.port = parsed.port or 9222
+        self.path = parsed.path or "/"
+        if parsed.query:
+            self.path += "?" + parsed.query
+        self.sock: Optional[socket.socket] = None
+        self._msg_id = 0
+
+    def connect(self) -> bool:
+        try:
+            self.sock = socket.create_connection((self.host, self.port), timeout=self.timeout)
+            self.sock.settimeout(self.timeout)
+            sec_key = base64.b64encode(os.urandom(16)).decode("ascii")
+            req = (
+                f"GET {self.path} HTTP/1.1\r\n"
+                f"Host: {self.host}:{self.port}\r\n"
+                f"Upgrade: websocket\r\n"
+                f"Connection: Upgrade\r\n"
+                f"Sec-WebSocket-Key: {sec_key}\r\n"
+                f"Sec-WebSocket-Version: 13\r\n\r\n"
+            )
+            self.sock.sendall(req.encode("ascii"))
+            resp = b""
+            while b"\r\n\r\n" not in resp:
+                chunk = self.sock.recv(4096)
+                if not chunk:
+                    break
+                resp += chunk
+            if b"101 Switching Protocols" not in resp:
+                self.close()
+                return False
+            return True
+        except Exception as e:
+            logger.debug("CDP WebSocket connect error to %s: %s", self.ws_url, e)
+            self.close()
+            return False
+
+    def send_cdp(self, method: str, params: Optional[Dict[str, Any]] = None) -> int:
+        self._msg_id += 1
+        payload = json.dumps({"id": self._msg_id, "method": method, "params": params or {}})
+        self.send_text(payload)
+        return self._msg_id
+
+    def send_text(self, text: str) -> None:
+        if not self.sock:
+            return
+        data = text.encode("utf-8")
+        mask = os.urandom(4)
+        header = bytearray([0x81])  # FIN + Text frame
+        length = len(data)
+        if length < 126:
+            header.append(0x80 | length)
+        elif length <= 0xFFFF:
+            header.append(0x80 | 126)
+            header.extend(length.to_bytes(2, "big"))
+        else:
+            header.append(0x80 | 127)
+            header.extend(length.to_bytes(8, "big"))
+        header.extend(mask)
+        masked = bytearray(b ^ mask[i % 4] for i, b in enumerate(data))
+        self.sock.sendall(header + masked)
+
+    def recv_text(self, timeout: Optional[float] = None) -> Optional[str]:
+        if not self.sock:
+            return None
+        if timeout is not None:
+            self.sock.settimeout(timeout)
+        try:
+            head = self._recv_exact(2)
+            if not head:
+                return None
+            b1, b2 = head[0], head[1]
+            opcode = b1 & 0x0F
+            masked = (b2 & 0x80) != 0
+            payload_len = b2 & 0x7F
+            if payload_len == 126:
+                ext = self._recv_exact(2)
+                if not ext:
+                    return None
+                payload_len = int.from_bytes(ext, "big")
+            elif payload_len == 127:
+                ext = self._recv_exact(8)
+                if not ext:
+                    return None
+                payload_len = int.from_bytes(ext, "big")
+            mask = self._recv_exact(4) if masked else None
+            payload = self._recv_exact(payload_len)
+            if masked and mask:
+                payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+            if opcode == 0x8:  # Close frame
+                self.close()
+                return None
+            if opcode == 0x1:  # Text frame
+                return payload.decode("utf-8", errors="replace")
+            return None
+        except socket.timeout:
+            return None
+        except Exception as e:
+            logger.debug("CDP recv_text error: %s", e)
+            return None
+
+    def _recv_exact(self, n: int) -> bytes:
+        buf = bytearray()
+        while len(buf) < n:
+            try:
+                chunk = self.sock.recv(n - len(buf)) if self.sock else b""
+                if not chunk:
+                    break
+                buf.extend(chunk)
+            except socket.timeout:
+                break
+        return bytes(buf)
+
+    def close(self) -> None:
+        if self.sock:
+            try:
+                self.sock.close()
+            except Exception:
+                pass
+            self.sock = None
+
+
+def discover_cdp_target(
+    cdp_host: str = "127.0.0.1", cdp_port: int = 9222, timeout: float = 3.0
+) -> Optional[Dict[str, Any]]:
+    """Query Chrome /json/list to discover active page targets."""
+    url = f"http://{cdp_host}:{cdp_port}/json/list"
+    try:
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            if isinstance(data, list):
+                for target in data:
+                    if target.get("type") == "page" and target.get("webSocketDebuggerUrl"):
+                        return target
+                if data:
+                    return data[0]
+    except Exception as e:
+        logger.debug("Error discovering CDP targets at %s: %s", url, e)
+    return None
+
+
+CDP_TAP_SCRIPT = """
+(() => {
+    if (window.__reach_event_tap_installed) return;
+    window.__reach_event_tap_installed = true;
+    window.__reach_events = window.__reach_events || [];
+
+    function getSelector(el) {
+        if (!el || el === document || el === window) return '';
+        if (el.id) return '#' + el.id;
+        if (el.getAttribute && el.getAttribute('name')) return `${el.tagName.toLowerCase()}[name="${el.getAttribute('name')}"]`;
+        if (el.getAttribute && el.getAttribute('data-reach-ref')) return `[data-reach-ref="${el.getAttribute('data-reach-ref')}"]`;
+        let path = [];
+        let cur = el;
+        while (cur && cur.nodeType === Node.ELEMENT_NODE) {
+            let selector = cur.nodeName.toLowerCase();
+            if (cur.id) {
+                selector += '#' + cur.id;
+                path.unshift(selector);
+                break;
+            } else {
+                let sib = cur, nth = 1;
+                while (sib = sib.previousElementSibling) {
+                    if (sib.nodeName.toLowerCase() === selector) nth++;
+                }
+                if (nth !== 1) selector += `:nth-of-type(${nth})`;
+            }
+            path.unshift(selector);
+            cur = cur.parentNode;
+        }
+        return path.join(' > ');
+    }
+
+    function emitEvent(ev) {
+        window.__reach_events.push(ev);
+        if (typeof window.__reach_emit_event === 'function') {
+            try {
+                window.__reach_emit_event(JSON.stringify(ev));
+            } catch (e) {}
+        }
+    }
+
+    // 1. Click listener (capture phase)
+    document.addEventListener('click', (e) => {
+        try {
+            const target = e.target;
+            const refEl = target.closest ? target.closest('[data-reach-ref]') : null;
+            const ref = refEl ? ('@' + refEl.getAttribute('data-reach-ref')) : null;
+            const sel = getSelector(target);
+            const role = target.getAttribute ? (target.getAttribute('role') || target.tagName.toLowerCase()) : '';
+            const aria = target.getAttribute ? (target.getAttribute('aria-label') || target.getAttribute('placeholder') || (target.innerText || '')) : '';
+
+            emitEvent({
+                type: 'click',
+                timestamp: new Date().toISOString(),
+                x: e.clientX,
+                y: e.clientY,
+                ref: ref,
+                selector: sel,
+                role: role,
+                aria: aria.slice(0, 100).trim(),
+                url: window.location.href,
+            });
+        } catch (err) {}
+    }, true);
+
+    // 2. Change/Input listener (capture text inputs)
+    document.addEventListener('change', (e) => {
+        try {
+            const target = e.target;
+            if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+                const refEl = target.closest ? target.closest('[data-reach-ref]') : null;
+                const ref = refEl ? ('@' + refEl.getAttribute('data-reach-ref')) : null;
+                const sel = getSelector(target);
+                emitEvent({
+                    type: 'type',
+                    timestamp: new Date().toISOString(),
+                    text: target.value,
+                    ref: ref,
+                    selector: sel,
+                    url: window.location.href,
+                });
+            }
+        } catch (err) {}
+    }, true);
+
+    // 3. Keydown listener (for Enter, Tab, Escape)
+    document.addEventListener('keydown', (e) => {
+        try {
+            if (['Enter', 'Tab', 'Escape', 'Backspace'].includes(e.key)) {
+                emitEvent({
+                    type: 'key',
+                    timestamp: new Date().toISOString(),
+                    key: e.key,
+                    url: window.location.href,
+                });
+            }
+        } catch (err) {}
+    }, true);
+})();
+"""
+
+
+class CDPEventTap:
+    """Hooks Chrome DevTools Protocol to capture user actions in real time."""
+
+    def __init__(
+        self,
+        recorder: RoutineRecorder,
+        cdp_host: str = "127.0.0.1",
+        cdp_port: int = 9222,
+    ) -> None:
+        self.recorder = recorder
+        self.cdp_host = cdp_host
+        self.cdp_port = cdp_port
+        self.client: Optional[SimpleCDPClient] = None
+        self._running = False
+        self._thread: Optional[threading.Thread] = None
+        self._last_event_ts = 0.0
+
+    def start(self) -> bool:
+        """Discover Chrome page target and connect CDP tap."""
+        target = discover_cdp_target(self.cdp_host, self.cdp_port)
+        if not target or not target.get("webSocketDebuggerUrl"):
+            return False
+
+        ws_url = target["webSocketDebuggerUrl"]
+        self.client = SimpleCDPClient(ws_url)
+        if not self.client.connect():
+            return False
+
+        # Initialize CDP domains and tap hooks
+        self.client.send_cdp("Page.enable")
+        self.client.send_cdp("Runtime.enable")
+        self.client.send_cdp("Runtime.addBinding", {"name": "__reach_emit_event"})
+        self.client.send_cdp("Page.addScriptToEvaluateOnNewDocument", {"source": CDP_TAP_SCRIPT})
+        self.client.send_cdp("Runtime.evaluate", {"expression": CDP_TAP_SCRIPT})
+
+        self._running = True
+        self._thread = threading.Thread(target=self._listen_loop, daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self) -> None:
+        """Stop listening and close CDP connection."""
+        self._running = False
+        if self.client:
+            self.client.close()
+            self.client = None
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+    def _listen_loop(self) -> None:
+        """Poll and receive CDP messages and in-page events."""
+        eval_drain = (
+            "(() => { const evs = window.__reach_events || []; "
+            "window.__reach_events = []; return JSON.stringify(evs); })()"
+        )
+        last_poll = time.time()
+        while self._running and self.client:
+            try:
+                # 1. Check for incoming WebSocket message
+                raw = self.client.recv_text(timeout=0.2)
+                if raw:
+                    self._handle_cdp_message(raw)
+
+                # 2. Periodically drain events in case page navigated or binding was bypassed
+                now = time.time()
+                if now - last_poll >= 1.0:
+                    last_poll = now
+                    self.client.send_cdp("Runtime.evaluate", {"expression": CDP_TAP_SCRIPT})
+                    self.client.send_cdp(
+                        "Runtime.evaluate",
+                        {"expression": eval_drain, "returnByValue": True},
+                    )
+            except Exception as e:
+                logger.debug("Error in CDP event tap loop: %s", e)
+                break
+
+    def _handle_cdp_message(self, raw_json: str) -> None:
+        try:
+            data = json.loads(raw_json)
+        except Exception:
+            return
+
+        method = data.get("method")
+        if method == "Runtime.bindingCalled":
+            params = data.get("params", {})
+            if params.get("name") == "__reach_emit_event":
+                payload_str = params.get("payload", "{}")
+                try:
+                    ev = json.loads(payload_str)
+                    self._process_event(ev)
+                except Exception:
+                    pass
+        elif method == "Page.frameNavigated":
+            params = data.get("params", {})
+            frame = params.get("frame", {})
+            url = frame.get("url")
+            if url and not frame.get("parentId") and url != "about:blank":
+                self._process_event({"type": "navigate", "url": url})
+        elif "result" in data:
+            res = data.get("result", {}).get("result", {})
+            val = res.get("value")
+            if val and isinstance(val, str) and val.startswith("["):
+                try:
+                    ev_list = json.loads(val)
+                    for ev in ev_list:
+                        self._process_event(ev)
+                except Exception:
+                    pass
+
+    def _process_event(self, ev: Dict[str, Any]) -> None:
+        ev_type = ev.get("type", "click")
+        now = time.time()
+        if now - self._last_event_ts < 0.2:
+            pass
+        self._last_event_ts = now
+
+        x = ev.get("x")
+        y = ev.get("y")
+        text = ev.get("text")
+        key = ev.get("key")
+        url = ev.get("url")
+        selector = ev.get("selector")
+        aria = ev.get("aria") or ev.get("role")
+        ref = ev.get("ref")
+
+        self.recorder.record_step(
+            action_type=ev_type,
+            x=x,
+            y=y,
+            text=text,
+            key=key,
+            url=url,
+            selector=selector,
+            aria_tag=aria,
+            reference=ref,
+            execute=False,
+            metadata={"source": "cdp_event_tap"},
+        )
 
 
 class RoutineRecorder:
@@ -403,6 +804,7 @@ class RoutineRecorder:
         url: Optional[str] = None,
         selector: Optional[str] = None,
         aria_tag: Optional[str] = None,
+        reference: Optional[str] = None,
         execute: bool = True,
         metadata: Optional[Dict[str, Any]] = None,
     ) -> TraceStep:
@@ -422,6 +824,7 @@ class RoutineRecorder:
             act = ReachAction(
                 kind=action_type,
                 point=(x, y) if x is not None and y is not None else None,
+                ref=reference,
                 value=text or url,
                 key=key,
                 target=selector or url,
@@ -448,6 +851,7 @@ class RoutineRecorder:
             url=self._current_url,
             selector=selector,
             aria_tag=aria_tag,
+            reference=reference,
             before_frame=rel_before,
             after_frame=rel_after,
             dom_snapshot=dom_snapshot,
@@ -456,6 +860,42 @@ class RoutineRecorder:
         self.steps.append(step)
         self.save_trace()
         return step
+
+    def start_event_tap(
+        self,
+        initial_url: Optional[str] = None,
+        timeout_sec: Optional[float] = None,
+        stop_event: Optional[threading.Event] = None,
+        cdp_host: str = "127.0.0.1",
+        cdp_port: Optional[int] = None,
+    ) -> RoutineTrace:
+        """Start automated CDP event tap session to capture demonstration actions."""
+        if initial_url:
+            self.record_step("navigate", url=initial_url, execute=True)
+
+        port = cdp_port if cdp_port is not None else (9222 + self.screen)
+        tap = CDPEventTap(self, cdp_host=cdp_host, cdp_port=port)
+        if not tap.start():
+            logger.warning(
+                "Could not attach CDP event tap on %s:%s. Chrome may not have remote debugging enabled.",
+                cdp_host,
+                port,
+            )
+            return self.save_trace()
+
+        logger.info("CDP Event Tap active on %s:%s. Capturing demonstration...", cdp_host, port)
+        start_time = time.time()
+        try:
+            while True:
+                if stop_event and stop_event.is_set():
+                    break
+                if timeout_sec and (time.time() - start_time) > timeout_sec:
+                    break
+                time.sleep(0.5)
+        finally:
+            tap.stop()
+
+        return self.save_trace()
 
     def save_trace(self) -> RoutineTrace:
         """Save the accumulated trace to trace.json."""
@@ -600,7 +1040,9 @@ class RoutineCompiler:
             value = f"{{{{{param_name}}}}}"
 
         desc = f"{step.action_type.capitalize()}"
-        if step.selector:
+        if step.reference:
+            desc += f" on ref '{step.reference}'"
+        elif step.selector:
             desc += f" on '{step.selector}'"
         elif step.aria_tag:
             desc += f" on '{step.aria_tag}'"
@@ -618,6 +1060,7 @@ class RoutineCompiler:
             kind=step.action_type,
             point=point,
             normalized_point=normalized_point,
+            reference=step.reference,
             url=step.url,
             selector=step.selector,
             aria=step.aria_tag,
@@ -851,6 +1294,7 @@ class RoutineReplayer:
             reach_action = ReachAction(
                 kind=action.kind,
                 point=action.point,
+                ref=action.reference,
                 value=action.value or action.url,
                 key=action.key,
                 target=action.selector or action.url,
@@ -1072,6 +1516,9 @@ def main() -> None:
     p_record = subparsers.add_parser("record", help="Record interactive routine demonstration")
     p_record.add_argument("--name", required=True, help="Routine name")
     p_record.add_argument("--screen", type=int, default=0, help="Screen ID to record (default: 0)")
+    p_record.add_argument("--url", default=None, help="Initial URL to open for demonstration")
+    p_record.add_argument("--manual", action="store_true", help="Fallback to manual terminal REPL")
+    p_record.add_argument("--cdp-port", type=int, default=None, help="Chrome CDP port (default: 9222 + screen)")
     p_record.add_argument("--routines-dir", default=None, help="Base routines directory")
     p_record.add_argument("--api-url", default=DEFAULT_API_URL, help="Reach agent API URL")
     p_record.add_argument("--sandbox", default=None, help="Sandbox name or ID")
@@ -1104,32 +1551,83 @@ def main() -> None:
             api_url=args.api_url,
             sandbox=args.sandbox,
         )
-        print(f"[+] Recording demonstration for '{args.name}' on screen :{99 + args.screen}")
+        print(f"[+] Demonstration recorder initialized for '{args.name}' on screen :{99 + args.screen}")
         print(f"    Routines directory: {recorder.routine_dir}")
-        print("    Enter actions in format: 'navigate <url>', 'click <x> <y>', 'type <text>', 'key <combo>', 'done'")
 
-        while True:
-            try:
-                line = input("reach record> ").strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not line or line.lower() in ("done", "exit", "quit"):
-                break
+        if args.url:
+            print(f"    Navigating to initial URL: {args.url}")
+            recorder.record_step("navigate", url=args.url, execute=True)
 
-            parts = line.split(maxsplit=2)
-            cmd = parts[0].lower()
-            if cmd == "navigate" and len(parts) > 1:
-                recorder.record_step("navigate", url=parts[1])
-            elif cmd == "click" and len(parts) >= 3:
-                recorder.record_step("click", x=int(parts[1]), y=int(parts[2]))
-            elif cmd == "type" and len(parts) > 1:
-                recorder.record_step("type", text=parts[1])
-            elif cmd == "key" and len(parts) > 1:
-                recorder.record_step("key", key=parts[1])
-            elif cmd == "scroll":
-                recorder.record_step("scroll")
+        if args.manual:
+            print("    [Manual Mode] Enter actions in format: 'navigate <url>', 'click <x> <y>', 'click @ref', 'type <text>', 'key <combo>', 'done'")
+            while True:
+                try:
+                    line = input("reach record> ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    break
+                if not line or line.lower() in ("done", "exit", "quit"):
+                    break
+
+                parts = line.split(maxsplit=2)
+                cmd = parts[0].lower()
+                if cmd == "navigate" and len(parts) > 1:
+                    recorder.record_step("navigate", url=parts[1])
+                elif cmd == "click" and len(parts) >= 2:
+                    if parts[1].startswith("@") or parts[1].startswith("e"):
+                        recorder.record_step("click", reference=parts[1])
+                    elif len(parts) >= 3:
+                        recorder.record_step("click", x=int(parts[1]), y=int(parts[2]))
+                elif cmd == "type" and len(parts) > 1:
+                    recorder.record_step("type", text=parts[1])
+                elif cmd == "key" and len(parts) > 1:
+                    recorder.record_step("key", key=parts[1])
+                elif cmd == "scroll":
+                    recorder.record_step("scroll")
+                else:
+                    print(f"Unknown command: {line}")
+        else:
+            # Automated CDP event tap mode
+            cdp_port = args.cdp_port if args.cdp_port is not None else (9222 + args.screen)
+            tap = CDPEventTap(recorder, cdp_port=cdp_port)
+            attached = tap.start()
+            if attached:
+                print(f"[✓] Automated CDP event tap attached to Chrome on port {cdp_port}")
+                print("    Perform demonstration actions in the browser window.")
+                print("    Clicks, keystrokes, form inputs, and navigations are captured automatically.")
+                print("    Press [Enter] or Ctrl+C when finished...")
+                try:
+                    input()
+                except (EOFError, KeyboardInterrupt):
+                    pass
+                tap.stop()
             else:
-                print(f"Unknown command: {line}")
+                print(f"[!] Warning: Could not attach CDP event tap on port {cdp_port}.")
+                print("    Falling back to interactive terminal REPL.")
+                print("    Enter actions in format: 'navigate <url>', 'click <x> <y>', 'click @ref', 'type <text>', 'done'")
+                while True:
+                    try:
+                        line = input("reach record> ").strip()
+                    except (EOFError, KeyboardInterrupt):
+                        break
+                    if not line or line.lower() in ("done", "exit", "quit"):
+                        break
+                    parts = line.split(maxsplit=2)
+                    cmd = parts[0].lower()
+                    if cmd == "navigate" and len(parts) > 1:
+                        recorder.record_step("navigate", url=parts[1])
+                    elif cmd == "click" and len(parts) >= 2:
+                        if parts[1].startswith("@") or parts[1].startswith("e"):
+                            recorder.record_step("click", reference=parts[1])
+                        elif len(parts) >= 3:
+                            recorder.record_step("click", x=int(parts[1]), y=int(parts[2]))
+                    elif cmd == "type" and len(parts) > 1:
+                        recorder.record_step("type", text=parts[1])
+                    elif cmd == "key" and len(parts) > 1:
+                        recorder.record_step("key", key=parts[1])
+                    elif cmd == "scroll":
+                        recorder.record_step("scroll")
+                    else:
+                        print(f"Unknown command: {line}")
 
         trace = recorder.save_trace()
         print(f"[✓] Recorded {len(trace.steps)} step(s) to {recorder.trace_file}")

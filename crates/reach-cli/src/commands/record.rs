@@ -13,6 +13,14 @@ pub struct RecordArgs {
     #[arg(long)]
     pub name: String,
 
+    /// Optional initial URL to open for demonstration
+    #[arg(long)]
+    pub url: Option<String>,
+
+    /// Fallback to manual terminal REPL instead of automated CDP event tap
+    #[arg(long)]
+    pub manual: bool,
+
     /// Optional custom base directory for routines
     #[arg(long)]
     pub routines_dir: Option<PathBuf>,
@@ -44,6 +52,12 @@ pub async fn run(args: RecordArgs) -> anyhow::Result<()> {
     cmd.arg("--screen").arg(args.screen.to_string());
     cmd.arg("--api-url").arg(&args.api_url);
 
+    if let Some(url) = &args.url {
+        cmd.arg("--url").arg(url);
+    }
+    if args.manual {
+        cmd.arg("--manual");
+    }
     if let Some(rd) = &args.routines_dir {
         cmd.arg("--routines-dir").arg(rd);
     }

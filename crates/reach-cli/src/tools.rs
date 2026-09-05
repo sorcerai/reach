@@ -166,7 +166,7 @@ pub fn resolve_profile_name(args: &serde_json::Value, screen: u32) -> (String, b
 }
 
 pub fn browse_command(url: &str, profile_dir: &str) -> String {
-    browse_command_with_hydration(url, profile_dir, None)
+    browse_command_full(url, profile_dir, None, None)
 }
 
 pub fn browse_command_with_hydration(
@@ -174,9 +174,23 @@ pub fn browse_command_with_hydration(
     profile_dir: &str,
     hydrated_json: Option<&str>,
 ) -> String {
+    browse_command_full(url, profile_dir, hydrated_json, None)
+}
+
+pub fn browse_command_full(
+    url: &str,
+    profile_dir: &str,
+    hydrated_json: Option<&str>,
+    cdp_port: Option<u16>,
+) -> String {
     let escaped_json = hydrated_json
         .map(|j| format!("'''{}'''", j.replace('\\', "\\\\").replace('\'', "\\'")))
         .unwrap_or_else(|| "None".to_string());
+
+    let cdp_flag = match cdp_port {
+        Some(port) => format!("--remote-debugging-port={port} "),
+        None => String::new(),
+    };
 
     format!(
         "mkdir -p '{p}' && \
@@ -213,7 +227,7 @@ pub fn browse_command_with_hydration(
                                ctx.add_cookies(cookies); \
                                ctx.close(); \
                    except Exception: pass\" 2>/dev/null || true; \
-         reach-chrome --no-sandbox --disable-gpu --no-first-run \
+         reach-chrome --no-sandbox --disable-gpu --no-first-run {cdp_flag}\
          --user-data-dir='{p}' '{u}' >/dev/null 2>&1 &",
         p = profile_dir,
         u = url.replace('\'', "%27")
@@ -423,11 +437,12 @@ pub async fn dispatch(
                 None
             };
 
+            let cdp_port = 9222 + screen as u16;
             sh(
                 ctx,
                 target,
                 screen,
-                &browse_command_with_hydration(url, &profile_dir, hydrated_json.as_deref()),
+                &browse_command_full(url, &profile_dir, hydrated_json.as_deref(), Some(cdp_port)),
             )
             .await
         }

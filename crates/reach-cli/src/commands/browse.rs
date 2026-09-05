@@ -2,7 +2,7 @@ use clap::Args;
 use reach_cli::config::ReachConfig;
 use reach_cli::docker::{DockerClient, ProfileMount};
 use reach_cli::profile::{CookieJarService, LockHolderInfo, ProfileBroker};
-use reach_cli::tools::browse_command_with_hydration;
+use reach_cli::tools::browse_command_full;
 
 #[derive(Args, Clone, Debug)]
 pub struct BrowseArgs {
@@ -83,7 +83,13 @@ pub async fn run(args: BrowseArgs) -> anyhow::Result<()> {
         None
     };
 
-    let cmd = browse_command_with_hydration(&args.url, &profile_dir, hydrated_json.as_deref());
+    let cdp_port = 9222 + args.screen as u16;
+    let cmd = browse_command_full(
+        &args.url,
+        &profile_dir,
+        hydrated_json.as_deref(),
+        Some(cdp_port),
+    );
     let display = format!(":{}", 99 + args.screen);
     docker
         .exec(

@@ -133,6 +133,93 @@ class TestRoutineRecorder(unittest.TestCase):
         self.assertTrue((frames_dir / "step_001_after.png").is_file())
         self.assertTrue((frames_dir / "step_004_after.png").is_file())
 
+    def test_record_actions_with_semantic_reference(self) -> None:
+        recorder = RoutineRecorder(
+            routine_name="test_ref_record",
+            screen=0,
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+        )
+        step = recorder.record_step(
+            action_type="click",
+            x=500,
+            y=250,
+            selector="button#login",
+            aria_tag="Login button",
+            reference="@e14",
+            execute=True,
+        )
+        self.assertEqual(step.reference, "@e14")
+        self.mock_driver.execute_action.assert_called()
+        call_action = self.mock_driver.execute_action.call_args[0][0]
+        self.assertEqual(call_action.ref, "@e14")
+
+        trace_file = Path(self.temp_dir) / "test_ref_record" / "trace.json"
+        with open(trace_file, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        self.assertEqual(data["steps"][0]["ref"], "@e14")
+
+    def test_cdp_event_tap_event_processing(self) -> None:
+        from scripts.reach_routine import CDPEventTap
+
+        recorder = RoutineRecorder(
+            routine_name="test_tap_flow",
+            screen=0,
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+        )
+        tap = CDPEventTap(recorder=recorder, cdp_port=9222)
+
+        # Process click event with semantic ref
+        tap._process_event({
+            "type": "click",
+            "x": 320,
+            "y": 240,
+            "selector": "button#submit",
+            "aria": "Submit form",
+            "ref": "@e7",
+            "url": "https://example.com/checkout",
+        })
+        self.assertEqual(len(recorder.steps), 1)
+        self.assertEqual(recorder.steps[0].action_type, "click")
+        self.assertEqual(recorder.steps[0].reference, "@e7")
+        self.assertEqual(recorder.steps[0].selector, "button#submit")
+        self.assertEqual(recorder.steps[0].x, 320)
+        self.assertEqual(recorder.steps[0].y, 240)
+        self.assertEqual(recorder.steps[0].metadata.get("source"), "cdp_event_tap")
+
+        # Process type event
+        tap._process_event({
+            "type": "type",
+            "text": "john_doe@example.com",
+            "selector": "input#email",
+            "ref": "@e2",
+            "url": "https://example.com/checkout",
+        })
+        self.assertEqual(len(recorder.steps), 2)
+        self.assertEqual(recorder.steps[1].action_type, "type")
+        self.assertEqual(recorder.steps[1].text, "john_doe@example.com")
+        self.assertEqual(recorder.steps[1].reference, "@e2")
+
+        # Process key event
+        tap._process_event({
+            "type": "key",
+            "key": "Enter",
+            "url": "https://example.com/checkout",
+        })
+        self.assertEqual(len(recorder.steps), 3)
+        self.assertEqual(recorder.steps[2].action_type, "key")
+        self.assertEqual(recorder.steps[2].key, "Enter")
+
+        # Process navigate event
+        tap._process_event({
+            "type": "navigate",
+            "url": "https://example.com/dashboard",
+        })
+        self.assertEqual(len(recorder.steps), 4)
+        self.assertEqual(recorder.steps[3].action_type, "navigate")
+        self.assertEqual(recorder.steps[3].url, "https://example.com/dashboard")
+
 
 class TestRoutineCompiler(unittest.TestCase):
     """Tests for RoutineCompiler (scripts/compiler.py)."""
@@ -224,6 +311,39 @@ class TestRoutineCompiler(unittest.TestCase):
         # routine.json written to disk
         routine_json_path = self.routine_dir / "routine.json"
         self.assertTrue(routine_json_path.is_file())
+
+    def test_compile_trace_with_semantic_reference(self) -> None:
+        trace_data = {
+            "version": 1,
+            "name": "ref_routine",
+            "screen": 0,
+            "created_at": "2026-09-05T00:00:00Z",
+            "steps": [
+                {
+                    "step_index": 1,
+                    "action_type": "click",
+                    "x": 640,
+                    "y": 360,
+                    "ref": "@e3",
+                    "selector": "button#buy",
+                    "aria_tag": "Buy Now",
+                },
+                {
+                    "step_index": 2,
+                    "action_type": "type",
+                    "text": "Tesla",
+                    "ref": "@e4",
+                    "selector": "input#search",
+                    "aria_tag": "Search",
+                },
+            ],
+        }
+        compiler = RoutineCompiler()
+        compiled = compiler.compile(trace_data, routines_dir=self.temp_dir)
+        self.assertEqual(compiled.steps[0].action.reference, "@e3")
+        self.assertIn("ref '@e3'", compiled.steps[0].action.description)
+        self.assertEqual(compiled.steps[1].action.reference, "@e4")
+        self.assertEqual(compiled.steps[1].action.to_dict()["ref"], "@e4")
 
 
 class TestRoutineReplayer(unittest.TestCase):
@@ -390,6 +510,25 @@ class TestRoutineReplayer(unittest.TestCase):
         # Newly recorded action was spliced into the routine
         step_kinds = [s["action"]["kind"] for s in healed_json["steps"]]
         self.assertIn("click", step_kinds)
+
+    def test_deterministic_replay_dispatches_ref(self) -> None:
+        action = CompiledAction(
+            kind="click",
+            point=(100, 200),
+            reference="@e9",
+            description="Click on ref '@e9'",
+        )
+        replayer = RoutineReplayer(
+            routine_name="demo_routine",
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+            heal_with_cua=False,
+        )
+        ok, err = replayer._execute_deterministic_action(action)
+        self.assertTrue(ok)
+        self.assertIsNone(err)
+        last_action = self.mock_driver.execute_action.call_args[0][0]
+        self.assertEqual(last_action.ref, "@e9")
 
 
 class TestTemplateAndHashingUtilities(unittest.TestCase):

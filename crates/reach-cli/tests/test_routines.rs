@@ -49,6 +49,7 @@ fn test_trace_and_routine_serde_roundtrip() {
         url: Some("https://example.com".to_string()),
         selector: Some("button#submit".to_string()),
         aria_tag: Some("Submit order".to_string()),
+        reference: Some("@e1".to_string()),
         before_frame: Some("frames/step_001_before.png".to_string()),
         after_frame: Some("frames/step_001_after.png".to_string()),
         dom_snapshot: Some("<div>Submit</div>".to_string()),
@@ -69,11 +70,14 @@ fn test_trace_and_routine_serde_roundtrip() {
     assert_eq!(loaded_trace.name, "test_roundtrip");
     assert_eq!(loaded_trace.steps.len(), 1);
     assert_eq!(loaded_trace.steps[0].x, Some(500));
+    assert_eq!(loaded_trace.steps[0].reference, Some("@e1".to_string()));
 
     let compiled = compile_trace(&loaded_trace, None).expect("compile trace");
     assert_eq!(compiled.name, "test_roundtrip");
     assert_eq!(compiled.steps.len(), 1);
     assert_eq!(compiled.steps[0].action.kind, "click");
+    assert_eq!(compiled.steps[0].action.reference, Some("@e1".to_string()));
+    assert_eq!(compiled.steps[0].action.description, "click on ref '@e1'");
     assert_eq!(
         compiled.steps[0].action.selector,
         Some("button#submit".to_string())
