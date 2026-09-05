@@ -401,11 +401,31 @@ impl Vault {
                 return PathBuf::from(trimmed);
             }
         }
-        let cfg = crate::config::ReachConfig::load();
-        if let Some(p) = cfg.vault.path {
-            return p;
-        }
         let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        let config_path = std::env::var("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from(&home).join(".config"))
+            .join("reach")
+            .join("config.toml");
+        if let Ok(content) = std::fs::read_to_string(&config_path)
+            && let Some(pos) = content.find("[vault]")
+        {
+            let section = &content[pos..];
+            for line in section.lines().skip(1) {
+                let line = line.trim();
+                if line.starts_with('[') {
+                    break;
+                }
+                if let Some((k, v)) = line.split_once('=')
+                    && k.trim() == "path"
+                {
+                    let path_str = v.trim().trim_matches('"').trim_matches('\'').trim();
+                    if !path_str.is_empty() {
+                        return PathBuf::from(path_str);
+                    }
+                }
+            }
+        }
         PathBuf::from(home)
             .join(".reach")
             .join("vault")
@@ -711,7 +731,13 @@ mod tests {
 
     #[test]
     fn test_vault_persistence_and_permissions() {
-        let unique = format!("reach-test-vault-{}", uuid::Uuid::new_v4());
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let unique = format!("reach-test-vault-{}_{}_{}", std::process::id(), nanos, c);
         let temp_dir = std::env::temp_dir().join(unique);
         let vault_file = temp_dir.join("secrets.json");
         let vault = Vault::new(&vault_file);

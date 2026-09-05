@@ -27,6 +27,7 @@ axum.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
+reach-secrets = { path = "../reach-secrets" }
 
 clap = { version = "4", features = ["derive", "env"] }
 bollard = "0.18"

@@ -767,16 +767,23 @@ impl CookieJarService {
 
     pub fn sanitize_domain(domain: &str) -> String {
         let trimmed = domain.trim();
-        let without_scheme = trimmed
-            .strip_prefix("http://")
-            .or_else(|| trimmed.strip_prefix("https://"))
-            .unwrap_or(trimmed);
+        let lower = trimmed.to_ascii_lowercase();
+        let without_scheme = if let Some(stripped) = lower.strip_prefix("https://") {
+            stripped
+        } else if let Some(stripped) = lower.strip_prefix("http://") {
+            stripped
+        } else if let Some(stripped) = lower.strip_prefix("//") {
+            stripped
+        } else {
+            &lower
+        };
         let host = without_scheme.split('/').next().unwrap_or(without_scheme);
-        let cleaned = host.trim_start_matches('.');
+        let host_without_port = host.split(':').next().unwrap_or(host);
+        let cleaned = host_without_port.trim_start_matches('.');
         if cleaned.is_empty() {
             "default".to_string()
         } else {
-            cleaned.to_ascii_lowercase()
+            cleaned.to_string()
         }
     }
 
@@ -910,17 +917,32 @@ impl CookieJarService {
     }
 
     /// Dump updated cookies back into the matching domain jars.
-    pub fn dump_cookies_to_jars(
+    pub fn dump_cookies_to_jars<C: CookieSource + ?Sized>(
         &self,
-        cookies: &[Cookie],
+        source: &C,
         declared_jars: &[String],
     ) -> anyhow::Result<()> {
-        for domain in declared_jars {
+        let cookies = source.as_cookies();
+        let target_domains: Vec<String> = if declared_jars.is_empty() {
+            let mut seen = std::collections::BTreeSet::new();
+            for c in cookies {
+                let clean = Self::sanitize_domain(&c.domain);
+                if !clean.is_empty() && clean != "default" {
+                    seen.insert(clean);
+                }
+            }
+            seen.into_iter().collect()
+        } else {
+            declared_jars.to_vec()
+        };
+
+        for domain in &target_domains {
             let clean_domain = Self::sanitize_domain(domain);
             let matching_cookies: Vec<Cookie> = cookies
                 .iter()
                 .filter(|c| {
-                    let c_dom = c.domain.trim_start_matches('.');
+                    let c_clean = Self::sanitize_domain(&c.domain);
+                    let c_dom = c_clean.trim_start_matches('.');
                     c_dom.ends_with(&clean_domain) || clean_domain.ends_with(c_dom)
                 })
                 .cloned()
@@ -933,12 +955,21 @@ impl CookieJarService {
             for _ in 0..3 {
                 let mut jar = self.load_jar(domain).unwrap_or_default();
                 for new_c in &matching_cookies {
+                    let mut cookie_to_store = new_c.clone();
+                    if cookie_to_store.domain.contains("://")
+                        || cookie_to_store.domain.contains(':')
+                    {
+                        cookie_to_store.domain = Self::sanitize_domain(&cookie_to_store.domain);
+                    }
                     if let Some(existing) = jar.cookies.iter_mut().find(|c| {
-                        c.name == new_c.name && c.domain == new_c.domain && c.path == new_c.path
+                        c.name == cookie_to_store.name
+                            && Self::sanitize_domain(&c.domain)
+                                == Self::sanitize_domain(&cookie_to_store.domain)
+                            && c.path == cookie_to_store.path
                     }) {
-                        *existing = new_c.clone();
+                        *existing = cookie_to_store;
                     } else {
-                        jar.cookies.push(new_c.clone());
+                        jar.cookies.push(cookie_to_store);
                     }
                 }
                 if self.save_jar(domain, &jar).is_ok() {
@@ -947,6 +978,28 @@ impl CookieJarService {
             }
         }
         Ok(())
+    }
+}
+
+pub trait CookieSource {
+    fn as_cookies(&self) -> &[Cookie];
+}
+
+impl CookieSource for [Cookie] {
+    fn as_cookies(&self) -> &[Cookie] {
+        self
+    }
+}
+
+impl CookieSource for Vec<Cookie> {
+    fn as_cookies(&self) -> &[Cookie] {
+        self.as_slice()
+    }
+}
+
+impl CookieSource for StorageState {
+    fn as_cookies(&self) -> &[Cookie] {
+        &self.cookies
     }
 }
 

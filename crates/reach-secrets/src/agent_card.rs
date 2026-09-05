@@ -9,12 +9,15 @@
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::io::AsRawFd;
 
 /// Default approval threshold in USD.
 pub const DEFAULT_APPROVAL_THRESHOLD_USD: f64 = 25.0;
@@ -242,33 +245,22 @@ pub fn generate_synthetic_pan(prefix: &str) -> String {
     let target_len = 16;
     let needed = target_len - 1 - prefix.len();
     let mut rng_digits = String::with_capacity(needed);
-    for _ in 0..needed {
-        let n: u8 = (std::process::id() as u64
-            ^ SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos() as u64) as u8
-            % 10;
+
+    let seed = std::process::id() as u128
+        ^ SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+    let mut state = seed;
+    for i in 0..needed {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407 + i as u128);
+        let n = ((state >> 64) % 10) as u8;
         rng_digits.push_str(&n.to_string());
     }
 
-    // Use uuid for extra randomness if needed
-    let uuid_digits: String = uuid::Uuid::new_v4()
-        .as_simple()
-        .to_string()
-        .chars()
-        .filter_map(|c| c.to_digit(10))
-        .take(needed)
-        .map(|d| char::from_digit(d, 10).unwrap())
-        .collect();
-
-    let random_part = if uuid_digits.len() == needed {
-        uuid_digits
-    } else {
-        format!("{rng_digits:0<needed$}")
-    };
-
-    let partial = format!("{prefix}{random_part}");
+    let partial = format!("{prefix}{rng_digits}");
     let digits: Vec<u32> = partial.chars().filter_map(|c| c.to_digit(10)).collect();
 
     let mut checksum = 0;
@@ -285,8 +277,7 @@ pub fn generate_synthetic_pan(prefix: &str) -> String {
     }
 
     let check_digit = (10 - (checksum % 10)) % 10;
-    let pan = format!("{partial}{check_digit}");
-    pan
+    format!("{partial}{check_digit}")
 }
 
 /// Mask a card number showing only the first 4 and last 4 digits.
@@ -317,6 +308,42 @@ pub struct CardInjectionResult {
     pub commands: Vec<String>,
 }
 
+// ═══════════════════════════════════════════════════════════
+// File Locking Implementation (.cards.lock)
+// ═══════════════════════════════════════════════════════════
+
+#[cfg(unix)]
+unsafe extern "C" {
+    fn flock(fd: std::os::raw::c_int, operation: std::os::raw::c_int) -> std::os::raw::c_int;
+}
+
+#[cfg(unix)]
+const LOCK_EX: std::os::raw::c_int = 2;
+#[cfg(unix)]
+const LOCK_UN: std::os::raw::c_int = 8;
+
+static IN_PROCESS_CARD_LOCK: Mutex<()> = Mutex::new(());
+
+/// RAII lock guard holding exclusive access on `.cards.lock`.
+pub struct CardLockGuard<'a> {
+    #[allow(dead_code)]
+    file: File,
+    #[allow(dead_code)]
+    in_process_guard: std::sync::MutexGuard<'a, ()>,
+}
+
+impl Drop for CardLockGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        {
+            let fd = self.file.as_raw_fd();
+            unsafe {
+                flock(fd, LOCK_UN);
+            }
+        }
+    }
+}
+
 /// Agent Card Storage and Engine.
 pub struct AgentCardEngine {
     pub cards_file: PathBuf,
@@ -338,6 +365,44 @@ impl AgentCardEngine {
             cards_file,
             cards_dir,
         }
+    }
+
+    /// Path to the file lock preventing concurrent write clobbering.
+    pub fn lock_path(&self) -> PathBuf {
+        self.cards_dir.join(".cards.lock")
+    }
+
+    /// Acquire exclusive lock across processes and threads on `.cards.lock`.
+    pub fn acquire_lock(&self) -> Result<CardLockGuard<'_>> {
+        self.ensure_dir()?;
+        let in_process_guard = IN_PROCESS_CARD_LOCK
+            .lock()
+            .map_err(|e| anyhow::anyhow!("Failed to acquire in-process card lock: {e}"))?;
+
+        let lock_path = self.lock_path();
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .with_context(|| format!("Failed to open card lock file {:?}", lock_path))?;
+
+        #[cfg(unix)]
+        {
+            let perm = fs::Permissions::from_mode(0o600);
+            let _ = fs::set_permissions(&lock_path, perm);
+            let fd = file.as_raw_fd();
+            let res = unsafe { flock(fd, LOCK_EX) };
+            if res != 0 {
+                bail!("Failed to acquire exclusive flock on {:?}", lock_path);
+            }
+        }
+
+        Ok(CardLockGuard {
+            file,
+            in_process_guard,
+        })
     }
 
     fn ensure_dir(&self) -> Result<()> {
@@ -390,9 +455,19 @@ impl AgentCardEngine {
         self.ensure_dir()?;
         let json_str = serde_json::to_string_pretty(cards)?;
 
-        let temp_file = self
-            .cards_dir
-            .join(format!(".cards_{}.tmp", uuid::Uuid::new_v4()));
+        static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let cnt = TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+
+        let temp_file = self.cards_dir.join(format!(
+            ".cards_{}_{}_{}.tmp",
+            std::process::id(),
+            nanos,
+            cnt
+        ));
 
         fs::write(&temp_file, &json_str)
             .with_context(|| format!("Failed to write temporary cards file {:?}", temp_file))?;
@@ -437,9 +512,18 @@ impl AgentCardEngine {
             bail!("merchant domain cannot be empty");
         }
 
-        let cid = custom_id
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("card_{}", &uuid::Uuid::new_v4().to_string()[..8]));
+        let _lock = self.acquire_lock()?;
+
+        let cid = custom_id.map(|s| s.to_string()).unwrap_or_else(|| {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let rand_val = (nanos ^ ((std::process::id() as u128) << 32) ^ (c as u128)) as u64;
+            format!("card_{:08x}", rand_val & 0xffff_ffff)
+        });
 
         let pan = generate_synthetic_pan("411122");
         let status = if spending_limit_usd > require_approval_threshold {
@@ -477,6 +561,7 @@ impl AgentCardEngine {
 
     /// Retrieve card by ID.
     pub fn get_card(&self, card_id: &str) -> Result<Card> {
+        let _lock = self.acquire_lock()?;
         let cards = self.read_raw()?;
         cards
             .get(card_id)
@@ -487,6 +572,7 @@ impl AgentCardEngine {
     /// Approve spending on a pending virtual card.
     /// Transitions PENDING_APPROVAL -> ACTIVE.
     pub fn approve_card(&mut self, card_id: &str) -> Result<Card> {
+        let _lock = self.acquire_lock()?;
         let mut cards = self.read_raw()?;
         let card = cards
             .get_mut(card_id)
@@ -512,6 +598,7 @@ impl AgentCardEngine {
 
     /// Explicitly lock a card so it cannot be used or recharged.
     pub fn lock_card(&mut self, card_id: &str) -> Result<Card> {
+        let _lock = self.acquire_lock()?;
         let mut cards = self.read_raw()?;
         let card = cards
             .get_mut(card_id)
@@ -537,6 +624,7 @@ impl AgentCardEngine {
             bail!("Charge amount cannot be negative");
         }
 
+        let _lock = self.acquire_lock()?;
         let mut cards = self.read_raw()?;
         let card = cards
             .get_mut(card_id)
@@ -593,6 +681,7 @@ impl AgentCardEngine {
         merchant_filter: Option<&str>,
         status_filter: Option<CardStatus>,
     ) -> Result<Vec<Card>> {
+        let _lock = self.acquire_lock()?;
         let cards = self.read_raw()?;
         let norm_merchant = merchant_filter.map(normalize_domain);
 
@@ -663,6 +752,7 @@ impl AgentCardEngine {
         has_checkout_form: Option<bool>,
         idempotency_token: Option<&str>,
     ) -> Result<CardInjectionResult> {
+        let _lock = self.acquire_lock()?;
         let mut cards = self.read_raw()?;
         let card = cards
             .get_mut(card_id)
@@ -730,19 +820,21 @@ impl AgentCardEngine {
         }
 
         // Transition ACTIVE -> INJECTING (persisted to disk) BEFORE keystroke commands
-        let effective_tok = idempotency_token
-            .map(String::from)
-            .unwrap_or_else(|| format!("tok_{}", &uuid::Uuid::new_v4().to_string()[..8]));
+        let effective_tok = idempotency_token.map(String::from).unwrap_or_else(|| {
+            static TOK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let c = TOK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let rand_val = (nanos ^ ((std::process::id() as u128) << 32) ^ (c as u128)) as u64;
+            format!("tok_{:08x}", rand_val & 0xffff_ffff)
+        });
 
-        let card_to_inject = {
-            let card = cards
-                .get_mut(card_id)
-                .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
-            card.status = CardStatus::Injecting;
-            card.injected_at = Some(now);
-            card.idempotency_token = Some(effective_tok);
-            card.clone()
-        };
+        card.status = CardStatus::Injecting;
+        card.injected_at = Some(now);
+        card.idempotency_token = Some(effective_tok);
+        let card_to_inject = card.clone();
         self.write_raw(&cards)?;
 
         let cmds = self.build_injection_commands(&card_to_inject, submit, split_exp);
@@ -752,7 +844,14 @@ impl AgentCardEngine {
         let card_merchant = card_to_inject.merchant.clone();
 
         // Transition INJECTING -> LOCKED immediately after typing
-        let locked = self.lock_card(card_id)?;
+        let locked_card = {
+            let card_entry = cards
+                .get_mut(card_id)
+                .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
+            card_entry.status = CardStatus::Locked;
+            card_entry.clone()
+        };
+        self.write_raw(&cards)?;
 
         Ok(CardInjectionResult {
             status: "injected".into(),
@@ -760,7 +859,7 @@ impl AgentCardEngine {
             screen,
             target_container: target_container.into(),
             merchant: card_merchant,
-            card_status: locked.status,
+            card_status: locked_card.status,
             card_number_masked: masked_pan,
             submitted: submit,
             commands: cmds,
@@ -775,7 +874,18 @@ mod tests {
     struct TempDir(std::path::PathBuf);
     impl TempDir {
         fn new() -> Self {
-            let p = std::env::temp_dir().join(format!("reach-card-test-{}", uuid::Uuid::new_v4()));
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+            let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos();
+            let p = std::env::temp_dir().join(format!(
+                "reach-card-test-{}_{}_{}",
+                std::process::id(),
+                nanos,
+                c
+            ));
             let _ = std::fs::create_dir_all(&p);
             Self(p)
         }
@@ -1090,5 +1200,45 @@ mod tests {
         );
         assert!(res2.is_ok());
         assert_eq!(res2.unwrap().status, "already_injected");
+    }
+
+    #[test]
+    fn test_cards_lock_concurrency() {
+        let tmp_dir = TempDir::new();
+        let cards_file = tmp_dir.path().join("cards.json");
+        let engine = AgentCardEngine::new(Some(cards_file.clone()));
+
+        // Ensure lock file exists after lock acquisition
+        {
+            let _lock = engine.acquire_lock().unwrap();
+            assert!(engine.lock_path().exists());
+        }
+
+        // Concurrently mint cards across threads to verify no write clobbering
+        let mut handles = Vec::new();
+        for i in 0..5 {
+            let path_clone = cards_file.clone();
+            let handle = std::thread::spawn(move || {
+                let mut eng = AgentCardEngine::new(Some(path_clone));
+                eng.mint_card(
+                    &format!("merchant{i}.com"),
+                    10.0 + i as f64,
+                    25.0,
+                    None,
+                    None,
+                )
+                .unwrap()
+            });
+            handles.push(handle);
+        }
+
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let final_engine = AgentCardEngine::new(Some(cards_file));
+        let all_cards = final_engine.list_cards(None, None).unwrap();
+        // All 5 cards must exist without clobbering!
+        assert_eq!(all_cards.len(), 5);
     }
 }

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/reach-cli", "crates/reach-supervisor"]
+members = ["crates/reach-cli", "crates/reach-secrets", "crates/reach-supervisor"]
 
 [workspace.package]
 version = "0.0.1"

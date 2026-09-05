@@ -6,6 +6,7 @@ pub mod create;
 pub mod destroy;
 pub mod drive;
 pub mod exec;
+pub mod jar;
 pub mod list;
 pub mod record;
 pub mod recreate;
@@ -49,6 +50,8 @@ pub enum Command {
     BuzzDaemon(buzz_daemon::BuzzDaemonArgs),
     /// Manage credentials in native secret vault and generate TOTP codes
     Vault(vault::VaultArgs),
+    /// Manage domain-sharded cookie jars
+    Jar(jar::JarArgs),
     /// Run Reach CUA Driver vision-action loop
     Drive(drive::DriveArgs),
 }
@@ -70,6 +73,7 @@ pub async fn run(cmd: Command) -> anyhow::Result<()> {
         Command::Card(args) => card::run(args).await,
         Command::BuzzDaemon(args) => buzz_daemon::run(args).await,
         Command::Vault(args) => vault::run(args).await,
+        Command::Jar(args) => jar::run(args).await,
         Command::Drive(args) => drive::run(args).await,
     }
 }
