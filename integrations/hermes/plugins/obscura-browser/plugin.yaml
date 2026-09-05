@@ -1,0 +1,84 @@
+name: obscura-browser
+version: "0.1.0"
+description: "Ultra-fast (51ms) Rust-native headless browser for AI agents. Native stealth TLS, 3,520 tracker blocks, V8 JS execution, DOM/Markdown extraction, and CDP/MCP bridge."
+author: "Reach & Obscura Team"
+enabled_by_default: true
+
+tools:
+  - name: obscura_fetch
+    description: "Fetch and render a URL using Obscura's 51ms Rust V8 engine. Extracts clean markdown, text, HTML, or links with built-in anti-fingerprinting stealth."
+    parameters:
+      type: object
+      required:
+        - url
+      properties:
+        url:
+          type: string
+          description: "Target URL to fetch."
+        dump:
+          type: string
+          enum: ["markdown", "text", "html", "links"]
+          default: "markdown"
+          description: "Output format to extract from the page."
+        stealth:
+          type: boolean
+          default: true
+          description: "Enable anti-detection TLS ClientHello masking and 3,520 domain tracker blocking."
+        wait_until:
+          type: string
+          enum: ["load", "domcontentloaded", "networkidle0"]
+          default: "load"
+          description: "Navigation lifecycle state to wait for."
+        timeout:
+          type: integer
+          default: 30
+          description: "Timeout in seconds."
+
+  - name: obscura_eval
+    description: "Evaluate a JavaScript expression on a target URL using Obscura's embedded V8 runtime."
+    parameters:
+      type: object
+      required:
+        - url
+        - expr
+      properties:
+        url:
+          type: string
+          description: "Target page URL."
+        expr:
+          type: string
+          description: "JavaScript expression to evaluate (e.g., 'document.title', 'document.querySelectorAll(\"h2\").length')."
+        stealth:
+          type: boolean
+          default: true
+          description: "Enable anti-detection mode."
+
+  - name: obscura_scrape
+    description: "Scrape multiple URLs in parallel using Obscura worker processes with high concurrency."
+    parameters:
+      type: object
+      required:
+        - urls
+      properties:
+        urls:
+          type: array
+          items:
+            type: string
+          description: "List of URLs to scrape."
+        expr:
+          type: string
+          description: "Optional JavaScript expression to evaluate on each page."
+        concurrency:
+          type: integer
+          default: 10
+          description: "Number of parallel worker processes."
+
+  - name: obscura_cdp_info
+    description: "Get connection info for the Obscura Chrome DevTools Protocol (CDP) server for Playwright/Puppeteer."
+    parameters:
+      type: object
+      properties:
+        port:
+          type: integer
+          default: 9222
+          description: "CDP WebSocket port."

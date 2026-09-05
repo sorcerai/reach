@@ -20,6 +20,19 @@ services:
       timeout: 5s
       retries: 3
 
+  obscura:
+    image: h4ckf0r0day/obscura:latest
+    ports:
+      - "127.0.0.1:9222:9222"
+      - "127.0.0.1:8080:8080"
+    command: ["obscura", "serve", "--port", "9222", "--stealth"]
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: "1.0"
+
   prometheus:
     image: prom/prometheus:v2.51.0
     volumes:
