@@ -1,10 +1,15 @@
 pub mod browse;
+pub mod buzz_daemon;
+pub mod card;
 pub mod connect;
 pub mod create;
 pub mod destroy;
+pub mod drive;
 pub mod exec;
 pub mod list;
+pub mod record;
 pub mod recreate;
+pub mod replay;
 pub mod screenshot;
 pub mod serve;
 pub mod vnc;
@@ -33,6 +38,16 @@ pub enum Command {
     Vnc(vnc::VncArgs),
     /// Capture a screenshot from a sandbox
     Screenshot(screenshot::ScreenshotArgs),
+    /// Record an interactive routine demonstration
+    Record(record::RecordArgs),
+    /// Replay a compiled routine with CUA self-healing
+    Replay(replay::ReplayArgs),
+    /// Manage virtual agent cards and bounded spending limits
+    Card(card::CardArgs),
+    /// Run the Live Buzz Agent Daemon (@ReachBot continuous listener)
+    BuzzDaemon(buzz_daemon::BuzzDaemonArgs),
+    /// Run Reach CUA Driver vision-action loop
+    Drive(drive::DriveArgs),
 }
 
 pub async fn run(cmd: Command) -> anyhow::Result<()> {
@@ -47,5 +62,10 @@ pub async fn run(cmd: Command) -> anyhow::Result<()> {
         Command::Browse(args) => browse::run(args).await,
         Command::Vnc(args) => vnc::run(args).await,
         Command::Screenshot(args) => screenshot::run(args).await,
+        Command::Record(args) => record::run(args).await,
+        Command::Replay(args) => replay::run(args).await,
+        Command::Card(args) => card::run(args).await,
+        Command::BuzzDaemon(args) => buzz_daemon::run(args).await,
+        Command::Drive(args) => drive::run(args).await,
     }
 }

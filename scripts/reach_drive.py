@@ -1122,6 +1122,8 @@ class ReachDriver:
         max_unchanged_ticks: int = 3,
         backoff_sec: float = 0.75,
         roi: Optional[Union[List[int], Tuple[int, int, int, int], Roi, str]] = None,
+        lease_token: Optional[str] = None,
+        step_callback: Optional[Callable[[StepRecord], None]] = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.screen = screen
@@ -1139,6 +1141,8 @@ class ReachDriver:
         self.max_unchanged_ticks = max_unchanged_ticks
         self.backoff_sec = backoff_sec
         self.roi = Roi.from_value(roi) if roi is not None else None
+        self.lease_token = lease_token
+        self.step_callback = step_callback
         self.change_gate = PerceptualChangeGate(
             min_change_threshold=min_change_threshold,
             max_unchanged_ticks=max_unchanged_ticks,
@@ -1151,6 +1155,15 @@ class ReachDriver:
             approval_callback=approval_callback,
         )
         self._temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]] = None
+
+    def _record_step(self, steps: List[StepRecord], record: StepRecord) -> None:
+        """Append step record and notify step_callback if registered."""
+        steps.append(record)
+        if self.step_callback:
+            try:
+                self.step_callback(record)
+            except Exception as cb_err:
+                logger.warning("Step callback failed: %s", cb_err)
 
     def _archive_screenshot(self, src_path: str, filename: str) -> Optional[str]:
         """Save a screenshot into the visual audit directory."""
@@ -1275,7 +1288,10 @@ class ReachDriver:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "{}")
+                data = json.loads(r.read().decode("utf-8") or "{}")
+                if isinstance(data, dict) and data.get("token"):
+                    self.lease_token = data["token"]
+                return data
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
             logger.error("Lease screen failed (%s): %s", e.code, body)
@@ -1283,10 +1299,16 @@ class ReachDriver:
 
     def release_screen(self, owner: str) -> Dict[str, Any]:
         """Release leased screen."""
+        headers = {"content-type": "application/json"}
+        if self.lease_token:
+            headers["x-lease-token"] = self.lease_token
+        payload = {"owner": owner}
+        if self.lease_token:
+            payload["token"] = self.lease_token
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/lease",
-            data=json.dumps({"owner": owner}).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
             method="DELETE",
         )
         try:
@@ -1296,15 +1318,25 @@ class ReachDriver:
             logger.warning("Release screen %s failed: %s", self.screen, e)
             return {"error": str(e)}
 
-    def set_takeover(self, pending: bool, url: Optional[str] = None) -> Dict[str, Any]:
+    def set_takeover(
+        self,
+        pending: bool,
+        url: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """Set takeover pending state on Reach agent server."""
         payload: Dict[str, Any] = {"pending": pending}
         if url:
             payload["url"] = url
+        if reason:
+            payload["reason"] = reason
+        headers = {"content-type": "application/json"}
+        if self.lease_token:
+            headers["x-lease-token"] = self.lease_token
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/takeover",
             data=json.dumps(payload).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -1342,10 +1374,13 @@ class ReachDriver:
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": args_with_screen},
         }
+        headers = {"content-type": "application/json"}
+        if self.lease_token:
+            headers["x-lease-token"] = self.lease_token
         req = urllib.request.Request(
             f"{self.api_url}/mcp",
             data=json.dumps(req_body).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
@@ -1808,7 +1843,8 @@ class ReachDriver:
                             f"waiting for page/animation settle"
                         ),
                     )
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=gate_action,
@@ -1824,7 +1860,7 @@ class ReachDriver:
                             vlm_cached=True,
                             visual_change=gate_decision.visual_distance,
                             roi=self.roi.to_list() if self.roi else None,
-                        )
+                        ),
                     )
                     continue
 
@@ -1859,7 +1895,8 @@ class ReachDriver:
                     logger.error(
                         "Step %s model proposal failed: %s", step_idx, model_err
                     )
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=ReachAction(
@@ -1869,7 +1906,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             error=str(model_err),
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1893,7 +1930,8 @@ class ReachDriver:
                 if action.kind == "auth_required":
                     vnc_url = self.get_novnc_url()
                     self.set_takeover(True, vnc_url)
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
@@ -1903,7 +1941,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result={"status": "auth_required", "vnc_url": vnc_url},
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1918,7 +1956,8 @@ class ReachDriver:
 
                 # Handle termination
                 if action.kind == "terminate":
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
@@ -1928,7 +1967,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result={"status": "completed"},
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=True,
@@ -1950,7 +1989,8 @@ class ReachDriver:
                         "reason": danger_reason,
                     }
                     print(json.dumps(approval_notice), file=sys.stderr)
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
@@ -1960,7 +2000,7 @@ class ReachDriver:
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result=approval_notice,
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1996,7 +2036,8 @@ class ReachDriver:
                     except Exception as shot_err:
                         logger.debug("After screenshot capture skipped: %s", shot_err)
 
-                steps.append(
+                self._record_step(
+                    steps,
                     StepRecord(
                         step_index=step_idx,
                         action=action,
@@ -2010,7 +2051,7 @@ class ReachDriver:
                         visual_change=gate_decision.visual_distance,
                         roi=self.roi.to_list() if self.roi else None,
                         roi_crop_path=roi_crop_path,
-                    )
+                    ),
                 )
 
                 # Short delay for browser/display rendering

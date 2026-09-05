@@ -1,7 +1,9 @@
 pub mod agent;
+pub mod agent_card;
 pub mod config;
 pub mod docker;
 pub mod drive;
 pub mod mcp;
 pub mod profile;
+pub mod routine;
 pub mod tools;

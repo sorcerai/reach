@@ -678,6 +678,75 @@ pub fn clean_x11_locks() -> Result<()> {
     Ok(())
 }
 
+pub const NOVNC_BANNER_SNIPPET: &str = r##"<script id="reach-banner-injected">
+(function() {
+  if (document.getElementById("reach-takeover-banner")) return;
+  const s = document.createElement("style");
+  s.textContent = "#reach-takeover-banner{position:fixed;top:0;left:0;right:0;z-index:999999;background:rgba(24,24,37,0.95);backdrop-filter:blur(8px);color:#cdd6f4;border-bottom:2px solid #fab387;padding:10px 24px;display:none;justify-content:space-between;align-items:center;font-family:system-ui,sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.5)}.reach-banner-content{display:flex;align-items:center;gap:12px;font-size:14px;font-weight:500}.reach-pulse-dot{width:10px;height:10px;border-radius:50%;background:#fab387;box-shadow:0 0 10px #fab387;display:inline-block;animation:reach-pulse 1.5s infinite}@keyframes reach-pulse{0%,100%{transform:scale(0.95);opacity:0.8}50%{transform:scale(1.2);opacity:1}}#reach-takeover-reason{font-weight:700;color:#fab387}.reach-handback-btn{background:#89b4fa;color:#11111b;border:none;outline:none;font-weight:600;font-size:13px;padding:8px 18px;border-radius:8px;cursor:pointer;transition:all 0.2s ease}.reach-handback-btn:hover:not(:disabled){background:#b4befe}.reach-handback-btn:disabled{opacity:0.7;cursor:not-allowed}";
+  document.head.appendChild(s);
+  const b = document.createElement("div");
+  b.id = "reach-takeover-banner";
+  b.innerHTML = '<div class="reach-banner-content"><span class="reach-pulse-dot"></span><span class="reach-banner-msg">Agent is waiting: <span id="reach-takeover-reason">takeover requested</span></span></div><button id="reach-handback-btn" class="reach-handback-btn" type="button">Hand Back to Agent</button>';
+  document.body.appendChild(b);
+  const p = new URLSearchParams(window.location.search);
+  let id = p.has("screen") ? parseInt(p.get("screen"), 10) : (parseInt(window.location.port, 10) >= 6080 ? parseInt(window.location.port, 10) - 6080 : 0);
+  const api = p.get("api") ? p.get("api").replace(/\/$/, "") : window.location.protocol + "//" + window.location.hostname + ":4200";
+  const r = document.getElementById("reach-takeover-reason");
+  const btn = document.getElementById("reach-handback-btn");
+  if (p.get("reason")) { r.textContent = p.get("reason"); b.style.display = "flex"; }
+  async function poll() {
+    try {
+      const res = await fetch(api + "/agent/screens", { cache: "no-store" });
+      if (!res.ok) return;
+      const list = await res.json();
+      const cur = list.find(s => s.id === id);
+      if (cur && (cur.phase === "HandoffPending" || cur.phase === "HumanActive")) {
+        b.style.display = "flex";
+        if (cur.takeover_reason) r.textContent = cur.takeover_reason;
+        if (cur.phase === "HandoffPending") fetch(api + "/agent/screens/" + id + "/connected", { method: "POST" }).catch(() => {});
+      } else {
+        b.style.display = "none";
+      }
+    } catch (_) {}
+  }
+  setInterval(poll, 1500); poll();
+  btn.addEventListener("click", async () => {
+    btn.disabled = true; btn.textContent = "Handing back...";
+    try {
+      const res = await fetch(api + "/agent/screens/" + id + "/handback", { method: "POST" });
+      if (res.ok) {
+        btn.textContent = "Handed back \u{2713}";
+        r.textContent = "Control returned to agent";
+        setTimeout(() => { b.style.display = "none"; btn.disabled = false; btn.textContent = "Hand Back to Agent"; }, 1500);
+      } else { throw new Error("HTTP " + res.status); }
+    } catch (e) {
+      btn.disabled = false; btn.textContent = "Hand Back to Agent";
+      alert("Failed to hand back: " + e.message);
+    }
+  });
+})();
+</script>"##;
+
+pub fn inject_novnc_banner(vnc_html_path: &std::path::Path) -> std::io::Result<bool> {
+    if !vnc_html_path.exists() {
+        return Ok(false);
+    }
+    let content = std::fs::read_to_string(vnc_html_path)?;
+    if content.contains("reach-takeover-banner") || content.contains("reach-banner-injected") {
+        return Ok(false);
+    }
+    let new_content = if let Some(idx) = content.rfind("</body>") {
+        let mut s = content[..idx].to_string();
+        s.push_str(NOVNC_BANNER_SNIPPET);
+        s.push_str(&content[idx..]);
+        s
+    } else {
+        format!("{content}\n{NOVNC_BANNER_SNIPPET}")
+    };
+    std::fs::write(vnc_html_path, new_content)?;
+    Ok(true)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -752,73 +821,4 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(&dir);
     }
-}
-
-pub const NOVNC_BANNER_SNIPPET: &str = r##"<script id="reach-banner-injected">
-(function() {
-  if (document.getElementById("reach-takeover-banner")) return;
-  const s = document.createElement("style");
-  s.textContent = "#reach-takeover-banner{position:fixed;top:0;left:0;right:0;z-index:999999;background:rgba(24,24,37,0.95);backdrop-filter:blur(8px);color:#cdd6f4;border-bottom:2px solid #fab387;padding:10px 24px;display:none;justify-content:space-between;align-items:center;font-family:system-ui,sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.5)}.reach-banner-content{display:flex;align-items:center;gap:12px;font-size:14px;font-weight:500}.reach-pulse-dot{width:10px;height:10px;border-radius:50%;background:#fab387;box-shadow:0 0 10px #fab387;display:inline-block;animation:reach-pulse 1.5s infinite}@keyframes reach-pulse{0%,100%{transform:scale(0.95);opacity:0.8}50%{transform:scale(1.2);opacity:1}}#reach-takeover-reason{font-weight:700;color:#fab387}.reach-handback-btn{background:#89b4fa;color:#11111b;border:none;outline:none;font-weight:600;font-size:13px;padding:8px 18px;border-radius:8px;cursor:pointer;transition:all 0.2s ease}.reach-handback-btn:hover:not(:disabled){background:#b4befe}.reach-handback-btn:disabled{opacity:0.7;cursor:not-allowed}";
-  document.head.appendChild(s);
-  const b = document.createElement("div");
-  b.id = "reach-takeover-banner";
-  b.innerHTML = '<div class="reach-banner-content"><span class="reach-pulse-dot"></span><span class="reach-banner-msg">Agent is waiting: <span id="reach-takeover-reason">takeover requested</span></span></div><button id="reach-handback-btn" class="reach-handback-btn" type="button">Hand Back to Agent</button>';
-  document.body.appendChild(b);
-  const p = new URLSearchParams(window.location.search);
-  let id = p.has("screen") ? parseInt(p.get("screen"), 10) : (parseInt(window.location.port, 10) >= 6080 ? parseInt(window.location.port, 10) - 6080 : 0);
-  const api = p.get("api") ? p.get("api").replace(/\/$/, "") : window.location.protocol + "//" + window.location.hostname + ":4200";
-  const r = document.getElementById("reach-takeover-reason");
-  const btn = document.getElementById("reach-handback-btn");
-  if (p.get("reason")) { r.textContent = p.get("reason"); b.style.display = "flex"; }
-  async function poll() {
-    try {
-      const res = await fetch(api + "/agent/screens", { cache: "no-store" });
-      if (!res.ok) return;
-      const list = await res.json();
-      const cur = list.find(s => s.id === id);
-      if (cur && (cur.phase === "HandoffPending" || cur.phase === "HumanActive")) {
-        b.style.display = "flex";
-        if (cur.takeover_reason) r.textContent = cur.takeover_reason;
-        if (cur.phase === "HandoffPending") fetch(api + "/agent/screens/" + id + "/connected", { method: "POST" }).catch(() => {});
-      } else {
-        b.style.display = "none";
-      }
-    } catch (_) {}
-  }
-  setInterval(poll, 1500); poll();
-  btn.addEventListener("click", async () => {
-    btn.disabled = true; btn.textContent = "Handing back...";
-    try {
-      const res = await fetch(api + "/agent/screens/" + id + "/handback", { method: "POST" });
-      if (res.ok) {
-        btn.textContent = "Handed back \u{2713}";
-        r.textContent = "Control returned to agent";
-        setTimeout(() => { b.style.display = "none"; btn.disabled = false; btn.textContent = "Hand Back to Agent"; }, 1500);
-      } else { throw new Error("HTTP " + res.status); }
-    } catch (e) {
-      btn.disabled = false; btn.textContent = "Hand Back to Agent";
-      alert("Failed to hand back: " + e.message);
-    }
-  });
-})();
-</script>"##;
-
-pub fn inject_novnc_banner(vnc_html_path: &std::path::Path) -> std::io::Result<bool> {
-    if !vnc_html_path.exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(vnc_html_path)?;
-    if content.contains("reach-takeover-banner") || content.contains("reach-banner-injected") {
-        return Ok(false);
-    }
-    let new_content = if let Some(idx) = content.rfind("</body>") {
-        let mut s = content[..idx].to_string();
-        s.push_str(NOVNC_BANNER_SNIPPET);
-        s.push_str(&content[idx..]);
-        s
-    } else {
-        format!("{content}\n{NOVNC_BANNER_SNIPPET}")
-    };
-    std::fs::write(vnc_html_path, new_content)?;
-    Ok(true)
 }
