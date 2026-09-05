@@ -99,14 +99,35 @@ jobs:
       - uses: actions/checkout@v4
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
-      - name: Build arm64 image (no load, build-only)
+      - name: Build arm64 image
         uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/arm64
+          load: true
           tags: reach:ci-arm64
           cache-from: type=gha,scope=arm64
           cache-to: type=gha,mode=max,scope=arm64
+      - name: Smoke test arm64 container
+        run: |
+          docker run -d --name smoke-arm64 -p 8400:8400 reach:ci-arm64
+          HEALTHY=false
+          for i in $(seq 1 30); do
+            RESPONSE=$(curl -sf http://localhost:8400/health 2>/dev/null || true)
+            if echo "$RESPONSE" | grep -q '"status":"healthy"'; then
+              echo "Healthy after ${i}s"
+              HEALTHY=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$HEALTHY" != "true" ]; then
+            echo "Timeout waiting for health"
+            docker logs smoke-arm64
+            docker rm -f smoke-arm64
+            exit 1
+          fi
+          docker rm -f smoke-arm64
 
   e2e:
     name: E2E Tests
