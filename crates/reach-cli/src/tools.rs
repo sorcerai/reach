@@ -306,12 +306,32 @@ pub async fn dispatch(
             Err(e) => ToolResponse::error(e.to_string()),
         },
         "click" => {
-            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
             let btn = match args.get("button").and_then(|v| v.as_str()) {
                 Some("right") => "3",
                 Some("middle") => "2",
                 _ => "1",
+            };
+            let reference = args.get("ref").and_then(|v| v.as_str());
+            let (x, y) = if let Some(ref_str) = reference {
+                match crate::refs::resolve_ref(target, screen, ref_str) {
+                    Some(el) => match el.target_coordinates() {
+                        Some(coords) => coords,
+                        None => {
+                            return ToolResponse::error(format!(
+                                "ref '{ref_str}' has no valid coordinates"
+                            ));
+                        }
+                    },
+                    None => {
+                        return ToolResponse::error(format!(
+                            "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
+                        ));
+                    }
+                }
+            } else {
+                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
+                (x, y)
             };
             sh(
                 ctx,
@@ -323,13 +343,45 @@ pub async fn dispatch(
         }
         "type" => {
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
-            sh(
-                ctx,
-                target,
-                screen,
-                &format!("xdotool type -- '{}'", text.replace('\'', "'\\''")),
-            )
-            .await
+            let reference = args.get("ref").and_then(|v| v.as_str());
+            let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+
+            if let Some(ref_str) = reference {
+                match crate::refs::resolve_ref(target, screen, ref_str) {
+                    Some(el) => {
+                        let (cx, cy) = match el.target_coordinates() {
+                            Some(coords) => coords,
+                            None => {
+                                return ToolResponse::error(format!(
+                                    "ref '{ref_str}' has no valid coordinates"
+                                ));
+                            }
+                        };
+                        let mut script = format!("xdotool mousemove {cx} {cy} click 1");
+                        if clear {
+                            script.push_str(" && xdotool key ctrl+a BackSpace");
+                        }
+                        script.push_str(&format!(
+                            " && xdotool type -- '{}'",
+                            text.replace('\'', "'\\''")
+                        ));
+                        sh(ctx, target, screen, &script).await
+                    }
+                    None => ToolResponse::error(format!(
+                        "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
+                    )),
+                }
+            } else {
+                let mut script = String::new();
+                if clear {
+                    script.push_str("xdotool key ctrl+a BackSpace && ");
+                }
+                script.push_str(&format!(
+                    "xdotool type -- '{}'",
+                    text.replace('\'', "'\\''")
+                ));
+                sh(ctx, target, screen, &script).await
+            }
         }
         "key" => {
             let combo = args
@@ -464,6 +516,10 @@ pub async fn dispatch(
                     .get("selector")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
+                format: args
+                    .get("format")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
                 timeout_ms: args
                     .get("timeout_ms")
                     .and_then(|v| v.as_u64())
@@ -474,6 +530,10 @@ pub async fn dispatch(
             };
             match ctx.docker.page_text(target, &opts).await {
                 Ok(out) => {
+                    if let Some(map) = &out.refs {
+                        crate::refs::global_ref_table().set_refs(target, screen, map.clone());
+                        crate::refs::save_refs_to_disk(target, screen, map);
+                    }
                     if !declared_jars.is_empty() && !out.cookies.is_empty() {
                         if let Some(jars_svc) = ctx.cookie_jars {
                             let _ = jars_svc.dump_cookies_to_jars(&out.cookies, &declared_jars);

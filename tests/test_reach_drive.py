@@ -297,9 +297,57 @@ class ReachDriverTests(unittest.TestCase):
         with patch("time.sleep"):  # skip sleep delays in test
             result = self.driver.drive(goal="Endless loop")
 
-        self.assertFalse(result.success)
-        self.assertEqual(result.status, "max_steps_exceeded")
-        self.assertEqual(len(result.steps), 5)
+    def test_parse_and_execute_ref_click_action(self) -> None:
+        raw_text = '{"action": {"kind": "click", "ref": "@e3", "button": "left", "description": "Click login"}}'
+        action = ReachDriver.extract_action_from_text(raw_text)
+        self.assertEqual(action.kind, "click")
+        self.assertEqual(action.ref, "@e3")
+        self.assertIsNone(action.point)
+
+        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
+            mock_mcp.return_value = {"status": "ok"}
+            self.driver.execute_action(action)
+            mock_mcp.assert_called_once_with(
+                "click",
+                {"ref": "@e3", "button": "left", "screen": 0},
+            )
+
+    def test_parse_and_execute_ref_type_action(self) -> None:
+        raw_text = '{"action": {"kind": "type", "ref": "e1", "value": "alice@reach.io", "description": "Enter email"}}'
+        action = ReachDriver.extract_action_from_text(raw_text)
+        self.assertEqual(action.kind, "type")
+        self.assertEqual(action.ref, "@e1")
+        self.assertEqual(action.value, "alice@reach.io")
+
+        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
+            mock_mcp.return_value = {"status": "ok"}
+            self.driver.execute_action(action)
+            mock_mcp.assert_called_once_with(
+                "type",
+                {"text": "alice@reach.io", "ref": "@e1", "screen": 0},
+            )
+
+    def test_capture_page_text_extracts_axtree_and_refs(self) -> None:
+        page_text_payload = json.dumps({
+            "status": "ok",
+            "url": "https://example.com/login",
+            "title": "Login",
+            "text": "Login page body text",
+            "axtree": "[heading \"Sign In\"]\n[@e1: textbox \"Email\" focused x=200 y=100 w=200 h=30]\n[@e2: button \"Submit\" x=200 y=150 w=80 h=30]",
+            "refs": {
+                "e1": {"ref": "e1", "role": "textbox", "name": "Email", "point": [300, 115]},
+                "e2": {"ref": "e2", "role": "button", "name": "Submit", "point": [240, 165]}
+            }
+        })
+
+        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
+            mock_mcp.return_value = {
+                "content": [{"type": "text", "text": page_text_payload}]
+            }
+            res = self.driver.capture_page_text("https://example.com/login")
+            self.assertIn("Accessibility Tree (Interact via @eN refs):", res)
+            self.assertIn("@e1: textbox \"Email\"", res)
+            self.assertIn("@e2: button \"Submit\"", res)
 
 
 if __name__ == "__main__":

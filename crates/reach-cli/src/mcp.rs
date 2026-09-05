@@ -179,8 +179,12 @@ fn default_format() -> ImageFormat {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ClickParams {
+    #[serde(default)]
     pub x: i32,
+    #[serde(default)]
     pub y: i32,
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
     #[serde(default)]
     pub button: MouseButton,
     #[serde(default)]
@@ -201,6 +205,10 @@ pub enum MouseButton {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TypeParams {
     pub text: String,
+    #[serde(default, rename = "ref")]
+    pub reference: Option<String>,
+    #[serde(default)]
+    pub clear: bool,
     #[serde(default)]
     pub sandbox: Option<String>,
     #[serde(default)]
@@ -283,6 +291,8 @@ pub struct PageTextParams {
     pub wait_for: Option<String>,
     #[serde(default)]
     pub selector: Option<String>,
+    #[serde(default)]
+    pub format: Option<String>,
     #[serde(default = "default_page_text_timeout")]
     pub timeout_ms: u64,
     #[serde(default)]
@@ -465,13 +475,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "click".into(),
-            description: "Click at screen coordinates".into(),
+            description: "Click at screen coordinates or semantic element ref (e.g. '@e1')".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "required": ["x", "y"],
                 "properties": {
-                    "x": { "type": "integer" },
-                    "y": { "type": "integer" },
+                    "x": { "type": "integer", "description": "X coordinate (optional if ref is provided)" },
+                    "y": { "type": "integer", "description": "Y coordinate (optional if ref is provided)" },
+                    "ref": { "type": "string", "description": "Semantic element ref from page_text (e.g. '@e1' or 'e1')" },
                     "button": { "type": "string", "enum": ["left", "right", "middle"], "default": "left" },
                     "sandbox": { "type": "string" },
                     "screen": { "type": "integer", "default": 0 }
@@ -480,12 +491,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: "type".into(),
-            description: "Type text using the keyboard".into(),
+            description:
+                "Type text using the keyboard, optionally focusing an element by ref first".into(),
             input_schema: serde_json::json!({
                 "type": "object",
                 "required": ["text"],
                 "properties": {
                     "text": { "type": "string" },
+                    "ref": { "type": "string", "description": "Optional element ref from page_text (e.g. '@e1' or 'e1') to focus before typing" },
+                    "clear": { "type": "boolean", "default": false, "description": "Clear field before typing" },
                     "sandbox": { "type": "string" },
                     "screen": { "type": "integer", "default": 0 }
                 }
@@ -566,7 +580,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
             name: "page_text".into(),
             description:
                 "Navigate to a URL using Playwright (real Chromium), wait for the page to render, \
-                 and return the visible text content. Handles JS-heavy SPAs that Scrapling can't."
+                 and return the accessibility tree (AXTree) with semantic element refs (@e1, @e2) \
+                 and visible text content. Handles JS-heavy SPAs that Scrapling can't."
                     .into(),
             input_schema: serde_json::json!({
                 "type": "object",
@@ -580,6 +595,12 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "selector": {
                         "type": "string",
                         "description": "Only extract text from elements matching this selector (default: body)"
+                    },
+                    "format": {
+                        "type": "string",
+                        "enum": ["axtree", "text", "both"],
+                        "default": "both",
+                        "description": "Output format: concise semantic AXTree with refs, raw text, or both"
                     },
                     "timeout_ms": {
                         "type": "integer",

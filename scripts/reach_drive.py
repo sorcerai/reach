@@ -69,11 +69,12 @@ Given the screenshot observation, page text snapshot, the goal, and recent histo
 Output ONLY the JSON object, no prose. Do NOT call external tools or execute commands.
 
 Schema:
-{"action":{"actionClass":"read_only|reversible_mutation","kind":"click|type|key|navigate|auth_required|terminate","point":[x,y],"target":"accessible name, element, or URL","value":"text to type if kind=type","key":"key combo if kind=key","button":"left|right|middle","description":"one short sentence"}}
+{"action":{"actionClass":"read_only|reversible_mutation","kind":"click|type|key|navigate|auth_required|terminate","ref":"@e1 (preferred)","point":[x,y],"target":"accessible name, element, or URL","value":"text to type if kind=type","key":"key combo if kind=key","button":"left|right|middle","description":"one short sentence"}}
 
 Rules:
-- For kind=click: provide "point": [x, y] coordinates where the element is located on the screen image. "button" defaults to "left".
-- For kind=type: specify "value" as the text to type into the focused field.
+- PREFER using "ref": "@eN" (e.g. "@e1", "@e4") from the Accessibility Tree snapshot instead of guessing coordinates! When "ref" is provided, "point" is not required.
+- For kind=click: provide "ref": "@eN" OR "point": [x, y]. "button" defaults to "left".
+- For kind=type: provide "ref": "@eN" to focus the element, and "value": "text to type".
 - For kind=key: specify "key" as the key or combination to press (e.g. "Return", "Tab", "Escape", "BackSpace", "Up", "Down", "ctrl+a").
 - For kind=navigate: specify "target" or "value" as the URL to open.
 - For kind=auth_required: use when a login wall, 2FA prompt, CAPTCHA, or human verification is visible on the screen.
@@ -125,6 +126,7 @@ class ReachAction:
     kind: str  # click | type | key | navigate | wait | scroll | auth_required | terminate
     action_class: str = "read_only"
     point: Optional[Tuple[int, int]] = None
+    ref: Optional[str] = None
     target: Optional[str] = None
     value: Optional[str] = None
     key: Optional[str] = None
@@ -139,6 +141,8 @@ class ReachAction:
             "action_class": self.action_class,
             "description": self.description,
         }
+        if self.ref is not None:
+            d["ref"] = self.ref
         if self.point is not None:
             d["point"] = list(self.point)
         if self.target is not None:
@@ -1463,7 +1467,7 @@ class ReachDriver:
         return screenshot_path
 
     def capture_page_text(self, current_url: Optional[str] = None) -> str:
-        """Capture DOM/page text snapshot."""
+        """Capture DOM/page text snapshot with accessibility tree semantic refs."""
         if not current_url:
             return ""
         try:
@@ -1474,7 +1478,21 @@ class ReachDriver:
             content = res.get("content", [])
             for part in content:
                 if part.get("type") == "text":
-                    return part.get("text", "")
+                    raw = part.get("text", "")
+                    try:
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            axtree = parsed.get("axtree")
+                            text = parsed.get("text")
+                            if axtree and text:
+                                return f"Accessibility Tree (Interact via @eN refs):\n{axtree}\n\nVisible Text Summary:\n{text[:600]}"
+                            elif axtree:
+                                return f"Accessibility Tree (Interact via @eN refs):\n{axtree}"
+                            elif text:
+                                return text
+                    except Exception:
+                        pass
+                    return raw
         except Exception as e:
             logger.debug("Page text capture failed: %s", e)
         return ""
@@ -1684,6 +1702,12 @@ class ReachDriver:
             except (ValueError, TypeError):
                 pass
 
+        ref = d.get("ref") or d.get("reference") or d.get("target_ref")
+        if ref:
+            ref = str(ref).strip()
+            if not ref.startswith("@"):
+                ref = f"@{ref}"
+
         roi = None
         raw_roi = d.get("roi") or d.get("box") or d.get("bbox")
         if raw_roi:
@@ -1695,6 +1719,7 @@ class ReachDriver:
             kind=kind,
             action_class=str(d.get("actionClass", "read_only")),
             point=point,
+            ref=ref,
             target=d.get("target"),
             value=d.get("value"),
             key=d.get("key") or d.get("combo"),
@@ -1735,15 +1760,23 @@ class ReachDriver:
             return self.call_mcp_tool("key", {"combo": combo, "screen": self.screen})
 
         if action.kind == "click":
-            x, y = action.point if action.point else (100, 100)
-            return self.call_mcp_tool(
-                "click",
-                {"x": x, "y": y, "button": action.button, "screen": self.screen},
-            )
+            payload: Dict[str, Any] = {"button": action.button, "screen": self.screen}
+            if action.ref:
+                payload["ref"] = action.ref
+            elif action.point:
+                payload["x"] = action.point[0]
+                payload["y"] = action.point[1]
+            else:
+                payload["x"] = 100
+                payload["y"] = 100
+            return self.call_mcp_tool("click", payload)
 
         if action.kind == "type":
             text = action.value or ""
-            return self.call_mcp_tool("type", {"text": text, "screen": self.screen})
+            payload = {"text": text, "screen": self.screen}
+            if action.ref:
+                payload["ref"] = action.ref
+            return self.call_mcp_tool("type", payload)
 
         if action.kind == "key":
             combo = action.key or action.target or "Return"
