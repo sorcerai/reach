@@ -350,7 +350,14 @@ pub struct AgentCardEngine {
     pub cards_dir: PathBuf,
 }
 
+pub type CardStore = AgentCardEngine;
+
 impl AgentCardEngine {
+    /// Load card store from default location or REACH_CARD_PATH.
+    pub fn load_from_default() -> Result<Self> {
+        Ok(Self::new(None))
+    }
+
     /// Instantiate engine using explicit path or environment variable / defaults.
     pub fn new(custom_path: Option<PathBuf>) -> Self {
         let cards_file = custom_path

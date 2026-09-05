@@ -112,6 +112,7 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/sse", get(sse_handler))
         .route("/health", get(|| async { "ok" }))
         .route("/agent/screens", get(agent_screens_handler))
+        .route("/agent/screens/{id}", get(agent_screen_get_handler))
         .route("/agent/screens/{id}/lease", post(agent_lease_handler))
         .route("/agent/screens/{id}/lease", delete(agent_release_handler))
         .route("/agent/screens/{id}/takeover", post(agent_takeover_handler))
@@ -394,6 +395,42 @@ async fn agent_screens_handler(
         .collect();
 
     Json(res)
+}
+
+async fn agent_screen_get_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> Result<Json<ScreenInfoResponse>, (StatusCode, Json<serde_json::Value>)> {
+    let sb = match resolve_sandbox(&state, None).await {
+        Ok(name) => state.docker.find(&name).await.ok(),
+        Err(_) => None,
+    };
+
+    if let Some(ref sb) = sb {
+        state.agent.ensure_screens(sb.ports.screens);
+    }
+
+    let novnc_base = sb.as_ref().and_then(|s| s.ports.novnc).unwrap_or(6080);
+
+    if let Some(s) = state.agent.screen_info(id) {
+        Ok(Json(ScreenInfoResponse {
+            id: s.id,
+            owner: s.owner,
+            phase: s.phase,
+            handoff_gen: s.handoff_gen,
+            takeover_pending: s.takeover_pending,
+            takeover_reason: s.takeover_reason,
+            takeover_url: s.takeover_url,
+            leased_at: s.leased_at,
+            novnc_url: novnc_url(&state.public_host, novnc_base + s.id as u16),
+            busy: s.busy,
+        }))
+    } else {
+        Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("screen {id} not found") })),
+        ))
+    }
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -500,6 +500,19 @@ pub async fn dispatch(
                         .unwrap_or("default"),
                 )),
                 display: Some(display.clone()),
+                storage_state: args.get("storage_state").and_then(|v| {
+                    if let Some(s) = v.as_str() {
+                        Some(s.to_string())
+                    } else if v.is_object() {
+                        serde_json::to_string(v).ok()
+                    } else {
+                        None
+                    }
+                }),
+                reason: args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
             };
 
             // Resolve the noVNC URL up-front so we can include it in the
@@ -513,7 +526,8 @@ pub async fn dispatch(
                 Ok(out) => {
                     if let Some(agent) = ctx.agent {
                         if out.status == "auth_required" {
-                            let _ = agent.set_takeover(screen, true, Some(vnc.clone()));
+                            let reason = opts.reason.clone().or_else(|| Some("takeover requested".to_string()));
+                            let _ = agent.request_takeover(screen, reason, Some(vnc.clone()));
                         } else if out.status == "authenticated" {
                             let _ = agent.set_takeover(screen, false, None);
                         }

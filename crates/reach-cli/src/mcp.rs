@@ -308,6 +308,10 @@ pub struct AuthHandoffParams {
     pub sandbox: Option<String>,
     #[serde(default)]
     pub screen: u32,
+    #[serde(default)]
+    pub storage_state: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -621,7 +625,15 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "description": "Persistent Chrome profile name (see `reach create --persist-profile`)"
                     },
                     "sandbox": { "type": "string" },
-                    "screen": { "type": "integer", "default": 0 }
+                    "screen": { "type": "integer", "default": 0 },
+                    "storage_state": {
+                        "type": "string",
+                        "description": "Exported storage state (cookies/local storage) JSON"
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "Reason for auth handoff or escalation"
+                    }
                 }
             }),
         },

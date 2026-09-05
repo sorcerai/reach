@@ -830,6 +830,8 @@ impl DockerClient {
             "wait_for_url_contains": opts.wait_for_url_contains,
             "timeout_seconds": opts.timeout_seconds,
             "user_data_dir": opts.user_data_dir,
+            "storage_state": opts.storage_state,
+            "reason": opts.reason,
             "headless": false,
         });
 
@@ -1000,6 +1002,8 @@ pub struct AuthHandoffOptions {
     pub timeout_seconds: u64,
     pub user_data_dir: Option<String>,
     pub display: Option<String>,
+    pub storage_state: Option<String>,
+    pub reason: Option<String>,
 }
 
 /// Parsed output from the embedded `auth_handoff` Python helper.
@@ -1230,7 +1234,20 @@ try:
         )
         has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
         state_file = "/workspace/.reach/state.json"
-        if not has_cookies and os.path.exists(state_file):
+        storage_state_arg = payload.get("storage_state")
+        if storage_state_arg:
+            try:
+                state_data = json.loads(storage_state_arg) if isinstance(storage_state_arg, str) else storage_state_arg
+                cookies = state_data.get("cookies", []) if isinstance(state_data, dict) else []
+                if cookies:
+                    now = time.time()
+                    for c in cookies:
+                        if c.get("expires", -1) <= 0:
+                            c["expires"] = int(now + 86400 * 30)
+                    ctx.add_cookies(cookies)
+            except Exception:
+                pass
+        elif not has_cookies and os.path.exists(state_file):
             try:
                 with open(state_file) as f:
                     state = json.load(f)
