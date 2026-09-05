@@ -160,10 +160,8 @@ pub fn resolve_profile_name(args: &serde_json::Value, screen: u32) -> (String, b
     } else if args.get("jars").is_some() {
         // Jars declared without explicit profile name: launch ephemeral browser context
         (format!("/tmp/ctx-{}", uuid::Uuid::new_v4()), true)
-    } else if screen > 0 {
-        (format!("default-screen{screen}"), false)
     } else {
-        ("default".to_string(), false)
+        (format!("screen-{screen}"), false)
     }
 }
 
@@ -420,6 +418,20 @@ pub async fn dispatch(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("echo");
+            match ctx.docker.find(target).await {
+                Ok(sandbox) => {
+                    if !sandbox.allow_exec {
+                        return ToolResponse::error(format!(
+                            "exec capability denied: sandbox '{target}' was created without --allow-exec"
+                        ));
+                    }
+                }
+                Err(e) => {
+                    return ToolResponse::error(format!(
+                        "exec: failed to inspect sandbox '{target}': {e}"
+                    ));
+                }
+            }
             sh(ctx, target, screen, cmd).await
         }
         "page_text" => {
@@ -480,8 +492,11 @@ pub async fn dispatch(
                 Some(u) if !u.is_empty() => u.to_string(),
                 _ => return ToolResponse::error("auth_handoff: missing required `url`"),
             };
+
+            let (profile_name, _) = resolve_profile_name(args, screen);
+
             let opts = AuthHandoffOptions {
-                url,
+                url: url.clone(),
                 wait_for_selector: args
                     .get("wait_for_selector")
                     .and_then(|v| v.as_str())
@@ -494,11 +509,7 @@ pub async fn dispatch(
                     .get("timeout_seconds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(300),
-                user_data_dir: Some(ProfileMount::container_path_for(
-                    args.get("use_profile")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default"),
-                )),
+                user_data_dir: Some(ProfileMount::container_path_for(&profile_name)),
                 display: Some(display.clone()),
                 storage_state: args.get("storage_state").and_then(|v| {
                     if let Some(s) = v.as_str() {
@@ -823,5 +834,22 @@ mod tests {
         let err_json: serde_json::Value = serde_json::from_str(content_text).unwrap();
         assert_eq!(err_json["error"], "profile_locked");
         assert_eq!(err_json["profile"], "work");
+    }
+
+    #[test]
+    fn test_resolve_profile_name_defaults_to_screen_id() {
+        let empty_args = serde_json::json!({});
+        let (prof0, eph0) = resolve_profile_name(&empty_args, 0);
+        assert_eq!(prof0, "screen-0");
+        assert!(!eph0);
+
+        let (prof1, eph1) = resolve_profile_name(&empty_args, 1);
+        assert_eq!(prof1, "screen-1");
+        assert!(!eph1);
+
+        let explicit_args = serde_json::json!({ "use_profile": "custom-prof" });
+        let (prof_custom, eph_custom) = resolve_profile_name(&explicit_args, 0);
+        assert_eq!(prof_custom, "custom-prof");
+        assert!(!eph_custom);
     }
 }

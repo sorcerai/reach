@@ -145,28 +145,30 @@ pub fn normalize_domain(domain_or_url: &str) -> String {
     h
 }
 
-/// Extract effective Top-Level Domain plus one label (eTLD+1).
+/// Extract effective Top-Level Domain plus one label (eTLD+1) using the official Public Suffix List.
 pub fn extract_etld_plus_one(domain_or_url: &str) -> String {
     let host = normalize_domain(domain_or_url);
     if host.is_empty() {
         return String::new();
     }
-    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost") {
+    if host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.ends_with(".localhost")
+        || host.parse::<std::net::IpAddr>().is_ok()
+    {
         return host;
     }
 
-    let parts: Vec<&str> = host.split('.').collect();
-    if parts.len() <= 2 {
-        return host;
+    if let Some(domain) = psl::domain_str(&host) {
+        domain.to_string()
+    } else {
+        let parts: Vec<&str> = host.split('.').collect();
+        if parts.len() <= 2 {
+            return host;
+        }
+        parts[parts.len() - 2..].join(".")
     }
-
-    let known_second_levels = ["co", "com", "org", "net", "edu", "gov", "ac", "ne", "mil"];
-    let len = parts.len();
-    if len >= 3 && known_second_levels.contains(&parts[len - 2]) && parts[len - 1].len() == 2 {
-        return parts[len - 3..].join(".");
-    }
-
-    parts[len - 2..].join(".")
 }
 
 /// Validate active page URL against bound target domain.
@@ -1247,5 +1249,24 @@ mod tests {
         let all_cards = final_engine.list_cards(None, None).unwrap();
         // All 5 cards must exist without clobbering!
         assert_eq!(all_cards.len(), 5);
+    }
+
+    #[test]
+    fn test_psl_multi_tenant_subdomain_isolation() {
+        // Multi-tenant suffixes must NOT allow cross-subdomain injection!
+        let err1 = validate_origin("https://attacker.github.io/checkout", "shop.github.io");
+        assert!(
+            err1.is_err(),
+            "attacker.github.io must NOT match shop.github.io"
+        );
+
+        let err2 = validate_origin("https://evil.pages.dev/pay", "good.pages.dev");
+        assert!(
+            err2.is_err(),
+            "evil.pages.dev must NOT match good.pages.dev"
+        );
+
+        let ok1 = validate_origin("https://sub.shop.github.io/cart", "shop.github.io");
+        assert!(ok1.is_ok(), "subdomain of shop.github.io should match");
     }
 }

@@ -494,6 +494,7 @@ class BuzzDaemon:
         reach_client: Optional[ReachApiClient] = None,
         driver_factory: Optional[Callable[..., Any]] = None,
         private_key: Optional[str] = None,
+        allowed_senders: Optional[List[str]] = None,
     ) -> None:
         self.relay_url = relay_url.rstrip("/")
         self.ws_relay_url = ws_relay_url.rstrip("/")
@@ -510,6 +511,19 @@ class BuzzDaemon:
         self.private_key = private_key or os.environ.get("BUZZ_PRIVATE_KEY")
         self.reach_client = reach_client or ReachApiClient(api_url=self.api_url)
         self.driver_factory = driver_factory or self._default_driver_factory
+
+        if allowed_senders is not None:
+            self.allowed_senders: Optional[Set[str]] = {
+                s.strip().lower() for s in allowed_senders if s.strip()
+            }
+        else:
+            env_senders = os.environ.get("BUZZ_ALLOWED_SENDERS", "")
+            if env_senders.strip():
+                self.allowed_senders = {
+                    s.strip().lower() for s in env_senders.split(",") if s.strip()
+                }
+            else:
+                self.allowed_senders = None
 
         self.seen_message_ids: Set[str] = set()
         self.running = False
@@ -632,6 +646,59 @@ class BuzzDaemon:
 
         task = parse_task_message(content, trigger=self.trigger)
         if not task:
+            return None
+
+        sender = (
+            message.get("sender")
+            or message.get("pubkey")
+            or message.get("author")
+            or message.get("user")
+            or message.get("from")
+            or ""
+        ).strip()
+
+        # Sender allowlist verification
+        if self.allowed_senders is not None:
+            if not sender or sender.lower() not in self.allowed_senders:
+                logger.warning(
+                    "Rejected message %s from unauthorized sender '%s' (allowed: %s)",
+                    msg_id,
+                    sender,
+                    self.allowed_senders,
+                )
+                buzz_send_message(
+                    channel=channel,
+                    content="⛔ Unauthorized sender. You are not in the BUZZ_ALLOWED_SENDERS allowlist.",
+                    reply_to=msg_id,
+                    relay_url=self.relay_url,
+                    private_key=self.private_key,
+                )
+                return None
+
+        # Forbid chat-initiated goals from requesting mutating capabilities (exec, card, vault)
+        mutating_patterns = [
+            r"\bexec\b",
+            r"\bcard\b",
+            r"\bvault\b",
+            r"\bcard_mint\b",
+            r"\bcard_inject\b",
+            r"\bvault_inject\b",
+            r"\bcredit\s*card\b",
+            r"\bpayment\b",
+            r"\bcheckout\b",
+        ]
+        lower_goal = task.goal.lower()
+        if any(re.search(pat, lower_goal) for pat in mutating_patterns):
+            logger.warning(
+                "Rejected chat-initiated goal requesting mutating tool: %s", task.goal
+            )
+            buzz_send_message(
+                channel=channel,
+                content="⛔ Security restriction: Mutating tools (exec, card, vault) cannot be invoked from chat-initiated goals. Please run these operations directly from the Reach CLI or authorized supervisor.",
+                reply_to=msg_id,
+                relay_url=self.relay_url,
+                private_key=self.private_key,
+            )
             return None
 
         logger.info(

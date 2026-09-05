@@ -79,6 +79,23 @@ fn build_mounts_includes_workspace_and_profile() {
     let targets: Vec<String> = mounts.iter().map(|m| m.target.clone().unwrap()).collect();
     assert!(targets.contains(&WORKSPACE_CONTAINER_PATH.to_string()));
     assert!(targets.contains(&"/home/sandbox/.config/google-chrome-profiles/default".to_string()));
+    let ws_mount = mounts
+        .iter()
+        .find(|m| m.target.as_deref() == Some(WORKSPACE_CONTAINER_PATH))
+        .unwrap();
+    assert_eq!(ws_mount.read_only, Some(true));
+
+    let c_rw = SandboxConfig {
+        workspace: Some(PathBuf::from("/tmp/ws")),
+        writable_workspace: true,
+        ..SandboxConfig::default()
+    };
+    let mounts_rw = build_mounts(&c_rw);
+    let ws_mount_rw = mounts_rw
+        .iter()
+        .find(|m| m.target.as_deref() == Some(WORKSPACE_CONTAINER_PATH))
+        .unwrap();
+    assert_eq!(ws_mount_rw.read_only, Some(false));
 }
 
 #[test]
@@ -91,6 +108,21 @@ fn labels_include_workspace_when_set() {
     assert_eq!(
         l.get(Labels::WORKSPACE).map(String::as_str),
         Some("/tmp/ws")
+    );
+}
+
+#[test]
+fn labels_include_allow_exec_and_writable_workspace() {
+    let c = SandboxConfig {
+        allow_exec: true,
+        writable_workspace: true,
+        ..SandboxConfig::default()
+    };
+    let l = Labels::for_sandbox(&c);
+    assert_eq!(l.get(Labels::ALLOW_EXEC).map(String::as_str), Some("true"));
+    assert_eq!(
+        l.get(Labels::WRITABLE_WORKSPACE).map(String::as_str),
+        Some("true")
     );
 }
 
@@ -115,6 +147,11 @@ fn labels_for_sandbox_includes_all_required_keys() {
     assert_eq!(labels.get(Labels::NAME), Some(&config.name));
     assert!(labels.contains_key(Labels::CREATED));
     assert!(labels.contains_key(Labels::RESOLUTION));
+    assert_eq!(labels.get(Labels::ALLOW_EXEC), Some(&"false".to_string()));
+    assert_eq!(
+        labels.get(Labels::WRITABLE_WORKSPACE),
+        Some(&"false".to_string())
+    );
 }
 
 #[test]
@@ -162,6 +199,7 @@ fn sandbox_serializes_to_json() {
             extra: Vec::new(),
         },
         created_at: "2026-04-02T00:00:00Z".into(),
+        allow_exec: false,
     };
 
     let json = serde_json::to_value(&sandbox).unwrap();

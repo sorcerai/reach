@@ -80,6 +80,15 @@ def extract_etld_plus_one(domain_or_url: str) -> str:
     if len(parts) <= 2:
         return host
 
+    known_multi_tenant = {
+        "github.io", "pages.dev", "vercel.app", "herokuapp.com",
+        "cloudfront.net", "web.app", "azurewebsites.net", "netlify.app", "s3.amazonaws.com"
+    }
+    for suffix in known_multi_tenant:
+        if host.endswith("." + suffix):
+            sub_part = host[: -(len(suffix) + 1)].split(".")[-1]
+            return f"{sub_part}.{suffix}"
+
     known_second_levels = {"co", "com", "org", "net", "edu", "gov", "ac", "ne", "mil"}
     if len(parts) >= 3 and parts[-2] in known_second_levels and len(parts[-1]) == 2:
         return ".".join(parts[-3:])

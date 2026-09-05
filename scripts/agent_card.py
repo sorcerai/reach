@@ -95,6 +95,15 @@ def extract_etld_plus_one(domain_or_url: str) -> str:
     if len(parts) <= 2:
         return host
 
+    known_multi_tenant = {
+        "github.io", "pages.dev", "vercel.app", "herokuapp.com",
+        "cloudfront.net", "web.app", "azurewebsites.net", "netlify.app", "s3.amazonaws.com"
+    }
+    for suffix in known_multi_tenant:
+        if host.endswith("." + suffix):
+            sub_part = host[: -(len(suffix) + 1)].split(".")[-1]
+            return f"{sub_part}.{suffix}"
+
     known_second_levels = {"co", "com", "org", "net", "edu", "gov", "ac", "ne", "mil"}
     if len(parts) >= 3 and parts[-2] in known_second_levels and len(parts[-1]) == 2:
         return ".".join(parts[-3:])
@@ -766,6 +775,22 @@ class AgentCardEngine:
             target_container,
             active_url,
         )
+
+        # Step 0b: Re-verify active tab URL immediately before keystrokes/DOM injection (TOCTOU guard)
+        if current_url is not None:
+            try:
+                live_check = _call_mcp("page_text", {"screen": screen})
+                live_url = (
+                    live_check.get("url")
+                    or live_check.get("active_url")
+                    or live_check.get("current_url")
+                )
+                if live_url:
+                    validate_origin(live_url, card.merchant)
+            except Exception as e:
+                if isinstance(e, ValueError):
+                    raise
+                logger.debug("Pre-keystroke origin re-verification note: %s", e)
 
         if method == "cdp":
             # DOM field injection script

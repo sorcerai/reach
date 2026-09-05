@@ -453,5 +453,71 @@ class BuzzDaemonPollingTests(unittest.TestCase):
         self.assertEqual(len(results_second), 0)
 
 
+class BuzzDaemonSecurityTests(unittest.TestCase):
+    """Test sender allowlist and mutating tool restriction on chat-initiated goals."""
+
+    def setUp(self) -> None:
+        self.mock_reach_client = MagicMock()
+        self.mock_reach_client.lease_screen.return_value = {"token": "test-tok"}
+        self.daemon = BuzzDaemon(
+            allowed_senders=["alice", "bob"],
+            reach_client=self.mock_reach_client,
+        )
+
+    @patch("scripts.buzz_daemon.buzz_send_message")
+    def test_unauthorized_sender_rejected(self, mock_send) -> None:
+        msg = {
+            "id": "msg-101",
+            "channel": "dev",
+            "sender": "mallory",
+            "content": "@ReachBot search for rust docs",
+        }
+        res = self.daemon.handle_message(msg)
+        self.assertIsNone(res)
+        self.mock_reach_client.lease_screen.assert_not_called()
+        mock_send.assert_called_once()
+        self.assertIn("Unauthorized sender", mock_send.call_args[1]["content"])
+
+    @patch("scripts.buzz_daemon.buzz_send_message")
+    def test_authorized_sender_accepted(self, mock_send) -> None:
+        driver_mock = MagicMock()
+        driver_mock.drive.return_value = DriveResult(success=True, status="completed", steps=[])
+        self.daemon.driver_factory = MagicMock(return_value=driver_mock)
+
+        msg = {
+            "id": "msg-102",
+            "channel": "dev",
+            "sender": "Alice",
+            "content": "@ReachBot search for rust docs",
+        }
+        res = self.daemon.handle_message(msg)
+        self.assertIsNotNone(res)
+        self.mock_reach_client.lease_screen.assert_called_once()
+
+    @patch("scripts.buzz_daemon.buzz_send_message")
+    def test_mutating_chat_goals_rejected(self, mock_send) -> None:
+        mutating_goals = [
+            "@ReachBot exec rm -rf /workspace",
+            "@ReachBot inject card for checkout",
+            "@ReachBot use vault credentials to login",
+            "@ReachBot enter credit card on payment page",
+        ]
+        for goal_msg in mutating_goals:
+            with self.subTest(goal=goal_msg):
+                msg = {
+                    "id": f"msg-{abs(hash(goal_msg))}",
+                    "channel": "dev",
+                    "sender": "alice",
+                    "content": goal_msg,
+                }
+                res = self.daemon.handle_message(msg)
+                self.assertIsNone(res)
+                self.mock_reach_client.lease_screen.assert_not_called()
+                self.assertIn(
+                    "Mutating tools",
+                    mock_send.call_args[1]["content"],
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

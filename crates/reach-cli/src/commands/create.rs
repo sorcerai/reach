@@ -84,6 +84,16 @@ pub struct CreateArgs {
     /// Number of virtual screens / displays (default: 1)
     #[arg(long, default_value = "1")]
     pub screens: u32,
+
+    /// Allow arbitrary shell command execution inside the container via the `exec` tool.
+    /// Default: false (refuses `exec` calls unless explicitly enabled).
+    #[arg(long)]
+    pub allow_exec: bool,
+
+    /// Make the /workspace bind mount writable inside the container.
+    /// Default: false (mounts /workspace as read-only).
+    #[arg(long)]
+    pub writable_workspace: bool,
 }
 
 /// Parse a `HOST:CONTAINER` port pair, or a single `PORT` shorthand for
@@ -166,6 +176,8 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         memory,
         restart_unless_stopped: workspace.is_some() && !args.no_restart,
         vnc_password: vnc_password.clone(),
+        allow_exec: args.allow_exec,
+        writable_workspace: args.writable_workspace,
     };
 
     let docker = DockerClient::new(cfg.docker.socket_path())?;
@@ -211,11 +223,25 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
     }
 
     if let Some(ws) = &workspace {
+        let mode = if args.writable_workspace {
+            "writable"
+        } else {
+            "read-only"
+        };
         println!(
-            "  {} {}  {}",
+            "  {} {}  {} {}",
             "\u{2713}".green(),
             "Workspace ".dimmed(),
-            ws.display()
+            ws.display(),
+            format!("({mode})").dimmed()
+        );
+    }
+
+    if args.allow_exec {
+        println!(
+            "  {} {}  enabled",
+            "\u{2713}".green(),
+            "Allow Exec".dimmed(),
         );
     }
 

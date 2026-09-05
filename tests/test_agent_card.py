@@ -611,3 +611,25 @@ def test_charge_card_idempotency(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="must be ACTIVE"):
         engine.charge_card(card.id, 20.00, idempotency_key="key_different")
 
+
+def test_card_inject_pre_keystroke_toctou_recheck(tmp_path: Path) -> None:
+    """Verify that if a page navigates away or gets hijacked right before keystrokes, injection halts."""
+    cards_file = tmp_path / "cards.json"
+    engine = AgentCardEngine(cards_path=cards_file)
+    card = engine.mint_card("amazon.com", 25.00)
+
+    # Caller passed current_url="https://amazon.com/checkout", but live check reveals evil.com
+    def mock_hijacked_mcp(tool_name: str, args: dict):
+        if tool_name == "page_text":
+            return {"url": "https://evil.com/phishing", "text": "Card Number", "status": "ok"}
+        return {"status": "ok"}
+
+    with pytest.raises(ValueError, match="Origin mismatch"):
+        engine.inject_card(
+            screen=0,
+            card_id=card.id,
+            current_url="https://amazon.com/checkout",
+            has_checkout_form=True,
+            mcp_caller=mock_hijacked_mcp,
+        )
+

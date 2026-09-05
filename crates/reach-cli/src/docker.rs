@@ -45,6 +45,10 @@ pub struct SandboxConfig {
     /// environment variable, it is visible to any process or user with access
     /// to `docker inspect`.
     pub vnc_password: Option<String>,
+    /// Whether the sandbox container allows arbitrary shell command execution via the `exec` tool.
+    pub allow_exec: bool,
+    /// Whether `/workspace` is mounted read-write. When false, `/workspace` is mounted read-only.
+    pub writable_workspace: bool,
 }
 
 impl std::fmt::Debug for SandboxConfig {
@@ -64,6 +68,8 @@ impl std::fmt::Debug for SandboxConfig {
                 "vnc_password",
                 &self.vnc_password.as_ref().map(|_| "<redacted>"),
             )
+            .field("allow_exec", &self.allow_exec)
+            .field("writable_workspace", &self.writable_workspace)
             .finish()
     }
 }
@@ -162,6 +168,8 @@ impl Default for SandboxConfig {
             memory: None,
             restart_unless_stopped: true,
             vnc_password: None,
+            allow_exec: false,
+            writable_workspace: false,
         }
     }
 }
@@ -178,6 +186,8 @@ pub struct Sandbox {
     pub image: String,
     pub ports: SandboxPortMapping,
     pub created_at: String,
+    #[serde(default)]
+    pub allow_exec: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -235,6 +245,8 @@ impl Labels {
     pub const PROFILE: &str = "reach.profile";
     pub const PROFILE_HOST: &str = "reach.profile_host";
     pub const WORKSPACE: &str = "reach.workspace";
+    pub const ALLOW_EXEC: &str = "reach.allow_exec";
+    pub const WRITABLE_WORKSPACE: &str = "reach.writable_workspace";
 
     pub fn for_sandbox(config: &SandboxConfig) -> HashMap<String, String> {
         let mut labels = HashMap::new();
@@ -243,6 +255,11 @@ impl Labels {
         labels.insert(Self::CREATED.into(), chrono::Utc::now().to_rfc3339());
         labels.insert(Self::RESOLUTION.into(), config.resolution.to_string());
         labels.insert(Self::SCREENS.into(), config.screens.to_string());
+        labels.insert(Self::ALLOW_EXEC.into(), config.allow_exec.to_string());
+        labels.insert(
+            Self::WRITABLE_WORKSPACE.into(),
+            config.writable_workspace.to_string(),
+        );
         if let Some(profile) = &config.profile {
             labels.insert(Self::PROFILE.into(), profile.name.clone());
             labels.insert(
@@ -273,6 +290,16 @@ fn bind(source: &std::path::Path, target: &str) -> Mount {
     }
 }
 
+fn bind_ro(source: &std::path::Path, target: &str, read_only: bool) -> Mount {
+    Mount {
+        target: Some(target.to_string()),
+        source: Some(source.to_string_lossy().into_owned()),
+        typ: Some(MountTypeEnum::BIND),
+        read_only: Some(read_only),
+        ..Default::default()
+    }
+}
+
 /// Bind mounts for a sandbox: persistent Chrome profile and `/workspace`.
 pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
     let mut v = Vec::new();
@@ -280,7 +307,11 @@ pub fn build_mounts(config: &SandboxConfig) -> Vec<Mount> {
         v.push(bind(&p.host_path, &p.container_path));
     }
     if let Some(ws) = &config.workspace {
-        v.push(bind(ws, WORKSPACE_CONTAINER_PATH));
+        v.push(bind_ro(
+            ws,
+            WORKSPACE_CONTAINER_PATH,
+            !config.writable_workspace,
+        ));
     }
     v
 }
@@ -396,6 +427,15 @@ pub fn config_from_inspect(
         }
     });
 
+    let allow_exec = labels
+        .get(Labels::ALLOW_EXEC)
+        .map(|s| s == "true")
+        .unwrap_or(false);
+    let writable_workspace = labels
+        .get(Labels::WRITABLE_WORKSPACE)
+        .map(|s| s == "true")
+        .unwrap_or(false);
+
     Ok(SandboxConfig {
         name,
         image,
@@ -408,6 +448,8 @@ pub fn config_from_inspect(
         memory,
         restart_unless_stopped,
         vnc_password,
+        allow_exec,
+        writable_workspace,
     })
 }
 
@@ -604,6 +646,7 @@ impl DockerClient {
                 extra: config.ports.extra.clone(),
             },
             created_at: chrono::Utc::now().to_rfc3339(),
+            allow_exec: config.allow_exec,
         })
     }
 
@@ -657,6 +700,10 @@ impl DockerClient {
                     .get(Labels::SCREENS)
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(1);
+                let allow_exec = labels
+                    .get(Labels::ALLOW_EXEC)
+                    .map(|s| s == "true")
+                    .unwrap_or(false);
                 let mut ports = extract_ports(&c.ports.unwrap_or_default());
                 ports.screens = screens;
 
@@ -667,6 +714,7 @@ impl DockerClient {
                     image: c.image.unwrap_or_default(),
                     ports,
                     created_at: labels.get(Labels::CREATED).cloned().unwrap_or_default(),
+                    allow_exec,
                 }
             })
             .collect();
