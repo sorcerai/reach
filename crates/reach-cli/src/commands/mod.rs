@@ -12,6 +12,7 @@ pub mod recreate;
 pub mod replay;
 pub mod screenshot;
 pub mod serve;
+pub mod vault;
 pub mod vnc;
 
 use clap::Subcommand;
@@ -46,6 +47,8 @@ pub enum Command {
     Card(card::CardArgs),
     /// Run the Live Buzz Agent Daemon (@ReachBot continuous listener)
     BuzzDaemon(buzz_daemon::BuzzDaemonArgs),
+    /// Manage credentials in native secret vault and generate TOTP codes
+    Vault(vault::VaultArgs),
     /// Run Reach CUA Driver vision-action loop
     Drive(drive::DriveArgs),
 }
@@ -66,6 +69,7 @@ pub async fn run(cmd: Command) -> anyhow::Result<()> {
         Command::Replay(args) => replay::run(args).await,
         Command::Card(args) => card::run(args).await,
         Command::BuzzDaemon(args) => buzz_daemon::run(args).await,
+        Command::Vault(args) => vault::run(args).await,
         Command::Drive(args) => drive::run(args).await,
     }
 }

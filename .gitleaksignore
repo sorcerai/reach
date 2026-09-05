@@ -2,3 +2,9 @@
 2d85860f05c8a9a6907d697a024542aa9590c584:tests/test_vault.py:generic-api-key:38
 2d85860f05c8a9a6907d697a024542aa9590c584:tests/test_vault.py:generic-api-key:88
 2d85860f05c8a9a6907d697a024542aa9590c584:tests/test_vault.py:generic-api-key:161
+*:crates/reach-cli/tests/vault_tests.rs:generic-api-key:79
+*:crates/reach-cli/src/vault.rs:generic-api-key:638
+*:crates/reach-cli/src/vault.rs:generic-api-key:663
+f30345bf3dd28a7046dd0c014ba6f926a1d82b0a:crates/reach-cli/tests/vault_tests.rs:generic-api-key:79
+f30345bf3dd28a7046dd0c014ba6f926a1d82b0a:crates/reach-cli/src/vault.rs:generic-api-key:638
+f30345bf3dd28a7046dd0c014ba6f926a1d82b0a:crates/reach-cli/src/vault.rs:generic-api-key:663

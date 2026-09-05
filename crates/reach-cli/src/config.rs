@@ -12,6 +12,15 @@ pub struct ReachConfig {
     pub sandbox: SandboxDefaults,
     pub server: ServerConfig,
     pub docker: DockerConfig,
+    pub vault: VaultConfig,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct VaultConfig {
+    /// Custom path to secrets.json vault file
+    #[serde(default)]
+    pub path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

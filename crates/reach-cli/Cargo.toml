@@ -15,6 +15,10 @@ path = "src/lib.rs"
 name = "reach"
 path = "src/main.rs"
 
+[[bin]]
+name = "agent-computer"
+path = "src/bin/agent_computer.rs"
+
 [dependencies]
 tokio.workspace = true
 serde.workspace = true
