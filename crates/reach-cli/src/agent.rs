@@ -13,6 +13,32 @@ pub struct ScreenState {
     pub leased_at: Option<String>,
     #[serde(default)]
     pub busy: bool,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub lease_token: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct LeaseResponse {
+    #[serde(default = "default_status_ok")]
+    pub status: String,
+    pub id: u32,
+    pub owner: String,
+    pub token: String,
+}
+
+fn default_status_ok() -> String {
+    "ok".to_string()
+}
+
+impl LeaseResponse {
+    pub fn new(id: u32, owner: impl Into<String>, token: impl Into<String>) -> Self {
+        Self {
+            status: "ok".to_string(),
+            id,
+            owner: owner.into(),
+            token: token.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -38,6 +64,9 @@ pub enum LeaseError {
         expected: String,
         actual: Option<String>,
     },
+    InvalidToken {
+        id: u32,
+    },
 }
 
 impl fmt::Display for LeaseError {
@@ -53,6 +82,9 @@ impl fmt::Display for LeaseError {
                 f,
                 "screen {id} is occupied by {actual:?}, expected {expected}"
             ),
+            Self::InvalidToken { id } => {
+                write!(f, "invalid or mismatched lease token for screen {id}")
+            }
         }
     }
 }
@@ -87,6 +119,7 @@ impl AgentState {
                 takeover_url: None,
                 leased_at: None,
                 busy: false,
+                lease_token: None,
             })
             .collect();
         Self {
@@ -107,6 +140,7 @@ impl AgentState {
                     takeover_url: None,
                     leased_at: None,
                     busy: false,
+                    lease_token: None,
                 });
             }
         }
@@ -151,6 +185,7 @@ impl AgentState {
                     takeover_url: None,
                     leased_at: None,
                     busy: false,
+                    lease_token: None,
                 });
             }
         }
@@ -200,6 +235,7 @@ impl AgentState {
                     takeover_url: None,
                     leased_at: None,
                     busy: false,
+                    lease_token: None,
                 });
             }
         }
@@ -211,26 +247,41 @@ impl AgentState {
     /// Lease first free screen, or return the screen already owned by `owner`.
     pub fn lease(&self, owner: &str) -> Result<u32, LeaseError> {
         let mut screens = self.screens.lock().unwrap();
-        if let Some(s) = screens.iter().find(|s| s.owner.as_deref() == Some(owner)) {
+        if let Some(s) = screens
+            .iter_mut()
+            .find(|s| s.owner.as_deref() == Some(owner))
+        {
+            if s.lease_token.is_none() {
+                s.lease_token = Some(uuid::Uuid::new_v4().to_string());
+            }
             return Ok(s.id);
         }
         if let Some(s) = screens.iter_mut().find(|s| s.owner.is_none()) {
             s.owner = Some(owner.to_string());
             s.leased_at = Some(chrono::Utc::now().to_rfc3339());
+            s.lease_token = Some(uuid::Uuid::new_v4().to_string());
             return Ok(s.id);
         }
         Err(LeaseError::NoFreeScreen)
     }
 
     /// Lease a specific screen by ID for `owner`. Idempotent if already owned by `owner`.
-    pub fn lease_screen(&self, id: u32, owner: &str) -> Result<(), LeaseError> {
+    pub fn lease_screen(&self, id: u32, owner: &str) -> Result<LeaseResponse, LeaseError> {
         let mut screens = self.screens.lock().unwrap();
         let s = screens
             .iter_mut()
             .find(|s| s.id == id)
             .ok_or(LeaseError::NotFound(id))?;
         if s.owner.as_deref() == Some(owner) {
-            return Ok(());
+            let token = match &s.lease_token {
+                Some(t) => t.clone(),
+                None => {
+                    let t = uuid::Uuid::new_v4().to_string();
+                    s.lease_token = Some(t.clone());
+                    t
+                }
+            };
+            return Ok(LeaseResponse::new(id, owner, token));
         }
         if s.owner.is_some() {
             return Err(LeaseError::NotOwner {
@@ -239,30 +290,69 @@ impl AgentState {
                 actual: s.owner.clone(),
             });
         }
+        let token = uuid::Uuid::new_v4().to_string();
         s.owner = Some(owner.to_string());
         s.leased_at = Some(chrono::Utc::now().to_rfc3339());
-        Ok(())
+        s.lease_token = Some(token.clone());
+        Ok(LeaseResponse::new(id, owner, token))
     }
 
-    /// Release screen by ID, verifying owner matches.
-    pub fn release(&self, id: u32, owner: &str) -> Result<(), LeaseError> {
+    /// Release screen by ID, verifying the lease token (or allowing owner/admin).
+    pub fn release_screen(
+        &self,
+        id: u32,
+        owner: &str,
+        token: Option<&str>,
+    ) -> Result<(), LeaseError> {
         let mut screens = self.screens.lock().unwrap();
         let s = screens
             .iter_mut()
             .find(|s| s.id == id)
             .ok_or(LeaseError::NotFound(id))?;
-        if s.owner.as_deref() != Some(owner) {
+
+        let is_admin = owner == "admin";
+
+        if let Some(tok) = token {
+            if s.lease_token.as_deref() != Some(tok) && !is_admin {
+                return Err(LeaseError::InvalidToken { id });
+            }
+        } else if !is_admin && s.owner.as_deref() != Some(owner) {
             return Err(LeaseError::NotOwner {
                 id,
                 expected: owner.to_string(),
                 actual: s.owner.clone(),
             });
         }
+
         s.owner = None;
         s.leased_at = None;
         s.takeover_pending = false;
         s.takeover_url = None;
+        s.lease_token = None;
         Ok(())
+    }
+
+    /// Release screen by ID, verifying owner matches.
+    pub fn release(&self, id: u32, owner: &str) -> Result<(), LeaseError> {
+        self.release_screen(id, owner, None)
+    }
+
+    /// Return the active lease token for screen `id` if it is currently leased.
+    pub fn lease_token(&self, id: u32) -> Option<String> {
+        let screens = self.screens.lock().unwrap();
+        screens
+            .iter()
+            .find(|s| s.id == id)
+            .and_then(|s| s.lease_token.clone())
+    }
+
+    /// Check if screen `id` is currently leased.
+    pub fn is_leased(&self, id: u32) -> bool {
+        let screens = self.screens.lock().unwrap();
+        screens
+            .iter()
+            .find(|s| s.id == id)
+            .is_some_and(|s| s.owner.is_some())
     }
 
     /// Set takeover pending flag and URL for a screen.
@@ -307,6 +397,67 @@ mod tests {
         // Screen 0 is still free
         a.lease_screen(0, "piper").unwrap();
         assert_eq!(a.snapshot().len(), 2);
+    }
+
+    #[test]
+    fn lease_token_generation_and_validation() {
+        let a = AgentState::new(2);
+        let res = a.lease_screen(0, "browser-use").unwrap();
+        assert!(!res.token.is_empty());
+        assert_eq!(res.id, 0);
+        assert_eq!(res.owner, "browser-use");
+        assert_eq!(a.lease_token(0), Some(res.token.clone()));
+        assert!(a.is_leased(0));
+
+        // Idempotent lease returns same token
+        let res2 = a.lease_screen(0, "browser-use").unwrap();
+        assert_eq!(res2.token, res.token);
+
+        // Rejection on token mismatch
+        let err = a
+            .release_screen(0, "browser-use", Some("wrong-token"))
+            .unwrap_err();
+        assert_eq!(err, LeaseError::InvalidToken { id: 0 });
+        assert!(a.is_leased(0));
+
+        // Rejection on non-owner without token
+        let err2 = a.release_screen(0, "intruder", None).unwrap_err();
+        assert!(matches!(err2, LeaseError::NotOwner { .. }));
+        assert!(a.is_leased(0));
+
+        // Success with valid token
+        a.release_screen(0, "browser-use", Some(&res.token))
+            .unwrap();
+        assert!(!a.is_leased(0));
+        assert_eq!(a.lease_token(0), None);
+    }
+
+    #[test]
+    fn release_screen_admin_override() {
+        let a = AgentState::new(1);
+        let _res = a.lease_screen(0, "worker").unwrap();
+        assert!(a.is_leased(0));
+
+        // Admin can release even with wrong token or no token
+        a.release_screen(0, "admin", Some("wrong-token")).unwrap();
+        assert!(!a.is_leased(0));
+        assert_eq!(a.lease_token(0), None);
+
+        // Lease again and admin release without token
+        let _ = a.lease_screen(0, "worker").unwrap();
+        a.release_screen(0, "admin", None).unwrap();
+        assert!(!a.is_leased(0));
+    }
+
+    #[test]
+    fn release_screen_owner_match_without_token() {
+        let a = AgentState::new(1);
+        let _res = a.lease_screen(0, "otto").unwrap();
+        assert!(a.is_leased(0));
+
+        // Owner can release without token
+        a.release(0, "otto").unwrap();
+        assert!(!a.is_leased(0));
     }
 
     #[test]
