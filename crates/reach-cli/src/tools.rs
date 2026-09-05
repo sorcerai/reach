@@ -526,7 +526,10 @@ pub async fn dispatch(
                 Ok(out) => {
                     if let Some(agent) = ctx.agent {
                         if out.status == "auth_required" {
-                            let reason = opts.reason.clone().or_else(|| Some("takeover requested".to_string()));
+                            let reason = opts
+                                .reason
+                                .clone()
+                                .or_else(|| Some("takeover requested".to_string()));
                             let _ = agent.request_takeover(screen, reason, Some(vnc.clone()));
                         } else if out.status == "authenticated" {
                             let _ = agent.set_takeover(screen, false, None);
