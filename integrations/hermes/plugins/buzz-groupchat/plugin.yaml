@@ -1,0 +1,104 @@
+name: buzz-groupchat
+version: "0.1.0"
+description: "Multi-Bot Groupchat surface: integrate with self-hosted Buzz (ariaserver:3000) for persistent history, @mentions, visual diff audit reels, and human takeover cards."
+author: "Reach Team"
+enabled_by_default: true
+
+tools:
+  - name: buzz_send_message
+    description: "Send a message or status update to a Buzz channel or thread."
+    parameters:
+      type: object
+      required:
+        - channel
+        - content
+      properties:
+        channel:
+          type: string
+          description: "Target channel ID or name."
+        content:
+          type: string
+          description: "Message content (supports markdown and @mentions)."
+        reply_to:
+          type: string
+          description: "Optional parent message ID to reply in a thread."
+        broadcast:
+          type: boolean
+          default: false
+          description: "Whether to also broadcast thread reply to the channel."
+
+  - name: buzz_send_takeover_alert
+    description: "Post an interactive Human Takeover alert to a Buzz channel or thread when 2FA, Captcha, or credentials require human intervention."
+    parameters:
+      type: object
+      required:
+        - channel
+        - screen
+        - reason
+      properties:
+        channel:
+          type: string
+          description: "Target Buzz channel ID or name."
+        screen:
+          type: integer
+          description: "Screen ID where human intervention is required."
+        reason:
+          type: string
+          description: "Reason human intervention is needed (e.g., 2FA prompt, CAPTCHA, manual review)."
+        novnc_url:
+          type: string
+          description: "Optional direct noVNC URL. If omitted, defaults to REACH_NOVNC_URL or http://100.124.38.17:6080/vnc.html."
+        reply_to:
+          type: string
+          description: "Optional thread ID to post the takeover request under."
+
+  - name: buzz_post_visual_diff
+    description: "Post a visual diff audit reel / screenshot summary to a Buzz channel or thread."
+    parameters:
+      type: object
+      required:
+        - channel
+        - summary
+      properties:
+        channel:
+          type: string
+          description: "Target Buzz channel ID or name."
+        summary:
+          type: string
+          description: "Text summary of the action and visual diff results."
+        screenshot_path:
+          type: string
+          description: "Path to the local screenshot or audit reel image."
+        diff_percent:
+          type: number
+          description: "Optional perceptual hash or visual difference percentage (0.0 to 100.0)."
+        tokens_saved:
+          type: integer
+          description: "Optional count of tokens saved by pHash change gating."
+        reply_to:
+          type: string
+          description: "Optional thread ID to post under."
+
+  - name: buzz_get_messages
+    description: "Read recent messages from a Buzz channel or thread to check for @mentions or user instructions."
+    parameters:
+      type: object
+      required:
+        - channel
+      properties:
+        channel:
+          type: string
+          description: "Channel ID or name."
+        limit:
+          type: integer
+          default: 20
+          description: "Maximum number of messages to retrieve."
+
+  - name: buzz_list_channels
+    description: "List available channels on the Buzz relay."
+    parameters:
+      type: object
+      properties:
+        relay_url:
+          type: string
+          description: "Optional Buzz relay URL override."
