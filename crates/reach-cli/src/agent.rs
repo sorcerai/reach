@@ -54,6 +54,8 @@ pub struct ScreenState {
     pub busy: bool,
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub lease_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub human_token: Option<String>,
 }
 
 pub type ScreenInfo = ScreenState;
@@ -65,19 +67,31 @@ pub struct LeaseResponse {
     pub id: u32,
     pub owner: String,
     pub token: String,
+    #[serde(default = "default_handoff_gen")]
+    pub handoff_gen: u64,
 }
 
 fn default_status_ok() -> String {
     "ok".to_string()
 }
 
+fn default_handoff_gen() -> u64 {
+    1
+}
+
 impl LeaseResponse {
-    pub fn new(id: u32, owner: impl Into<String>, token: impl Into<String>) -> Self {
+    pub fn new(
+        id: u32,
+        owner: impl Into<String>,
+        token: impl Into<String>,
+        handoff_gen: u64,
+    ) -> Self {
         Self {
             status: "ok".to_string(),
             id,
             owner: owner.into(),
             token: token.into(),
+            handoff_gen,
         }
     }
 }
@@ -152,6 +166,9 @@ pub enum TakeoverError {
     InvalidToken {
         id: u32,
     },
+    Busy {
+        id: u32,
+    },
 }
 
 impl fmt::Display for TakeoverError {
@@ -178,6 +195,9 @@ impl fmt::Display for TakeoverError {
             ),
             Self::InvalidToken { id } => {
                 write!(f, "invalid or mismatched lease token for screen {id}")
+            }
+            Self::Busy { id } => {
+                write!(f, "screen {id} is busy with in-flight tool execution")
             }
         }
     }
@@ -215,11 +235,17 @@ impl fmt::Display for WaitError {
 
 impl std::error::Error for WaitError {}
 
+fn append_query_param(url: &str, key: &str, val: &str) -> String {
+    let sep = if url.contains('?') { '&' } else { '?' };
+    format!("{url}{sep}{key}={val}")
+}
+
 #[derive(Debug)]
 pub struct AgentState {
     screens: Mutex<Vec<ScreenState>>,
     active_tools: Mutex<HashMap<u32, u32>>,
     phase_notify: tokio::sync::broadcast::Sender<u32>,
+    busy_notify: tokio::sync::broadcast::Sender<u32>,
 }
 
 /// RAII guard that decrements a screen's active tool count on drop.
@@ -237,6 +263,7 @@ impl<'a> Drop for BusyGuard<'a> {
 impl AgentState {
     pub fn new(n: u32) -> Self {
         let (phase_notify, _) = tokio::sync::broadcast::channel(128);
+        let (busy_notify, _) = tokio::sync::broadcast::channel(128);
         let screens = (0..n)
             .map(|id| ScreenState {
                 id,
@@ -249,12 +276,14 @@ impl AgentState {
                 leased_at: None,
                 busy: false,
                 lease_token: None,
+                human_token: None,
             })
             .collect();
         Self {
             screens: Mutex::new(screens),
             active_tools: Mutex::new(HashMap::new()),
             phase_notify,
+            busy_notify,
         }
     }
 
@@ -274,6 +303,7 @@ impl AgentState {
                     leased_at: None,
                     busy: false,
                     lease_token: None,
+                    human_token: None,
                 });
             }
         }
@@ -283,6 +313,12 @@ impl AgentState {
     pub fn is_busy(&self, screen: u32) -> bool {
         let tools = self.active_tools.lock().unwrap();
         tools.get(&screen).copied().unwrap_or(0) > 0
+    }
+
+    /// Returns the number of active tools running on `screen`.
+    pub fn busy_count(&self, screen: u32) -> u32 {
+        let tools = self.active_tools.lock().unwrap();
+        tools.get(&screen).copied().unwrap_or(0)
     }
 
     /// Mark `screen` as busy with an RAII guard that resets busy on drop.
@@ -322,6 +358,7 @@ impl AgentState {
                     leased_at: None,
                     busy: false,
                     lease_token: None,
+                    human_token: None,
                 });
             }
         }
@@ -343,6 +380,8 @@ impl AgentState {
         if let Some(s) = screens.iter_mut().find(|s| s.id == screen) {
             s.busy = is_busy;
         }
+        drop(screens);
+        let _ = self.busy_notify.send(screen);
     }
 
     /// Explicitly set the busy state on `screen`.
@@ -375,12 +414,15 @@ impl AgentState {
                     leased_at: None,
                     busy: false,
                     lease_token: None,
+                    human_token: None,
                 });
             }
         }
         if let Some(s) = screens.iter_mut().find(|s| s.id == screen) {
             s.busy = is_busy;
         }
+        drop(screens);
+        let _ = self.busy_notify.send(screen);
     }
 
     /// Lease first free screen, or return the screen already owned by `owner`.
@@ -424,7 +466,7 @@ impl AgentState {
                     t
                 }
             };
-            return Ok(LeaseResponse::new(id, owner, token));
+            return Ok(LeaseResponse::new(id, owner, token, s.handoff_gen));
         }
         if s.owner.is_some() {
             return Err(LeaseError::NotOwner {
@@ -438,9 +480,10 @@ impl AgentState {
         s.leased_at = Some(chrono::Utc::now().to_rfc3339());
         s.lease_token = Some(token.clone());
         s.phase = ScreenPhase::AgentActive;
+        let handoff_gen = s.handoff_gen;
         drop(screens);
         let _ = self.phase_notify.send(id);
-        Ok(LeaseResponse::new(id, owner, token))
+        Ok(LeaseResponse::new(id, owner, token, handoff_gen))
     }
 
     /// Release screen by ID, verifying the lease token (or allowing owner/admin).
@@ -477,6 +520,7 @@ impl AgentState {
         s.takeover_reason = None;
         s.takeover_url = None;
         s.lease_token = None;
+        s.human_token = None;
         drop(screens);
         let _ = self.phase_notify.send(id);
         Ok(())
@@ -512,6 +556,18 @@ impl AgentState {
         reason: Option<String>,
         url: Option<String>,
     ) -> Result<ScreenState, TakeoverError> {
+        // Drain / wait up to 2 seconds if tools are in flight
+        if self.is_busy(screen_id) {
+            let start = std::time::Instant::now();
+            let timeout = std::time::Duration::from_secs(2);
+            while self.is_busy(screen_id) {
+                if start.elapsed() >= timeout {
+                    return Err(TakeoverError::Busy { id: screen_id });
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+
         let mut screens = self.screens.lock().unwrap();
         let s = screens
             .iter_mut()
@@ -530,7 +586,12 @@ impl AgentState {
         s.handoff_gen += 1;
         s.takeover_pending = true;
         s.takeover_reason = reason;
-        s.takeover_url = url;
+
+        // Mint secure human token and embed into takeover URL
+        let human_token = uuid::Uuid::new_v4().to_string();
+        s.human_token = Some(human_token.clone());
+        s.takeover_url = url.map(|u| append_query_param(&u, "token", &human_token));
+
         let res = s.clone();
         drop(screens);
         let _ = self.phase_notify.send(screen_id);
@@ -605,6 +666,40 @@ impl AgentState {
         s.takeover_pending = false;
         s.takeover_reason = None;
         s.takeover_url = None;
+        s.human_token = None;
+        let res = s.clone();
+        drop(screens);
+        let _ = self.phase_notify.send(screen_id);
+        Ok(res)
+    }
+
+    /// Cancels a takeover from `HandoffPending` back to `AgentActive` (or `Idle`), increments `handoff_gen`.
+    /// Agents cannot cancel or eject human if already in `HumanActive`.
+    pub fn cancel_takeover(&self, screen_id: u32) -> Result<ScreenState, TakeoverError> {
+        let mut screens = self.screens.lock().unwrap();
+        let s = screens
+            .iter_mut()
+            .find(|s| s.id == screen_id)
+            .ok_or(TakeoverError::NotFound(screen_id))?;
+
+        if s.phase != ScreenPhase::HandoffPending {
+            return Err(TakeoverError::InvalidPhase {
+                id: screen_id,
+                current: s.phase,
+                expected: vec![ScreenPhase::HandoffPending],
+            });
+        }
+
+        s.phase = if s.owner.is_some() {
+            ScreenPhase::AgentActive
+        } else {
+            ScreenPhase::Idle
+        };
+        s.handoff_gen += 1;
+        s.takeover_pending = false;
+        s.takeover_reason = None;
+        s.takeover_url = None;
+        s.human_token = None;
         let res = s.clone();
         drop(screens);
         let _ = self.phase_notify.send(screen_id);
@@ -612,12 +707,82 @@ impl AgentState {
     }
 
     /// Set takeover pending flag and URL for a screen.
-    pub fn set_takeover(&self, id: u32, pending: bool, url: Option<String>) {
+    pub fn set_takeover(
+        &self,
+        id: u32,
+        pending: bool,
+        url: Option<String>,
+    ) -> Result<ScreenState, TakeoverError> {
         if pending {
-            let _ = self.request_takeover(id, Some("takeover requested".into()), url);
+            self.request_takeover(id, Some("takeover requested".into()), url)
         } else {
-            let _ = self.human_handback(id);
-            let _ = self.agent_ack(id);
+            self.cancel_takeover(id)
+        }
+    }
+
+    /// Return the active human takeover token for screen `id` if present.
+    pub fn human_token(&self, screen: u32) -> Option<String> {
+        let screens = self.screens.lock().unwrap();
+        screens
+            .iter()
+            .find(|s| s.id == screen)
+            .and_then(|s| s.human_token.clone())
+    }
+
+    /// Verify whether `token` matches the active human token for screen `id`.
+    pub fn verify_human_token(&self, screen: u32, token: &str) -> bool {
+        let screens = self.screens.lock().unwrap();
+        screens
+            .iter()
+            .find(|s| s.id == screen)
+            .and_then(|s| s.human_token.as_deref())
+            == Some(token)
+    }
+
+    /// Check whether `token` matches any active human token across all screens.
+    pub fn has_human_token(&self, token: &str) -> bool {
+        let screens = self.screens.lock().unwrap();
+        screens
+            .iter()
+            .any(|s| s.human_token.as_deref() == Some(token))
+    }
+
+    /// Asynchronously wait for busy tool count to drain to 0 on `screen` up to `timeout`.
+    pub async fn wait_for_drain(&self, screen: u32, timeout: std::time::Duration) -> bool {
+        if !self.is_busy(screen) {
+            return true;
+        }
+        let mut rx = self.busy_notify.subscribe();
+        let sleep = tokio::time::sleep(timeout);
+        tokio::pin!(sleep);
+
+        loop {
+            if !self.is_busy(screen) {
+                return true;
+            }
+            tokio::select! {
+                _ = &mut sleep => {
+                    return !self.is_busy(screen);
+                }
+                res = rx.recv() => {
+                    match res {
+                        Ok(id) if id == screen => {
+                            if !self.is_busy(screen) {
+                                return true;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            if !self.is_busy(screen) {
+                                return true;
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return !self.is_busy(screen);
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -808,18 +973,21 @@ mod tests {
     #[test]
     fn set_takeover_updates_flags() {
         let a = AgentState::new(1);
-        a.set_takeover(0, true, Some("http://localhost:6080/vnc.html".into()));
+        let s = a
+            .set_takeover(0, true, Some("http://localhost:6080/vnc.html".into()))
+            .unwrap();
         let snap = a.snapshot();
         assert!(snap[0].takeover_pending);
-        assert_eq!(
-            snap[0].takeover_url.as_deref(),
-            Some("http://localhost:6080/vnc.html")
-        );
+        let tok = snap[0].human_token.as_ref().unwrap();
+        let expected_url = format!("http://localhost:6080/vnc.html?token={tok}");
+        assert_eq!(snap[0].takeover_url.as_deref(), Some(expected_url.as_str()));
+        assert_eq!(s.human_token.as_ref().unwrap(), tok);
 
-        a.set_takeover(0, false, None);
+        a.set_takeover(0, false, None).unwrap();
         let snap2 = a.snapshot();
         assert!(!snap2[0].takeover_pending);
         assert!(snap2[0].takeover_url.is_none());
+        assert!(snap2[0].human_token.is_none());
     }
 
     #[test]
@@ -910,10 +1078,11 @@ mod tests {
             res.takeover_reason.as_deref(),
             Some("CAPTCHA challenge detected")
         );
-        assert_eq!(
-            res.takeover_url.as_deref(),
-            Some("http://127.0.0.1:6080/vnc.html")
-        );
+        let human_tok = res.human_token.as_ref().unwrap();
+        let expected_url = format!("http://127.0.0.1:6080/vnc.html?token={human_tok}");
+        assert_eq!(res.takeover_url.as_deref(), Some(expected_url.as_str()));
+        assert!(a.verify_human_token(0, human_tok));
+        assert!(!a.verify_human_token(0, "wrong-token"));
 
         // Cannot request takeover again when in HandoffPending
         let err = a
@@ -926,6 +1095,16 @@ mod tests {
         assert_eq!(res.phase, ScreenPhase::HumanActive);
         assert_eq!(res.handoff_gen, 2);
 
+        // Cannot cancel takeover while HumanActive (reach-5zs)
+        assert!(matches!(
+            a.cancel_takeover(0),
+            Err(TakeoverError::InvalidPhase { .. })
+        ));
+        assert!(matches!(
+            a.set_takeover(0, false, None),
+            Err(TakeoverError::InvalidPhase { .. })
+        ));
+
         // 4. Human handback -> moves HumanActive to HumanDone, increments gen to 3
         let res = a.human_handback(0).unwrap();
         assert_eq!(res.phase, ScreenPhase::HumanDone);
@@ -934,13 +1113,14 @@ mod tests {
         // Cannot human connected when HumanDone
         assert!(a.human_connected(0).is_err());
 
-        // 5. Agent ack -> moves HumanDone to AgentActive, increments gen to 4, clears reason/url
+        // 5. Agent ack -> moves HumanDone to AgentActive, increments gen to 4, clears reason/url/human_token
         let res = a.agent_ack(0).unwrap();
         assert_eq!(res.phase, ScreenPhase::AgentActive);
         assert_eq!(res.handoff_gen, 4);
         assert!(!res.takeover_pending);
         assert_eq!(res.takeover_reason, None);
         assert_eq!(res.takeover_url, None);
+        assert_eq!(res.human_token, None);
     }
 
     #[test]
@@ -1001,5 +1181,58 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, WaitError::Timeout { .. }));
+    }
+
+    #[test]
+    fn cancel_takeover_in_handoff_pending_succeeds() {
+        let a = AgentState::new(1);
+        let _ = a.lease_screen(0, "agent-eva").unwrap();
+        a.request_takeover(0, Some("Solve captcha".into()), None)
+            .unwrap();
+        assert_eq!(a.phase(0), Some(ScreenPhase::HandoffPending));
+        assert_eq!(a.handoff_gen(0), Some(2));
+        assert!(a.human_token(0).is_some());
+
+        // Cancel takeover before human connects
+        let res = a.cancel_takeover(0).unwrap();
+        assert_eq!(res.phase, ScreenPhase::AgentActive);
+        assert_eq!(res.handoff_gen, 3);
+        assert!(!res.takeover_pending);
+        assert_eq!(res.human_token, None);
+        assert_eq!(res.takeover_reason, None);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn request_takeover_drains_in_flight_busy_screen() {
+        let a = std::sync::Arc::new(AgentState::new(1));
+        let _ = a.lease_screen(0, "agent-dave").unwrap();
+
+        // Mark busy
+        a.inc_busy(0);
+        assert!(a.is_busy(0));
+
+        let a_clone = std::sync::Arc::clone(&a);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            a_clone.dec_busy(0);
+        });
+
+        // request_takeover should drain the in-flight tool and succeed
+        let res = a
+            .request_takeover(0, Some("drain test".into()), None)
+            .unwrap();
+        assert_eq!(res.phase, ScreenPhase::HandoffPending);
+        assert!(!a.is_busy(0));
+    }
+
+    #[test]
+    fn request_takeover_refuses_when_busy_timeout() {
+        let a = AgentState::new(1);
+        let _ = a.lease_screen(0, "agent-dave").unwrap();
+        a.inc_busy(0);
+
+        // Does not clear busy; should fail with TakeoverError::Busy after timeout
+        let err = a.request_takeover(0, Some("drain test".into()), None);
+        assert_eq!(err, Err(TakeoverError::Busy { id: 0 }));
     }
 }

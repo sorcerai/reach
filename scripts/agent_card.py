@@ -44,11 +44,12 @@ DEFAULT_REACH_API = os.environ.get("REACH_AGENT_URL", "http://127.0.0.1:4200")
 class CardStatus:
     PENDING_APPROVAL = "PENDING_APPROVAL"
     ACTIVE = "ACTIVE"
+    INJECTING = "INJECTING"
     CHARGED = "CHARGED"
     LOCKED = "LOCKED"
     EXPIRED = "EXPIRED"
 
-    ALL = {PENDING_APPROVAL, ACTIVE, CHARGED, LOCKED, EXPIRED}
+    ALL = {PENDING_APPROVAL, ACTIVE, INJECTING, CHARGED, LOCKED, EXPIRED}
 
 
 # --------------------------------------------------------------------------
@@ -76,6 +77,114 @@ def normalize_domain(domain_or_url: str) -> str:
     if host.startswith("www."):
         host = host[4:]
     return host
+
+
+def extract_etld_plus_one(domain_or_url: str) -> str:
+    """Extract effective Top-Level Domain plus one label (eTLD+1).
+
+    Handles common two-part public suffixes (e.g. .co.uk, .com.au, .co.jp, .org.uk)
+    and single-part TLDs (e.g. .com, .org, .net, .io, .ai).
+    """
+    host = normalize_domain(domain_or_url)
+    if not host:
+        return ""
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost"):
+        return host
+
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+
+    known_second_levels = {"co", "com", "org", "net", "edu", "gov", "ac", "ne", "mil"}
+    if len(parts) >= 3 and parts[-2] in known_second_levels and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
+
+    return ".".join(parts[-2:])
+
+
+def validate_origin(active_url: str, bound_domain: str) -> None:
+    """Validate active page URL against bound target domain.
+
+    Requirements:
+    1. Scheme must be 'https' (or 'http' only for localhost / 127.0.0.1).
+    2. Normalized domain / eTLD+1 of active_url must match bound_domain.
+    """
+    if not active_url or not active_url.strip():
+        raise ValueError("Cannot verify origin: active tab URL is empty or missing")
+
+    raw = active_url.strip()
+    parsed = urllib.parse.urlparse(raw if "://" in raw else f"https://{raw}")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or parsed.netloc or "").lower()
+    if ":" in host:
+        host = host.split(":")[0]
+
+    is_local = (
+        host in {"localhost", "127.0.0.1", "::1"}
+        or host.endswith(".localhost")
+        or host.startswith("127.")
+    )
+
+    if scheme == "http":
+        if not is_local:
+            raise ValueError(
+                f"Insecure origin scheme 'http' for non-localhost URL '{active_url}'. Only https is allowed."
+            )
+    elif scheme != "https":
+        raise ValueError(
+            f"Invalid origin scheme '{scheme}' in URL '{active_url}'. Only https (or localhost http) is permitted."
+        )
+
+    active_etld = extract_etld_plus_one(host)
+    bound_etld = extract_etld_plus_one(bound_domain)
+    if not active_etld or not bound_etld or active_etld != bound_etld:
+        raise ValueError(
+            f"Origin mismatch: active URL '{active_url}' (eTLD+1: '{active_etld}') "
+            f"does not match bound domain '{bound_domain}' (eTLD+1: '{bound_etld}')"
+        )
+
+
+def check_checkout_form_present(
+    page_text: str = "",
+    dom_html: str = "",
+    form_info: Optional[Dict[str, Any]] = None,
+) -> bool:
+    """Check if a checkout-like form or credit card input is present on the page."""
+    if form_info:
+        if (
+            form_info.get("has_form")
+            or form_info.get("form_present")
+            or form_info.get("has_checkout_form")
+        ):
+            return True
+
+    combined = f"{page_text} {dom_html}".lower()
+
+    # Check for card input field signatures in DOM / HTML
+    cc_input_patterns = [
+        r'autocomplete=["\'](?:cc-number|cc-csc|cc-exp)["\']',
+        r'(?:name|id|placeholder)=["\'][^"\']*(?:card[-_]?num|cc[-_]?num|credit[-_]?card|cardnumber|cvv|cvc)[^"\']*["\']',
+        r'type=["\'](?:tel|text|number)["\'][^>]+(?:card|cc|cvv)',
+    ]
+    for pat in cc_input_patterns:
+        if re.search(pat, dom_html, re.IGNORECASE):
+            return True
+
+    # Check for checkout or credit card keywords in page text
+    has_card_keyword = bool(
+        re.search(
+            r"\b(?:card\s*number|credit\s*card|debit\s*card|cardholder|cvv|cvc|security\s*code|exp(?:iration)?\s*date)\b",
+            combined,
+        )
+    )
+    has_checkout_keyword = bool(
+        re.search(
+            r"\b(?:checkout|payment|billing|place\s*order|pay\s*now|complete\s*purchase|order\s*summary)\b",
+            combined,
+        )
+    )
+
+    return has_card_keyword or has_checkout_keyword
 
 
 def validate_luhn(card_number: str) -> bool:
@@ -145,6 +254,8 @@ class Card:
     currency: str = "USD"
     status: str = CardStatus.ACTIVE
     created_at: int = field(default_factory=lambda: int(time.time()))
+    idempotency_token: Optional[str] = None
+    injected_at: Optional[float] = None
 
     def to_dict(self, mask: bool = False) -> Dict[str, Any]:
         data: Dict[str, Any] = {
@@ -159,6 +270,10 @@ class Card:
             "status": self.status,
             "created_at": self.created_at,
         }
+        if self.idempotency_token is not None:
+            data["idempotency_token"] = self.idempotency_token
+        if self.injected_at is not None:
+            data["injected_at"] = self.injected_at
         if mask:
             data["card_number_masked"] = mask_card_number(self.card_number)
         return data
@@ -244,6 +359,11 @@ class AgentCardEngine:
         for item in raw_list:
             if not isinstance(item, dict) or "id" not in item:
                 continue
+            raw_status = str(item.get("status", CardStatus.ACTIVE))
+            # If a card was in INJECTING state when loaded from disk (e.g. from an
+            # ungraceful crash mid-injection), treat it as LOCKED (burned / invalidated).
+            if raw_status == CardStatus.INJECTING:
+                raw_status = CardStatus.LOCKED
             card = Card(
                 id=str(item["id"]),
                 card_number=str(item.get("card_number", "")),
@@ -253,8 +373,10 @@ class AgentCardEngine:
                 merchant=str(item.get("merchant", "")),
                 spending_limit_usd=float(item.get("spending_limit_usd", 0.0)),
                 currency=str(item.get("currency", "USD")),
-                status=str(item.get("status", CardStatus.ACTIVE)),
+                status=raw_status,
                 created_at=int(item.get("created_at", int(time.time()))),
+                idempotency_token=item.get("idempotency_token"),
+                injected_at=float(item["injected_at"]) if item.get("injected_at") is not None else None,
             )
             cards_map[card.id] = card
 
@@ -404,6 +526,7 @@ class AgentCardEngine:
         card_id: str,
         amount_usd: float,
         merchant: Optional[str] = None,
+        idempotency_key: Optional[str] = None,
     ) -> Card:
         """Simulate charging a card.
 
@@ -411,6 +534,7 @@ class AgentCardEngine:
         - Card must be ACTIVE (not PENDING_APPROVAL, LOCKED, CHARGED, EXPIRED).
         - Amount cannot exceed spending_limit_usd.
         - Single-use: transitions status to CHARGED so it cannot be recharged.
+        - Idempotency key: replaying with the same key returns the charged card.
         """
         if amount_usd < 0:
             raise ValueError("Charge amount cannot be negative")
@@ -420,6 +544,15 @@ class AgentCardEngine:
             raise KeyError(f"Card '{card_id}' not found")
 
         card = cards[card_id]
+
+        if card.status == CardStatus.CHARGED:
+            if idempotency_key and card.idempotency_token == idempotency_key:
+                logger.info(
+                    "Idempotent charge replay for card %s with key %s",
+                    card_id,
+                    idempotency_key,
+                )
+                return card
 
         if card.status != CardStatus.ACTIVE:
             raise ValueError(
@@ -442,6 +575,8 @@ class AgentCardEngine:
 
         # Single-use: card transitions to CHARGED
         card.status = CardStatus.CHARGED
+        if idempotency_key:
+            card.idempotency_token = idempotency_key
         cards[card_id] = card
         self._write_raw(cards)
 
@@ -488,16 +623,54 @@ class AgentCardEngine:
         submit: bool = False,
         split_exp: bool = False,
         method: str = "synthetic",
+        current_url: Optional[str] = None,
+        has_checkout_form: Optional[bool] = None,
+        idempotency_token: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Inject card details directly into checkout form on the target screen.
 
         Specifications:
         - Card details (number, exp, cvv) are injected directly via CDP or synthetic input.
         - Card details NEVER appear in the LLM model prompt or conversation history.
-        - Automatically transitions card status to LOCKED once injected (single-use).
-        - Rejects injection if card is not ACTIVE (e.g. PENDING_APPROVAL, LOCKED).
+        - Origin validation: verifies active page URL matches card merchant bound.
+        - Requires checkout form or credit card input on the active page.
+        - Idempotency check: prevents double-submitting a recently injected form.
+        - Transition ACTIVE -> INJECTING (persisted) before first keystroke.
+        - Transition INJECTING -> LOCKED immediately after typing.
         """
-        card = self.get_card(card_id)
+        cards = self._read_raw()
+        if card_id not in cards:
+            raise KeyError(f"Card '{card_id}' not found")
+        card = cards[card_id]
+
+        # Idempotency token check: if already injected with the same idempotency token, return cached result
+        if idempotency_token and card.idempotency_token == idempotency_token:
+            if card.status in {CardStatus.INJECTING, CardStatus.LOCKED}:
+                logger.info(
+                    "Idempotent injection replay for card %s with token %s; skipping double-submit",
+                    card_id,
+                    idempotency_token,
+                )
+                return {
+                    "status": "already_injected",
+                    "card_id": card_id,
+                    "screen": screen,
+                    "target_container": target_container,
+                    "merchant": card.merchant,
+                    "card_status": card.status,
+                    "card_number_masked": mask_card_number(card.card_number),
+                    "submitted": submit,
+                    "method": method,
+                    "idempotent_replay": True,
+                    "idempotency_token": idempotency_token,
+                }
+
+        # Double-submit cooldown check
+        now = time.time()
+        if card.injected_at is not None and (now - card.injected_at) < 60:
+            raise ValueError(
+                f"Double-submit prevented: card '{card_id}' was injected recently at {card.injected_at}"
+            )
 
         if card.status != CardStatus.ACTIVE:
             raise ValueError(
@@ -529,12 +702,69 @@ class AgentCardEngine:
                     raise RuntimeError(f"MCP RPC Error: {res['error']}")
                 return res.get("result", {})
 
+        # Step 0: Read active tab URL and verify origin before typing secrets
+        active_url = current_url
+        page_text_res: Dict[str, Any] = {}
+        if not active_url or has_checkout_form is None:
+            try:
+                page_text_res = _call_mcp("page_text", {"screen": screen})
+                if not isinstance(page_text_res, dict):
+                    page_text_res = {}
+            except Exception as e:
+                logger.debug("Failed to query page_text on screen %d: %s", screen, e)
+                page_text_res = {}
+
+            if not active_url:
+                active_url = (
+                    page_text_res.get("url")
+                    or page_text_res.get("active_url")
+                    or page_text_res.get("current_url")
+                )
+                if not active_url and "text" in page_text_res:
+                    try:
+                        parsed_text = json.loads(page_text_res["text"])
+                        if isinstance(parsed_text, dict):
+                            active_url = parsed_text.get("url")
+                    except Exception:
+                        pass
+
+        if not active_url:
+            raise RuntimeError("Failed to inspect active tab URL before card injection")
+
+        validate_origin(active_url, card.merchant)
+
+        # Verify checkout-like form or credit card input is present on the page
+        if has_checkout_form is not None:
+            form_present = bool(has_checkout_form)
+        else:
+            page_text = str(page_text_res.get("text", ""))
+            dom_html = str(page_text_res.get("html", ""))
+            form_present = check_checkout_form_present(
+                page_text=page_text,
+                dom_html=dom_html,
+                form_info=page_text_res,
+            )
+
+        if not form_present:
+            raise ValueError(
+                f"Cannot inject card '{card_id}': no checkout form or credit card input detected on active page '{active_url}'"
+            )
+
+        # Transition ACTIVE -> INJECTING (persisted to disk) BEFORE the first keystroke is sent
+        card.status = CardStatus.INJECTING
+        card.injected_at = now
+        effective_token = idempotency_token or f"tok_{secrets.token_hex(8)}"
+        card.idempotency_token = effective_token
+        cards[card_id] = card
+        self._write_raw(cards)
+
         logger.info(
-            "Injecting card %s (%s) into screen %d on container %s",
+            "Injecting card %s (%s) into screen %d on container %s (origin verified: %s)",
             card.id,
             mask_card_number(card.card_number),
             screen,
             target_container,
+            active_url,
         )
 
         if method == "cdp":
@@ -592,7 +822,7 @@ class AgentCardEngine:
                 _call_mcp("key", {"combo": "Return", "screen": screen})
                 time.sleep(delay_sec)
 
-        # Single-use transition: lock the card immediately upon injection
+        # Transition INJECTING -> LOCKED immediately after typing
         locked_card = self.lock_card(card_id)
 
         # Return masked payload: Card details NEVER appear in response or LLM prompt!
@@ -606,6 +836,8 @@ class AgentCardEngine:
             "card_number_masked": mask_card_number(card.card_number),
             "submitted": submit,
             "method": method,
+            "active_url": active_url,
+            "idempotency_token": effective_token,
         }
 
 
@@ -661,10 +893,16 @@ def charge_card(
     amount_usd: float,
     merchant: Optional[str] = None,
     cards_path: Optional[Union[str, Path]] = None,
+    idempotency_key: Optional[str] = None,
 ) -> Card:
     """Convenience functional API for charging virtual cards."""
     engine = get_default_engine(cards_path)
-    return engine.charge_card(card_id=card_id, amount_usd=amount_usd, merchant=merchant)
+    return engine.charge_card(
+        card_id=card_id,
+        amount_usd=amount_usd,
+        merchant=merchant,
+        idempotency_key=idempotency_key,
+    )
 
 
 def get_card(card_id: str, cards_path: Optional[Union[str, Path]] = None) -> Card:
@@ -694,6 +932,9 @@ def inject_card(
     split_exp: bool = False,
     method: str = "synthetic",
     cards_path: Optional[Union[str, Path]] = None,
+    current_url: Optional[str] = None,
+    has_checkout_form: Optional[bool] = None,
+    idempotency_token: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Convenience functional API for out-of-band checkout injection."""
     engine = get_default_engine(cards_path)
@@ -707,6 +948,9 @@ def inject_card(
         submit=submit,
         split_exp=split_exp,
         method=method,
+        current_url=current_url,
+        has_checkout_form=has_checkout_form,
+        idempotency_token=idempotency_token,
     )
 
 
@@ -763,6 +1007,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_charge.add_argument("id", help="Card ID to charge")
     p_charge.add_argument("--amount", type=float, required=True, help="Amount in USD")
     p_charge.add_argument("--merchant", default=None, help="Merchant domain attempting charge")
+    p_charge.add_argument("--idempotency-key", default=None, help="Optional idempotency key for charge")
 
     # inject <id> [--screen <id>]
     p_inj = subparsers.add_parser("inject", help="Inject card details into checkout form")
@@ -793,6 +1038,16 @@ def main(argv: Optional[List[str]] = None) -> int:
         type=float,
         default=0.25,
         help="Inter-keystroke delay in seconds (default 0.25)",
+    )
+    p_inj.add_argument(
+        "--current-url",
+        default=None,
+        help="Active tab URL override for testing or manual origin verification",
+    )
+    p_inj.add_argument(
+        "--idempotency-token",
+        default=None,
+        help="Unique idempotency token to prevent duplicate submission",
     )
 
     args = parser.parse_args(argv)
@@ -830,6 +1085,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 card_id=args.id,
                 amount_usd=args.amount,
                 merchant=args.merchant,
+                idempotency_key=args.idempotency_key,
             )
             print(json.dumps(card.to_dict(mask=True), indent=2))
             return 0
@@ -843,6 +1099,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 delay_sec=args.delay,
                 submit=args.submit,
                 split_exp=args.split_exp,
+                current_url=args.current_url,
+                idempotency_token=args.idempotency_token,
             )
             print(json.dumps(res, indent=2))
             return 0

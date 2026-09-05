@@ -350,6 +350,7 @@ pub struct ChangeGateMetrics {
 /// State machine managing perceptual hash gating across vision loop ticks.
 pub struct ChangeGate {
     pub config: ChangeGateConfig,
+    pub handoff_gen: Option<u64>,
     previous_frame: Option<Vec<u8>>,
     previous_hash: Option<PerceptualHash>,
     unchanged_ticks: usize,
@@ -362,6 +363,7 @@ impl ChangeGate {
     pub fn new(config: ChangeGateConfig) -> Self {
         Self {
             config,
+            handoff_gen: None,
             previous_frame: None,
             previous_hash: None,
             unchanged_ticks: 0,
@@ -369,6 +371,16 @@ impl ChangeGate {
             total_vlm_calls: 0,
             total_frames_evaluated: 0,
         }
+    }
+
+    /// Update current handoff generation counter.
+    pub fn set_handoff_gen(&mut self, handoff_gen: u64) {
+        self.handoff_gen = Some(handoff_gen);
+    }
+
+    /// Retrieve current handoff generation counter.
+    pub fn handoff_gen(&self) -> Option<u64> {
+        self.handoff_gen
     }
 
     /// Evaluate current frame against previous frame.

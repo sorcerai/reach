@@ -41,6 +41,12 @@ fn test_lock_acquisition_and_mutual_exclusion() {
     assert_eq!(lease1.holder().owner.as_deref(), Some("agent-1"));
     assert!(broker.is_locked("test-profile-1"));
 
+    // Verify lock is in host locks dir and NOT in profile dir
+    assert!(!lease1.profile_dir().join(".reach.lock").exists());
+    assert_eq!(lease1.lock_path(), broker.lock_path_for("test-profile-1"));
+    assert!(lease1.lock_path().starts_with(broker.locks_dir()));
+    assert!(lease1.lock_path().exists());
+
     let holder_query = broker.holder_info("test-profile-1");
     assert!(holder_query.is_some());
     assert_eq!(holder_query.unwrap().lease_id, holder1.lease_id);
@@ -304,4 +310,137 @@ fn test_http_423_locked_response() {
     let resp_timeout = timeout_err.into_response();
     assert_eq!(resp_timeout.status(), StatusCode::LOCKED);
     assert_eq!(resp_timeout.status().as_u16(), 423);
+}
+
+#[test]
+fn test_locks_dir_outside_profile_dir_with_0700_permissions() {
+    let tmp_dir = TempDir::new();
+    let base_dir = tmp_dir.path().join("profiles");
+    let locks_dir = tmp_dir.path().join("locks");
+    let broker = ProfileBroker::new_with_locks_dir(base_dir.clone(), locks_dir.clone());
+
+    let lease = broker
+        .acquire("my-profile", 0)
+        .expect("acquire should succeed");
+
+    // Lock file lives under locks_dir
+    let expected_lock = locks_dir.join("my-profile.lock");
+    assert_eq!(lease.lock_path(), expected_lock);
+    assert!(expected_lock.exists());
+
+    // Profile dir does not have .reach.lock
+    assert!(!lease.profile_dir().join(".reach.lock").exists());
+
+    // On Unix, locks_dir has 0700 permissions
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let perm = std::fs::metadata(&locks_dir).unwrap().permissions();
+        assert_eq!(perm.mode() & 0o777, 0o700);
+    }
+}
+
+#[test]
+fn test_singleton_lock_detection_with_active_pid() {
+    let tmp_dir = TempDir::new();
+    let broker = ProfileBroker::new(tmp_dir.path().to_path_buf());
+    let profile_name = "profile-chrome-active";
+    let profile_dir = broker.profile_dir_for(profile_name);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let current_pid = std::process::id();
+    let symlink_path = profile_dir.join("SingletonLock");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(format!("myhost-{current_pid}"), &symlink_path).unwrap();
+    }
+
+    #[cfg(unix)]
+    {
+        assert!(broker.is_locked(profile_name));
+        let holder = broker
+            .holder_info(profile_name)
+            .expect("holder should be found");
+        assert_eq!(holder.pid, current_pid);
+        assert_eq!(holder.task.as_deref(), Some("chrome"));
+        assert_eq!(holder.owner.as_deref(), Some("chrome"));
+
+        // Competing acquire must return Locked with holder indicating Chrome
+        let res = broker.acquire(profile_name, 0);
+        match res {
+            Err(ProfileLockError::Locked { profile, holder }) => {
+                assert_eq!(profile, profile_name);
+                let h = holder.expect("holder must be present");
+                assert_eq!(h.pid, current_pid);
+                assert_eq!(h.task.as_deref(), Some("chrome"));
+            }
+            other => panic!("expected ProfileLockError::Locked, got {other:?}"),
+        }
+
+        // Clean up symlink
+        let _ = std::fs::remove_file(symlink_path);
+    }
+}
+
+#[test]
+fn test_singleton_lock_clean_handling_with_dead_pid() {
+    let tmp_dir = TempDir::new();
+    let broker = ProfileBroker::new(tmp_dir.path().to_path_buf());
+    let profile_name = "profile-chrome-dead";
+    let profile_dir = broker.profile_dir_for(profile_name);
+    std::fs::create_dir_all(&profile_dir).unwrap();
+
+    let dead_pid = 99_999_999;
+    let symlink_path = profile_dir.join("SingletonLock");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(format!("myhost-{dead_pid}"), &symlink_path).unwrap();
+        assert!(symlink_path.symlink_metadata().is_ok());
+
+        // is_locked should detect dead PID, remove stale symlink, and return false
+        assert!(!broker.is_locked(profile_name));
+        assert!(symlink_path.symlink_metadata().is_err());
+
+        // Re-create dead symlink to test acquire recovery
+        std::os::unix::fs::symlink(format!("crashhost-{dead_pid}"), &symlink_path).unwrap();
+        let lease = broker
+            .acquire(profile_name, 0)
+            .expect("acquire must succeed by recovering from stale SingletonLock");
+        assert_eq!(lease.profile(), profile_name);
+        assert!(symlink_path.symlink_metadata().is_err());
+    }
+}
+
+#[test]
+fn test_stale_holder_pid_reclaim() {
+    let tmp_dir = TempDir::new();
+    let broker = ProfileBroker::new(tmp_dir.path().to_path_buf());
+    let profile_name = "profile-stale-holder";
+    let lock_path = broker.lock_path_for(profile_name);
+
+    // Ensure parent dir exists
+    std::fs::create_dir_all(lock_path.parent().unwrap()).unwrap();
+
+    let dead_pid = 99_999_999;
+    let stale_holder = LockHolderInfo {
+        pid: dead_pid,
+        screen: Some(0),
+        task: Some("crashed-task".into()),
+        owner: Some("dead-agent".into()),
+        acquired_at: chrono::Utc::now(),
+        lease_id: "stale-lease-123".into(),
+    };
+    std::fs::write(&lock_path, serde_json::to_string(&stale_holder).unwrap()).unwrap();
+
+    // is_locked detects dead PID, cleans up stale file, and returns false
+    assert!(!broker.is_locked(profile_name));
+    assert_eq!(broker.holder_info(profile_name), None);
+
+    // Re-write stale file and verify acquire reclaims it cleanly
+    std::fs::write(&lock_path, serde_json::to_string(&stale_holder).unwrap()).unwrap();
+    let lease = broker
+        .acquire(profile_name, 0)
+        .expect("acquire should succeed by reclaiming stale lock");
+    assert_eq!(lease.profile(), profile_name);
+    assert_eq!(lease.holder().pid, std::process::id());
 }

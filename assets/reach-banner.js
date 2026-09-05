@@ -92,6 +92,7 @@
   document.body.appendChild(banner);
 
   const params = new URLSearchParams(window.location.search);
+  const token = params.get("token") || "";
   let screenId = 0;
   if (params.has("screen")) {
     screenId = parseInt(params.get("screen"), 10) || 0;
@@ -118,7 +119,11 @@
 
   async function checkTakeoverStatus() {
     try {
-      const res = await fetch(`${apiBase}/agent/screens`, { cache: "no-store" });
+      const url = token
+        ? `${apiBase}/agent/screens?token=${encodeURIComponent(token)}`
+        : `${apiBase}/agent/screens`;
+      const headers = token ? { "X-Human-Token": token } : {};
+      const res = await fetch(url, { cache: "no-store", headers });
       if (!res.ok) return;
       const screens = await res.json();
       const current = screens.find(s => s.id === screenId);
@@ -131,7 +136,13 @@
         }
         if (current.phase === "HandoffPending" && !notifiedConnected) {
           notifiedConnected = true;
-          fetch(`${apiBase}/agent/screens/${screenId}/connected`, { method: "POST" }).catch(() => {});
+          const connUrl = token
+            ? `${apiBase}/agent/screens/${screenId}/connected?token=${encodeURIComponent(token)}`
+            : `${apiBase}/agent/screens/${screenId}/connected`;
+          fetch(connUrl, {
+            method: "POST",
+            headers: token ? { "X-Human-Token": token } : {},
+          }).catch(() => {});
         }
       } else {
         banner.style.display = "none";
@@ -149,9 +160,16 @@
     btn.disabled = true;
     btn.textContent = "Handing back...";
     try {
-      const res = await fetch(`${apiBase}/agent/screens/${screenId}/handback`, {
+      const hbUrl = token
+        ? `${apiBase}/agent/screens/${screenId}/handback?token=${encodeURIComponent(token)}`
+        : `${apiBase}/agent/screens/${screenId}/handback`;
+      const hbHeaders = { "Content-Type": "application/json" };
+      if (token) {
+        hbHeaders["X-Human-Token"] = token;
+      }
+      const res = await fetch(hbUrl, {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: hbHeaders,
       });
       if (res.ok) {
         btn.textContent = "Handed back \u2713";

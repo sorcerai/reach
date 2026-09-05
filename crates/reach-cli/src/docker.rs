@@ -536,6 +536,8 @@ impl DockerClient {
             } else {
                 Some(mounts)
             },
+            cap_drop: Some(vec!["ALL".to_string()]),
+            security_opt: Some(vec!["no-new-privileges:true".to_string()]),
             ..Default::default()
         };
 

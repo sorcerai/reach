@@ -39,9 +39,11 @@ fn test_screen_phase_lifecycle_and_generation_counter() {
         s.takeover_reason.as_deref(),
         Some("Solve Cloudflare Turnstile")
     );
-    assert_eq!(
-        s.takeover_url.as_deref(),
-        Some("http://localhost:6081/vnc.html")
+    assert!(
+        s.takeover_url
+            .as_deref()
+            .unwrap()
+            .starts_with("http://localhost:6081/vnc.html")
     );
 
     // Human connects -> HumanActive, gen 2
@@ -171,4 +173,111 @@ async fn test_long_poll_wait_for_phase() {
         .await
         .expect_err("should have timed out");
     assert!(matches!(timeout_err, WaitError::Timeout { .. }));
+}
+
+#[test]
+fn test_agent_cannot_eject_human_in_human_active() {
+    let agent = AgentState::new(1);
+    let _ = agent.lease_screen(0, "bot").unwrap();
+
+    // 1. In HandoffPending, agent CAN cancel takeover
+    agent
+        .request_takeover(0, Some("need auth".into()), None)
+        .unwrap();
+    assert_eq!(agent.phase(0), Some(ScreenPhase::HandoffPending));
+    let initial_gen = agent.handoff_gen(0).unwrap();
+
+    let cancelled = agent.set_takeover(0, false, None).unwrap();
+    assert_eq!(cancelled.phase, ScreenPhase::AgentActive);
+    assert!(!cancelled.takeover_pending);
+    assert_eq!(cancelled.handoff_gen, initial_gen + 1);
+
+    // 2. Request takeover again and transition to HumanActive
+    agent
+        .request_takeover(0, Some("need auth".into()), None)
+        .unwrap();
+    agent.human_connected(0).unwrap();
+    assert_eq!(agent.phase(0), Some(ScreenPhase::HumanActive));
+
+    // 3. In HumanActive, agent CANNOT cancel takeover or force-eject human
+    let eject_err = agent
+        .set_takeover(0, false, None)
+        .expect_err("agent must not be able to eject human in HumanActive");
+    assert!(matches!(eject_err, TakeoverError::InvalidPhase { .. }));
+
+    // Cannot agent_ack either
+    let ack_err = agent.agent_ack(0).expect_err("cannot ack in HumanActive");
+    assert!(matches!(ack_err, TakeoverError::InvalidPhase { .. }));
+
+    // Only human_handback transitions out of HumanActive
+    let handed_back = agent.human_handback(0).unwrap();
+    assert_eq!(handed_back.phase, ScreenPhase::HumanDone);
+}
+
+#[test]
+fn test_human_token_minting_and_verification() {
+    let agent = AgentState::new(1);
+    let _ = agent.lease_screen(0, "bot").unwrap();
+
+    let base_url = "http://127.0.0.1:6080/vnc.html?autoconnect=1";
+    let state = agent
+        .request_takeover(0, Some("login".into()), Some(base_url.into()))
+        .unwrap();
+
+    let token = state
+        .human_token
+        .expect("request_takeover must mint human_token");
+    assert!(!token.is_empty());
+
+    let takeover_url = state.takeover_url.expect("takeover_url should be set");
+    assert!(
+        takeover_url.contains(&format!("token={}", token)),
+        "takeover_url must include minted token"
+    );
+
+    // Verification succeeds with correct token
+    assert!(agent.verify_human_token(0, &token));
+    assert!(agent.has_human_token(&token));
+
+    // Verification fails with bogus token
+    assert!(!agent.verify_human_token(0, "bogus-token"));
+    assert!(!agent.has_human_token("bogus-token"));
+
+    // Complete handoff cycle
+    agent.human_connected(0).unwrap();
+    agent.human_handback(0).unwrap();
+    agent.agent_ack(0).unwrap();
+
+    // After ack, human token is cleared
+    assert_eq!(agent.human_token(0), None);
+    assert!(!agent.has_human_token(&token));
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_takeover_busy_drain_and_timeout() {
+    let agent = Arc::new(AgentState::new(1));
+    let _ = agent.lease_screen(0, "bot").unwrap();
+
+    // Mark screen busy (in-flight tool)
+    agent.inc_busy(0);
+    assert_eq!(agent.busy_count(0), 1);
+
+    // Drain finishes in background after 50ms
+    let agent_clone = Arc::clone(&agent);
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        agent_clone.dec_busy(0);
+    });
+
+    let drained = agent.wait_for_drain(0, Duration::from_millis(500)).await;
+    assert!(drained, "wait_for_drain should succeed once busy reaches 0");
+
+    // Mark screen busy again and test drain timeout
+    agent.inc_busy(0);
+    let timed_out = !agent.wait_for_drain(0, Duration::from_millis(50)).await;
+    assert!(
+        timed_out,
+        "wait_for_drain should time out if busy remains > 0"
+    );
+    agent.dec_busy(0);
 }

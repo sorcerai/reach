@@ -64,6 +64,71 @@ def normalize_domain(domain_or_url: str) -> str:
     return host
 
 
+def extract_etld_plus_one(domain_or_url: str) -> str:
+    """Extract effective Top-Level Domain plus one label (eTLD+1).
+
+    Handles common two-part public suffixes (e.g. .co.uk, .com.au, .co.jp, .org.uk)
+    and single-part TLDs (e.g. .com, .org, .net, .io, .ai).
+    """
+    host = normalize_domain(domain_or_url)
+    if not host:
+        return ""
+    if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".localhost"):
+        return host
+
+    parts = host.split(".")
+    if len(parts) <= 2:
+        return host
+
+    known_second_levels = {"co", "com", "org", "net", "edu", "gov", "ac", "ne", "mil"}
+    if len(parts) >= 3 and parts[-2] in known_second_levels and len(parts[-1]) == 2:
+        return ".".join(parts[-3:])
+
+    return ".".join(parts[-2:])
+
+
+def validate_origin(active_url: str, bound_domain: str) -> None:
+    """Validate active page URL against bound target domain.
+
+    Requirements:
+    1. Scheme must be 'https' (or 'http' only for localhost / 127.0.0.1).
+    2. Normalized domain / eTLD+1 of active_url must match bound_domain.
+    """
+    if not active_url or not active_url.strip():
+        raise ValueError("Cannot verify origin: active tab URL is empty or missing")
+
+    raw = active_url.strip()
+    parsed = urllib.parse.urlparse(raw if "://" in raw else f"https://{raw}")
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or parsed.netloc or "").lower()
+    if ":" in host:
+        host = host.split(":")[0]
+
+    is_local = (
+        host in {"localhost", "127.0.0.1", "::1"}
+        or host.endswith(".localhost")
+        or host.startswith("127.")
+    )
+
+    if scheme == "http":
+        if not is_local:
+            raise ValueError(
+                f"Insecure origin scheme 'http' for non-localhost URL '{active_url}'. Only https is allowed."
+            )
+    elif scheme != "https":
+        raise ValueError(
+            f"Invalid origin scheme '{scheme}' in URL '{active_url}'. Only https (or localhost http) is permitted."
+        )
+
+    active_etld = extract_etld_plus_one(host)
+    bound_etld = extract_etld_plus_one(bound_domain)
+    if not active_etld or not bound_etld or active_etld != bound_etld:
+        raise ValueError(
+            f"Origin mismatch: active URL '{active_url}' (eTLD+1: '{active_etld}') "
+            f"does not match bound domain '{bound_domain}' (eTLD+1: '{bound_etld}')"
+        )
+
+
 # --------------------------------------------------------------------------
 # RFC 6238 TOTP Generator (Pure Python standard library)
 # --------------------------------------------------------------------------
@@ -347,11 +412,15 @@ class ReachVault:
         delay_sec: float = 0.25,
         type_totp: bool = True,
         mcp_caller: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
+        current_url: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Inject credentials directly into the active window on the target screen.
 
         Uses Reach MCP input typing (streamed synthetic X11 keypresses) or CDP
         without writing any password or secret to container disk.
+
+        Enforces origin validation: verifies that the active tab's domain matches
+        the target bound domain before typing any credentials.
         """
         canonical = normalize_domain(domain)
         creds = self.get(canonical)
@@ -382,6 +451,34 @@ class ReachVault:
                 if "error" in res:
                     raise RuntimeError(f"MCP RPC Error: {res['error']}")
                 return res.get("result", {})
+
+        # Step 0: Read active tab URL and verify origin before typing secrets
+        active_url = current_url
+        if not active_url:
+            try:
+                page_info = _call_mcp("page_text", {"screen": screen})
+                if isinstance(page_info, dict):
+                    active_url = (
+                        page_info.get("url")
+                        or page_info.get("active_url")
+                        or page_info.get("current_url")
+                    )
+                    if not active_url and "text" in page_info:
+                        try:
+                            parsed_text = json.loads(page_info["text"])
+                            if isinstance(parsed_text, dict):
+                                active_url = parsed_text.get("url")
+                        except Exception:
+                            pass
+            except Exception as e:
+                logger.debug("Failed to query page_text for active tab URL: %s", e)
+
+        if not active_url:
+            raise RuntimeError(
+                f"Failed to inspect active tab URL before credential injection on screen {screen}"
+            )
+
+        validate_origin(active_url, canonical)
 
         # Step 1: Type username into currently focused field
         logger.info("Injecting username into screen %s for %s", screen, canonical)
@@ -423,6 +520,7 @@ class ReachVault:
             "submitted": submit,
             "totp_generated": totp_code is not None,
             "totp_code": totp_code,
+            "active_url": active_url,
         }
 
 
@@ -456,9 +554,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_set.add_argument("--pass", dest="password", required=True, help="Password")
     p_set.add_argument("--totp", dest="totp", default=None, help="Optional TOTP base32 secret")
 
-    # get <domain>
+    # get <domain> [--reveal]
     p_get = subparsers.add_parser("get", help="Retrieve credentials for a domain")
     p_get.add_argument("domain", help="Target domain")
+    p_get.add_argument(
+        "--reveal",
+        action="store_true",
+        help="Display raw plaintext password in output (default: redacted to prevent accidental exfiltration)",
+    )
 
     # list
     subparsers.add_parser("list", help="List registered domains (redacting passwords)")
@@ -467,9 +570,14 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_del = subparsers.add_parser("delete", help="Delete credentials for a domain")
     p_del.add_argument("domain", help="Target domain")
 
-    # totp <domain>
+    # totp <domain> [--current-url <url>]
     p_totp = subparsers.add_parser("totp", help="Generate current 6-digit TOTP code")
     p_totp.add_argument("domain", help="Target domain")
+    p_totp.add_argument(
+        "--current-url",
+        default=None,
+        help="Active tab URL override for origin validation before revealing TOTP code",
+    )
 
     # inject <screen> <domain>
     p_inj = subparsers.add_parser(
@@ -500,6 +608,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         default=0.25,
         help="Inter-keystroke/field delay in seconds (default 0.25)",
     )
+    p_inj.add_argument(
+        "--current-url",
+        default=None,
+        help="Active tab URL override for testing or manual origin verification",
+    )
 
     args = parser.parse_args(argv)
     vault = ReachVault(vault_path=args.vault_path, key=args.key)
@@ -517,6 +630,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.command == "get":
             res = vault.get(args.domain)
+            if not getattr(args, "reveal", False):
+                res["password"] = "[REDACTED]"
+                res["_revealed"] = False
+            else:
+                res["_revealed"] = True
             print(json.dumps(res, indent=2))
             return 0
 
@@ -531,6 +649,8 @@ def main(argv: Optional[list[str]] = None) -> int:
             return 0 if deleted else 1
 
         if args.command == "totp":
+            if getattr(args, "current_url", None):
+                validate_origin(args.current_url, args.domain)
             code = vault.get_totp(args.domain)
             print(json.dumps({"domain": args.domain, "totp": code}, indent=2))
             return 0
@@ -543,6 +663,7 @@ def main(argv: Optional[list[str]] = None) -> int:
                 submit=args.submit,
                 delay_sec=args.delay,
                 type_totp=args.type_totp,
+                current_url=args.current_url,
             )
             print(json.dumps(res, indent=2))
             return 0

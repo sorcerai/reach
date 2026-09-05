@@ -42,7 +42,8 @@ pub async fn serve(port: u16, supervisor: SharedSupervisor) -> anyhow::Result<()
         .route("/screens", get(screens_handler))
         .with_state(supervisor);
 
-    let addr = format!("0.0.0.0:{port}");
+    let host = std::env::var("REACH_SUPERVISOR_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+    let addr = format!("{host}:{port}");
     tracing::info!("health server listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;

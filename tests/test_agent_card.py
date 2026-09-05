@@ -224,6 +224,12 @@ def test_synthetic_form_injection_and_single_use_lock(tmp_path: Path) -> None:
 
     def mock_mcp(tool_name: str, arguments: dict):
         calls.append((tool_name, arguments))
+        if tool_name == "page_text":
+            return {
+                "url": "https://amazon.com/checkout",
+                "text": "Checkout: Enter Card Number, CVV, Expiration Date",
+                "status": "ok",
+            }
         return {"status": "ok"}
 
     res = engine.inject_card(
@@ -250,26 +256,28 @@ def test_synthetic_form_injection_and_single_use_lock(tmp_path: Path) -> None:
     assert card.cvv not in json.dumps(res)
 
     # Verify input typing call sequence:
-    # 0: type PAN
-    # 1: key Tab
-    # 2: type exp (MM/YY)
-    # 3: key Tab
-    # 4: type CVV
-    # 5: key Return (submit)
-    assert len(calls) == 6
-    assert calls[0][0] == "type" and calls[0][1]["text"] == card.card_number and calls[0][1]["screen"] == 1
-    assert calls[1][0] == "key" and calls[1][1]["combo"] == "Tab"
-    assert calls[2][0] == "type" and calls[2][1]["text"] == f"{card.exp_month}/{card.exp_year}"
-    assert calls[3][0] == "key" and calls[3][1]["combo"] == "Tab"
-    assert calls[4][0] == "type" and calls[4][1]["text"] == card.cvv
-    assert calls[5][0] == "key" and calls[5][1]["combo"] == "Return"
+    # 0: page_text origin & form inspection
+    # 1: type PAN
+    # 2: key Tab
+    # 3: type exp (MM/YY)
+    # 4: key Tab
+    # 5: type CVV
+    # 6: key Return (submit)
+    assert len(calls) == 7
+    assert calls[0][0] == "page_text" and calls[0][1]["screen"] == 1
+    assert calls[1][0] == "type" and calls[1][1]["text"] == card.card_number and calls[1][1]["screen"] == 1
+    assert calls[2][0] == "key" and calls[2][1]["combo"] == "Tab"
+    assert calls[3][0] == "type" and calls[3][1]["text"] == f"{card.exp_month}/{card.exp_year}"
+    assert calls[4][0] == "key" and calls[4][1]["combo"] == "Tab"
+    assert calls[5][0] == "type" and calls[5][1]["text"] == card.cvv
+    assert calls[6][0] == "key" and calls[6][1]["combo"] == "Return"
 
     # Verify card status transitioned to LOCKED on disk
     persisted_card = engine.get_card(card.id)
     assert persisted_card.status == CardStatus.LOCKED
 
-    # Second injection attempt must fail because card is LOCKED (single-use enforcement)
-    with pytest.raises(ValueError, match="must be ACTIVE"):
+    # Second injection attempt must fail because card was just injected / is LOCKED
+    with pytest.raises(ValueError, match=r"(must be ACTIVE|Double-submit prevented)"):
         engine.inject_card(screen=1, card_id=card.id, mcp_caller=mock_mcp)
 
 
@@ -280,33 +288,58 @@ def test_split_exp_and_cdp_injection(tmp_path: Path) -> None:
     # Test split expiration (MM -> Tab -> YY)
     card1 = engine.mint_card("bestbuy.com", 20.00)
     calls1 = []
+
+    def mock_mcp1(t: str, a: dict):
+        calls1.append((t, a))
+        if t == "page_text":
+            return {
+                "url": "https://bestbuy.com/checkout",
+                "text": "Payment Checkout: Card Number CVV",
+                "status": "ok",
+            }
+        return {"status": "ok"}
+
     engine.inject_card(
         screen=0,
         card_id=card1.id,
-        mcp_caller=lambda t, a: calls1.append((t, a)) or {"status": "ok"},
+        mcp_caller=mock_mcp1,
         delay_sec=0.001,
         split_exp=True,
     )
-    # calls: type(PAN) -> Tab -> type(exp_month) -> Tab -> type(exp_year) -> Tab -> type(cvv)
-    assert len(calls1) == 7
-    assert calls1[2][1]["text"] == card1.exp_month
-    assert calls1[3][1]["combo"] == "Tab"
-    assert calls1[4][1]["text"] == card1.exp_year
+    # calls: page_text -> type(PAN) -> Tab -> type(exp_month) -> Tab -> type(exp_year) -> Tab -> type(cvv)
+    assert len(calls1) == 8
+    assert calls1[0][0] == "page_text"
+    assert calls1[1][0] == "type" and calls1[1][1]["text"] == card1.card_number
+    assert calls1[3][1]["text"] == card1.exp_month
+    assert calls1[4][1]["combo"] == "Tab"
+    assert calls1[5][1]["text"] == card1.exp_year
 
     # Test CDP injection mode
     card2 = engine.mint_card("target.com", 20.00)
     calls2 = []
+
+    def mock_mcp2(t: str, a: dict):
+        calls2.append((t, a))
+        if t == "page_text":
+            return {
+                "url": "https://target.com/checkout",
+                "text": "Checkout: input[autocomplete=\"cc-number\"]",
+                "status": "ok",
+            }
+        return {"status": "ok"}
+
     res2 = engine.inject_card(
         screen=0,
         card_id=card2.id,
         method="cdp",
-        mcp_caller=lambda t, a: calls2.append((t, a)) or {"status": "ok"},
+        mcp_caller=mock_mcp2,
     )
     assert res2["status"] == "injected"
     assert res2["card_status"] == CardStatus.LOCKED
-    assert len(calls2) == 1
-    assert calls2[0][0] == "playwright_eval"
-    assert "input[autocomplete=\"cc-number\"]" in calls2[0][1]["script"]
+    assert len(calls2) == 2
+    assert calls2[0][0] == "page_text"
+    assert calls2[1][0] == "playwright_eval"
+    assert "input[autocomplete=\"cc-number\"]" in calls2[1][1]["script"]
 
 
 def test_list_and_filtering(tmp_path: Path) -> None:
@@ -417,3 +450,164 @@ def test_cli_interface(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
     assert ret == 0
     lock_out = json.loads(capsys.readouterr().out)
     assert lock_out["status"] == CardStatus.LOCKED
+
+
+def test_card_inject_origin_validation(tmp_path: Path) -> None:
+    cards_file = tmp_path / "cards.json"
+    engine = AgentCardEngine(cards_path=cards_file)
+    card = engine.mint_card("amazon.com", 25.00)
+
+    # 1. Phishing mismatch rejection: active page is evil-phishing.com
+    def mock_phishing(t, a):
+        return {"url": "https://evil-phishing.com/checkout", "text": "Card Number", "status": "ok"}
+
+    with pytest.raises(ValueError, match="Origin mismatch"):
+        engine.inject_card(screen=0, card_id=card.id, mcp_caller=mock_phishing)
+
+    # 2. Insecure HTTP scheme rejection for remote merchant
+    def mock_http(t, a):
+        return {"url": "http://amazon.com/checkout", "text": "Card Number", "status": "ok"}
+
+    with pytest.raises(ValueError, match="Insecure origin"):
+        engine.inject_card(screen=0, card_id=card.id, mcp_caller=mock_http)
+
+    # 3. Missing active URL rejection
+    def mock_no_url(t, a):
+        return {"status": "ok"}
+
+    with pytest.raises(RuntimeError, match="Failed to inspect active tab URL"):
+        engine.inject_card(screen=0, card_id=card.id, mcp_caller=mock_no_url)
+
+    # 4. Valid subdomain match on eTLD+1 succeeds
+    calls = []
+    def mock_subdomain(t, a):
+        calls.append((t, a))
+        return {"url": "https://pay.amazon.com/us/checkout", "text": "Card Number CVV", "status": "ok"}
+
+    res = engine.inject_card(screen=0, card_id=card.id, mcp_caller=mock_subdomain)
+    assert res["status"] == "injected"
+    assert res["card_status"] == CardStatus.LOCKED
+
+    # 5. Localhost over HTTP is allowed
+    card_local = engine.mint_card("localhost", 10.00)
+    calls_local = []
+    def mock_local(t, a):
+        calls_local.append((t, a))
+        return {"url": "http://localhost:3000/pay", "text": "Checkout credit card", "status": "ok"}
+
+    res_local = engine.inject_card(screen=0, card_id=card_local.id, mcp_caller=mock_local)
+    assert res_local["status"] == "injected"
+
+
+def test_card_inject_form_check(tmp_path: Path) -> None:
+    cards_file = tmp_path / "cards.json"
+    engine = AgentCardEngine(cards_path=cards_file)
+    card = engine.mint_card("store.google.com", 25.00)
+
+    # Page with no credit card / checkout form
+    def mock_non_checkout(t, a):
+        return {
+            "url": "https://store.google.com/product/pixel",
+            "text": "Product details: Google Pixel 8 Pro. 128GB Obsidian.",
+            "status": "ok",
+        }
+
+    with pytest.raises(ValueError, match="no checkout form"):
+        engine.inject_card(screen=0, card_id=card.id, mcp_caller=mock_non_checkout)
+
+    # Card status must remain ACTIVE because injection was aborted before any typing
+    assert engine.get_card(card.id).status == CardStatus.ACTIVE
+
+
+def test_card_injecting_crash_recovery(tmp_path: Path) -> None:
+    cards_file = tmp_path / "cards.json"
+    # Simulate a crash where the card was left in INJECTING status on disk
+    raw_card = {
+        "card_crashed": {
+            "id": "card_crashed",
+            "card_number": "4111222233334444",
+            "exp_month": "12",
+            "exp_year": "28",
+            "cvv": "123",
+            "merchant": "amazon.com",
+            "spending_limit_usd": 50.0,
+            "currency": "USD",
+            "status": "INJECTING",
+            "created_at": 1700000000,
+        }
+    }
+    cards_file.write_text(json.dumps(raw_card), encoding="utf-8")
+
+    engine = AgentCardEngine(cards_path=cards_file)
+    loaded_card = engine.get_card("card_crashed")
+    # Must be safely treated as LOCKED (burned/invalidated)
+    assert loaded_card.status == CardStatus.LOCKED
+
+
+def test_card_inject_idempotency_and_cooldown(tmp_path: Path) -> None:
+    cards_file = tmp_path / "cards.json"
+    engine = AgentCardEngine(cards_path=cards_file)
+    card = engine.mint_card("amazon.com", 25.00)
+
+    calls = []
+    def mock_mcp(t, a):
+        calls.append((t, a))
+        return {"url": "https://amazon.com/checkout", "text": "Card Number CVV", "status": "ok"}
+
+    # 1. First injection with idempotency token
+    res1 = engine.inject_card(
+        screen=0,
+        card_id=card.id,
+        idempotency_token="idemp_tok_abc",
+        mcp_caller=mock_mcp,
+    )
+    assert res1["status"] == "injected"
+    assert res1["card_status"] == CardStatus.LOCKED
+    calls_after_first = len(calls)
+
+    # 2. Replay with same idempotency token -> idempotent replay without new keystrokes
+    res2 = engine.inject_card(
+        screen=0,
+        card_id=card.id,
+        idempotency_token="idemp_tok_abc",
+        mcp_caller=mock_mcp,
+    )
+    assert res2["status"] == "already_injected"
+    assert res2["idempotent_replay"] is True
+    assert len(calls) == calls_after_first  # No additional calls
+
+    # 3. Double-submit cooldown on a card injected without matching token
+    card2 = engine.mint_card("amazon.com", 25.00)
+    engine.inject_card(
+        screen=0,
+        card_id=card2.id,
+        mcp_caller=mock_mcp,
+    )
+    # Re-inject immediately without token raises double-submit error
+    with pytest.raises(ValueError, match="Double-submit prevented"):
+        engine.inject_card(
+            screen=0,
+            card_id=card2.id,
+            mcp_caller=mock_mcp,
+        )
+
+
+def test_charge_card_idempotency(tmp_path: Path) -> None:
+    cards_file = tmp_path / "cards.json"
+    engine = AgentCardEngine(cards_path=cards_file)
+    card = engine.mint_card("amazon.com", 25.00)
+
+    # Initial charge with idempotency key
+    ch1 = engine.charge_card(card.id, 20.00, idempotency_key="key_123")
+    assert ch1.status == CardStatus.CHARGED
+    assert ch1.idempotency_token == "key_123"
+
+    # Replaying same key returns the charged card idempotently
+    ch2 = engine.charge_card(card.id, 20.00, idempotency_key="key_123")
+    assert ch2.status == CardStatus.CHARGED
+    assert ch2.idempotency_token == "key_123"
+
+    # Attempting to charge with different key fails
+    with pytest.raises(ValueError, match="must be ACTIVE"):
+        engine.charge_card(card.id, 20.00, idempotency_key="key_different")
+

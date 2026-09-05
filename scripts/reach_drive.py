@@ -1123,6 +1123,7 @@ class ReachDriver:
         backoff_sec: float = 0.75,
         roi: Optional[Union[List[int], Tuple[int, int, int, int], Roi, str]] = None,
         lease_token: Optional[str] = None,
+        handoff_gen: Optional[int] = None,
         step_callback: Optional[Callable[[StepRecord], None]] = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
@@ -1142,6 +1143,7 @@ class ReachDriver:
         self.backoff_sec = backoff_sec
         self.roi = Roi.from_value(roi) if roi is not None else None
         self.lease_token = lease_token
+        self.handoff_gen = handoff_gen
         self.step_callback = step_callback
         self.change_gate = PerceptualChangeGate(
             min_change_threshold=min_change_threshold,
@@ -1273,7 +1275,12 @@ class ReachDriver:
         req = urllib.request.Request(f"{self.api_url}/agent/screens", method="GET")
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "[]")
+                screens = json.loads(r.read().decode("utf-8") or "[]")
+                if isinstance(screens, list):
+                    for s in screens:
+                        if isinstance(s, dict) and s.get("id") == self.screen and "handoff_gen" in s:
+                            self.handoff_gen = int(s["handoff_gen"])
+                return screens
         except Exception as e:
             logger.warning("Failed to query screens from %s: %s", self.api_url, e)
             return []
@@ -1289,8 +1296,11 @@ class ReachDriver:
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
                 data = json.loads(r.read().decode("utf-8") or "{}")
-                if isinstance(data, dict) and data.get("token"):
-                    self.lease_token = data["token"]
+                if isinstance(data, dict):
+                    if data.get("token"):
+                        self.lease_token = data["token"]
+                    if "handoff_gen" in data:
+                        self.handoff_gen = int(data["handoff_gen"])
                 return data
         except urllib.error.HTTPError as e:
             body = e.read().decode("utf-8", errors="replace")
@@ -1341,7 +1351,10 @@ class ReachDriver:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "{}")
+                data = json.loads(r.read().decode("utf-8") or "{}")
+                if isinstance(data, dict) and "handoff_gen" in data:
+                    self.handoff_gen = int(data["handoff_gen"])
+                return data
         except Exception as e:
             logger.warning("Failed to set takeover for screen %s: %s", self.screen, e)
             return {"error": str(e)}
@@ -1377,6 +1390,10 @@ class ReachDriver:
         headers = {"content-type": "application/json"}
         if self.lease_token:
             headers["x-lease-token"] = self.lease_token
+            if self.handoff_gen is None:
+                self.get_screens()
+            if self.handoff_gen is not None:
+                headers["x-handoff-gen"] = str(self.handoff_gen)
         req = urllib.request.Request(
             f"{self.api_url}/mcp",
             data=json.dumps(req_body).encode("utf-8"),
@@ -2169,6 +2186,12 @@ def main() -> None:
         help="Region of Interest crop 'x,y,width,height' to send to VLM",
     )
     parser.add_argument(
+        "--handoff-gen",
+        type=int,
+        default=None,
+        help="Expected handoff generation for mutating actions",
+    )
+    parser.add_argument(
         "--allow-mutations",
         action="store_true",
         help="Allow dangerous mutations without approval pause",
@@ -2213,6 +2236,7 @@ def main() -> None:
         max_unchanged_ticks=args.max_unchanged_ticks,
         backoff_sec=args.backoff_sec,
         roi=args.roi,
+        handoff_gen=args.handoff_gen,
     )
 
     result = driver.drive(goal=args.goal, initial_url=args.initial_url)

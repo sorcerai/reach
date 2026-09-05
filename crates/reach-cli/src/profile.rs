@@ -201,9 +201,140 @@ impl Drop for ProfileLease {
     }
 }
 
+/// Normalize a profile name or path into a safe filename for the locks directory.
+pub fn normalize_profile_name(profile_name: &str) -> String {
+    let sanitized: String = profile_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let trimmed = sanitized.trim_matches(|c| c == '_' || c == '.');
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Check if a process with `pid` is currently alive on the system.
+#[cfg(unix)]
+pub fn is_process_alive(pid: u32) -> bool {
+    if pid == 0 || pid > i32::MAX as u32 {
+        return false;
+    }
+    let res = unsafe { libc::kill(pid as libc::pid_t, 0) };
+    if res == 0 {
+        true
+    } else {
+        let err = std::io::Error::last_os_error().raw_os_error();
+        err == Some(libc::EPERM)
+    }
+}
+
+#[cfg(not(unix))]
+pub fn is_process_alive(_pid: u32) -> bool {
+    true
+}
+
+/// Parse a Chrome SingletonLock symlink target (e.g. `<hostname>-<pid>` or `<pid>`) into a PID.
+pub fn parse_singleton_lock_pid(target: &str) -> Option<u32> {
+    let s = target.trim();
+    if let Some((_, pid_str)) = s.rsplit_once('-') {
+        if let Ok(pid) = pid_str.parse::<u32>() {
+            return Some(pid);
+        }
+    }
+    s.parse::<u32>().ok()
+}
+
+/// Inspect Chrome's `SingletonLock` inside `profile_dir`.
+///
+/// Chrome creates `<profile_dir>/SingletonLock` pointing to `<hostname>-<pid>`.
+/// If `SingletonLock` exists and the target PID is currently alive on the system,
+/// returns `Ok(Some(holder))` indicating Chrome holds the profile.
+/// If the PID is dead (stale lock after crash) or malformed, removes the symlink
+/// to allow recovery and returns `Ok(None)`.
+pub fn inspect_and_clean_singleton_lock(
+    profile_dir: &Path,
+) -> Result<Option<LockHolderInfo>, std::io::Error> {
+    let singleton_path = profile_dir.join("SingletonLock");
+    let meta = match fs::symlink_metadata(&singleton_path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+
+    let target_str = if meta.file_type().is_symlink() {
+        match fs::read_link(&singleton_path) {
+            Ok(target) => target.to_string_lossy().into_owned(),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read SingletonLock symlink at {:?}: {e}; removing stale lock",
+                    singleton_path
+                );
+                let _ = fs::remove_file(&singleton_path);
+                return Ok(None);
+            }
+        }
+    } else if meta.is_file() {
+        match fs::read_to_string(&singleton_path) {
+            Ok(content) => content,
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to read SingletonLock file at {:?}: {e}; removing stale lock",
+                    singleton_path
+                );
+                let _ = fs::remove_file(&singleton_path);
+                return Ok(None);
+            }
+        }
+    } else {
+        let _ = fs::remove_file(&singleton_path);
+        return Ok(None);
+    };
+
+    let pid_opt = parse_singleton_lock_pid(&target_str);
+    match pid_opt {
+        Some(pid) if is_process_alive(pid) => Ok(Some(LockHolderInfo {
+            pid,
+            screen: None,
+            task: Some("chrome".to_string()),
+            owner: Some("chrome".to_string()),
+            acquired_at: chrono::Utc::now(),
+            lease_id: format!("chrome-singleton-{pid}"),
+        })),
+        Some(dead_pid) => {
+            tracing::warn!(
+                "Detected stale Chrome SingletonLock in {:?} (target '{}', PID {dead_pid} is dead); removing to allow recovery",
+                profile_dir,
+                target_str
+            );
+            let _ = fs::remove_file(&singleton_path);
+            let _ = fs::remove_file(profile_dir.join("SingletonCookie"));
+            let _ = fs::remove_file(profile_dir.join("SingletonSocket"));
+            Ok(None)
+        }
+        None => {
+            tracing::warn!(
+                "Detected malformed Chrome SingletonLock in {:?} (target '{}'); removing to allow recovery",
+                profile_dir,
+                target_str
+            );
+            let _ = fs::remove_file(&singleton_path);
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Debug)]
 struct ProfileBrokerInner {
     base_dir: PathBuf,
+    locks_dir: PathBuf,
     in_process: Mutex<HashMap<PathBuf, LockHolderInfo>>,
 }
 
@@ -215,9 +346,15 @@ pub struct ProfileBroker {
 
 impl ProfileBroker {
     pub fn new(base_dir: PathBuf) -> Self {
+        let locks_dir = base_dir.parent().unwrap_or(&base_dir).join("locks");
+        Self::new_with_locks_dir(base_dir, locks_dir)
+    }
+
+    pub fn new_with_locks_dir(base_dir: PathBuf, locks_dir: PathBuf) -> Self {
         Self {
             inner: Arc::new(ProfileBrokerInner {
                 base_dir,
+                locks_dir,
                 in_process: Mutex::new(HashMap::new()),
             }),
         }
@@ -234,6 +371,10 @@ impl ProfileBroker {
         &self.inner.base_dir
     }
 
+    pub fn locks_dir(&self) -> &Path {
+        &self.inner.locks_dir
+    }
+
     pub fn profile_dir_for(&self, profile_name: &str) -> PathBuf {
         let p = Path::new(profile_name);
         if p.is_absolute() {
@@ -244,7 +385,18 @@ impl ProfileBroker {
     }
 
     pub fn lock_path_for(&self, profile_name: &str) -> PathBuf {
-        self.profile_dir_for(profile_name).join(".reach.lock")
+        let normalized = normalize_profile_name(profile_name);
+        self.inner.locks_dir.join(format!("{normalized}.lock"))
+    }
+
+    fn ensure_locks_dir(&self) -> std::io::Result<()> {
+        fs::create_dir_all(&self.inner.locks_dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&self.inner.locks_dir, fs::Permissions::from_mode(0o700));
+        }
+        Ok(())
     }
 
     pub fn is_locked(&self, profile_name: &str) -> bool {
@@ -255,8 +407,26 @@ impl ProfileBroker {
             }
         }
 
+        let profile_dir = self.profile_dir_for(profile_name);
+        if let Ok(Some(_)) = inspect_and_clean_singleton_lock(&profile_dir) {
+            return true;
+        }
+
         if !lock_path.exists() {
             return false;
+        }
+
+        // Check if existing lock file has a dead holder
+        if let Some(holder) = read_holder_from_file(&lock_path) {
+            if !is_process_alive(holder.pid) {
+                tracing::warn!(
+                    "is_locked: found stale lock file {:?} with dead PID {}, removing",
+                    lock_path,
+                    holder.pid
+                );
+                let _ = fs::remove_file(&lock_path);
+                return false;
+            }
         }
 
         if let Ok(file) = OpenOptions::new().read(true).write(true).open(&lock_path) {
@@ -280,7 +450,26 @@ impl ProfileBroker {
             }
         }
 
-        read_holder_from_file(&lock_path)
+        let profile_dir = self.profile_dir_for(profile_name);
+        if let Ok(Some(holder)) = inspect_and_clean_singleton_lock(&profile_dir) {
+            return Some(holder);
+        }
+
+        if let Some(holder) = read_holder_from_file(&lock_path) {
+            if is_process_alive(holder.pid) {
+                Some(holder)
+            } else {
+                tracing::warn!(
+                    "holder_info: found stale lock file {:?} with dead PID {}, removing",
+                    lock_path,
+                    holder.pid
+                );
+                let _ = fs::remove_file(&lock_path);
+                None
+            }
+        } else {
+            None
+        }
     }
 
     /// Acquire exclusive lock on `profile_name`. If already locked, waits up to `timeout_ms`.
@@ -300,7 +489,14 @@ impl ProfileBroker {
         holder_opt: Option<LockHolderInfo>,
     ) -> Result<ProfileLease, ProfileLockError> {
         let profile_dir = self.profile_dir_for(profile_name);
-        let lock_path = profile_dir.join(".reach.lock");
+        let lock_path = self.lock_path_for(profile_name);
+
+        if let Err(e) = self.ensure_locks_dir() {
+            return Err(ProfileLockError::Io {
+                profile: profile_name.to_string(),
+                source: e,
+            });
+        }
 
         if let Err(e) = fs::create_dir_all(&profile_dir) {
             return Err(ProfileLockError::Io {
@@ -314,7 +510,36 @@ impl ProfileBroker {
         let timeout = Duration::from_millis(timeout_ms);
 
         loop {
-            // 1. Check in-process lock tracker
+            // 1. Inspect Chrome's own SingletonLock
+            match inspect_and_clean_singleton_lock(&profile_dir) {
+                Ok(Some(chrome_holder)) => {
+                    if start.elapsed() >= timeout {
+                        if timeout_ms == 0 {
+                            return Err(ProfileLockError::Locked {
+                                profile: profile_name.to_string(),
+                                holder: Some(chrome_holder),
+                            });
+                        } else {
+                            return Err(ProfileLockError::Timeout {
+                                profile: profile_name.to_string(),
+                                timeout_ms,
+                                holder: Some(chrome_holder),
+                            });
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(ProfileLockError::Io {
+                        profile: profile_name.to_string(),
+                        source: e,
+                    });
+                }
+            }
+
+            // 2. Check in-process lock tracker
             let in_process_held = {
                 let mut map = self.inner.in_process.lock().unwrap();
                 if let Some(existing) = map.get(&lock_path) {
@@ -345,7 +570,19 @@ impl ProfileBroker {
                 continue;
             }
 
-            // 2. We hold the in-process reservation; now acquire OS file lock (flock/fs4)
+            // 3. Stale-holder check before opening/locking file
+            if let Some(existing_holder) = read_holder_from_file(&lock_path) {
+                if !is_process_alive(existing_holder.pid) {
+                    tracing::warn!(
+                        "Lock file {:?} contains dead holder PID {}, removing stale lock file",
+                        lock_path,
+                        existing_holder.pid
+                    );
+                    let _ = fs::remove_file(&lock_path);
+                }
+            }
+
+            // 4. We hold the in-process reservation; now acquire OS file lock (flock/fs4)
             let mut file = match OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -385,14 +622,33 @@ impl ProfileBroker {
                     });
                 }
                 Err(_) => {
-                    // Lock held by external process
+                    // Lock held by external process.
+                    // Check if the external process PID is dead.
+                    let current_holder = read_holder_from_file(&lock_path);
+                    if let Some(ref h) = current_holder {
+                        if !is_process_alive(h.pid) {
+                            tracing::warn!(
+                                "Lock file {:?} is held by dead PID {}, reclaiming stale lock",
+                                lock_path,
+                                h.pid
+                            );
+                            drop(file);
+                            let _ = fs::remove_file(&lock_path);
+                            // Rollback in-process reservation and retry
+                            {
+                                let mut map = self.inner.in_process.lock().unwrap();
+                                map.remove(&lock_path);
+                            }
+                            std::thread::sleep(Duration::from_millis(20));
+                            continue;
+                        }
+                    }
+
                     // Rollback in-process reservation
                     {
                         let mut map = self.inner.in_process.lock().unwrap();
                         map.remove(&lock_path);
                     }
-
-                    let current_holder = read_holder_from_file(&lock_path);
 
                     if start.elapsed() >= timeout {
                         if timeout_ms == 0 {
@@ -423,6 +679,9 @@ fn read_holder_from_file(lock_path: &Path) -> Option<LockHolderInfo> {
     let mut file = OpenOptions::new().read(true).open(lock_path).ok()?;
     let mut buf = String::new();
     file.read_to_string(&mut buf).ok()?;
+    if buf.trim().is_empty() {
+        return None;
+    }
     serde_json::from_str(&buf).ok()
 }
 
@@ -688,5 +947,39 @@ impl CookieJarService {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_profile_name() {
+        assert_eq!(normalize_profile_name("my-profile"), "my-profile");
+        assert_eq!(normalize_profile_name("profile_1.2"), "profile_1.2");
+        assert_eq!(
+            normalize_profile_name("/path/to/profile"),
+            "path_to_profile"
+        );
+        assert_eq!(normalize_profile_name(""), "default");
+        assert_eq!(normalize_profile_name("...___..."), "default");
+    }
+
+    #[test]
+    fn test_parse_singleton_lock_pid() {
+        assert_eq!(parse_singleton_lock_pid("myhost-12345"), Some(12345));
+        assert_eq!(parse_singleton_lock_pid("host-with-dashes-42"), Some(42));
+        assert_eq!(parse_singleton_lock_pid("9999"), Some(9999));
+        assert_eq!(parse_singleton_lock_pid("invalid-pid"), None);
+        assert_eq!(parse_singleton_lock_pid(""), None);
+    }
+
+    #[test]
+    fn test_is_process_alive_current_pid() {
+        let current_pid = std::process::id();
+        assert!(is_process_alive(current_pid));
+        assert!(!is_process_alive(0));
+        assert!(!is_process_alive(99_999_999));
     }
 }

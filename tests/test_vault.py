@@ -165,6 +165,8 @@ def test_inject_credentials_without_disk_write(tmp_path: Path) -> None:
 
     def mock_mcp_caller(tool_name: str, arguments: dict):
         calls.append((tool_name, arguments))
+        if tool_name == "page_text":
+            return {"url": "https://github.com/login", "status": "ok"}
         return {"status": "ok"}
 
     result = vault.inject(
@@ -179,26 +181,29 @@ def test_inject_credentials_without_disk_write(tmp_path: Path) -> None:
     assert result["status"] == "injected"
     assert result["screen"] == 1
     assert result["domain"] == "github.com"
+    assert result["active_url"] == "https://github.com/login"
     assert result["totp_generated"] is True
     assert result["totp_code"] is not None
 
-    # Verify call sequence
+    # Verify call sequence: page_text origin check happens BEFORE any keystroke is typed
     tool_names = [call[0] for call in calls]
-    assert tool_names == ["type", "key", "type", "key", "type", "key"]
+    assert tool_names == ["page_text", "type", "key", "type", "key", "type", "key"]
 
-    # Call 0: Type username
-    assert calls[0][1] == {"text": "octocat", "screen": 1}
-    # Call 1: Tab to password
-    assert calls[1][1] == {"combo": "Tab", "screen": 1}
-    # Call 2: Type password
-    assert calls[2][1] == {"text": "super_top_secret_pass", "screen": 1}
-    # Call 3: Enter to submit login
-    assert calls[3][1] == {"combo": "Return", "screen": 1}
-    # Call 4: Type 6-digit TOTP
-    assert len(calls[4][1]["text"]) == 6
-    assert calls[4][1]["screen"] == 1
-    # Call 5: Enter to submit TOTP
-    assert calls[5][1] == {"combo": "Return", "screen": 1}
+    # Call 0: Origin check via page_text
+    assert calls[0][1] == {"screen": 1}
+    # Call 1: Type username
+    assert calls[1][1] == {"text": "octocat", "screen": 1}
+    # Call 2: Tab to password
+    assert calls[2][1] == {"combo": "Tab", "screen": 1}
+    # Call 3: Type password
+    assert calls[3][1] == {"text": "super_top_secret_pass", "screen": 1}
+    # Call 4: Enter to submit login
+    assert calls[4][1] == {"combo": "Return", "screen": 1}
+    # Call 5: Type 6-digit TOTP
+    assert len(calls[5][1]["text"]) == 6
+    assert calls[5][1]["screen"] == 1
+    # Call 6: Enter to submit TOTP
+    assert calls[6][1] == {"combo": "Return", "screen": 1}
 
     # Verify container disk was NOT touched:
     # no temporary files created containing the password
@@ -209,6 +214,61 @@ def test_inject_credentials_without_disk_write(tmp_path: Path) -> None:
                 content = f.read()
                 if fname != "secrets.json":
                     assert "super_top_secret_pass" not in content
+
+
+def test_vault_inject_origin_validation(tmp_path: Path) -> None:
+    vault_file = tmp_path / "secrets.json"
+    vault = ReachVault(vault_path=vault_file)
+    vault.set(
+        domain="github.com",
+        username="octocat",
+        password="super_top_secret_pass",
+    )
+
+    # 1. Phishing domain rejected
+    with pytest.raises(ValueError, match="Origin mismatch"):
+        vault.inject(
+            screen=0,
+            domain="github.com",
+            current_url="https://evil-github.com/login",
+        )
+
+    # 2. Insecure HTTP on public domain rejected
+    with pytest.raises(ValueError, match="Insecure origin scheme"):
+        vault.inject(
+            screen=0,
+            domain="github.com",
+            current_url="http://github.com/login",
+        )
+
+    # 3. Missing active URL rejected
+    with pytest.raises(RuntimeError, match="Failed to inspect active tab URL"):
+        vault.inject(
+            screen=0,
+            domain="github.com",
+            mcp_caller=lambda t, a: {"status": "ok"},  # No url returned
+        )
+
+    # 4. Valid subdomain matching eTLD+1 accepted
+    calls = []
+    res = vault.inject(
+        screen=0,
+        domain="github.com",
+        current_url="https://auth.github.com/login",
+        mcp_caller=lambda t, a: calls.append((t, a)) or {"status": "ok"},
+    )
+    assert res["status"] == "injected"
+    assert res["active_url"] == "https://auth.github.com/login"
+
+    # 5. Localhost HTTP accepted
+    vault.set(domain="localhost", username="admin", password="devpassword")
+    res_local = vault.inject(
+        screen=0,
+        domain="localhost",
+        current_url="http://localhost:8000/login",
+        mcp_caller=lambda t, a: {"status": "ok"},
+    )
+    assert res_local["status"] == "injected"
 
 
 def test_cli_set_get_totp_list_delete(tmp_path: Path, capsys: pytest.CaptureFixture) -> None:
@@ -233,13 +293,22 @@ def test_cli_set_get_totp_list_delete(tmp_path: Path, capsys: pytest.CaptureFixt
     captured = capsys.readouterr()
     assert "example.com" in captured.out
 
-    # CLI get
+    # CLI get (default: redacted)
     ret = main(["--vault-path", vault_file, "get", "example.com"])
     assert ret == 0
     captured = capsys.readouterr()
     data = json.loads(captured.out)
     assert data["username"] == "alice"
-    assert data["password"] == "alice123!"
+    assert data["password"] == "[REDACTED]"
+    assert data["_revealed"] is False
+
+    # CLI get with --reveal
+    ret = main(["--vault-path", vault_file, "get", "example.com", "--reveal"])
+    assert ret == 0
+    captured = capsys.readouterr()
+    data_revealed = json.loads(captured.out)
+    assert data_revealed["password"] == "alice123!"
+    assert data_revealed["_revealed"] is True
 
     # CLI totp
     ret = main(["--vault-path", vault_file, "totp", "example.com"])
@@ -247,6 +316,16 @@ def test_cli_set_get_totp_list_delete(tmp_path: Path, capsys: pytest.CaptureFixt
     captured = capsys.readouterr()
     totp_json = json.loads(captured.out)
     assert len(totp_json["totp"]) == 6
+
+    # CLI totp with valid origin
+    ret = main(["--vault-path", vault_file, "totp", "example.com", "--current-url", "https://example.com/2fa"])
+    assert ret == 0
+
+    # CLI totp with mismatched origin fails with returncode 1
+    ret = main(["--vault-path", vault_file, "totp", "example.com", "--current-url", "https://evil.com/2fa"])
+    assert ret == 1
+    captured = capsys.readouterr()
+    assert "does not match bound domain" in captured.err
 
     # CLI list
     ret = main(["--vault-path", vault_file, "list"])

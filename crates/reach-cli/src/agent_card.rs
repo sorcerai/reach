@@ -4,6 +4,8 @@
 //! approval gate enforcement, single-use locking, and out-of-band checkout
 //! injection into desktop sandboxes via synthetic inputs or Reach MCP.
 
+#![allow(clippy::collapsible_if, clippy::too_many_arguments)]
+
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -39,6 +41,7 @@ fn dirs_or_home() -> PathBuf {
 pub enum CardStatus {
     PendingApproval,
     Active,
+    Injecting,
     Charged,
     Locked,
     Expired,
@@ -49,6 +52,7 @@ impl std::fmt::Display for CardStatus {
         match self {
             CardStatus::PendingApproval => write!(f, "PENDING_APPROVAL"),
             CardStatus::Active => write!(f, "ACTIVE"),
+            CardStatus::Injecting => write!(f, "INJECTING"),
             CardStatus::Charged => write!(f, "CHARGED"),
             CardStatus::Locked => write!(f, "LOCKED"),
             CardStatus::Expired => write!(f, "EXPIRED"),
@@ -69,6 +73,10 @@ pub struct Card {
     pub currency: String,
     pub status: CardStatus,
     pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_token: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub injected_at: Option<i64>,
 }
 
 impl Card {
@@ -90,6 +98,7 @@ impl Card {
             currency: self.currency.clone(),
             status: self.status,
             created_at: self.created_at,
+            idempotency_token: self.idempotency_token.clone(),
         }
     }
 }
@@ -107,6 +116,8 @@ pub struct SafeCardView {
     pub currency: String,
     pub status: CardStatus,
     pub created_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_token: Option<String>,
 }
 
 /// Normalize merchant domain string or URL.
@@ -129,6 +140,81 @@ pub fn normalize_domain(domain_or_url: &str) -> String {
         h = h[4..].to_string();
     }
     h
+}
+
+/// Extract effective Top-Level Domain plus one label (eTLD+1).
+pub fn extract_etld_plus_one(domain_or_url: &str) -> String {
+    let host = normalize_domain(domain_or_url);
+    if host.is_empty() {
+        return String::new();
+    }
+    if host == "localhost" || host == "127.0.0.1" || host == "::1" || host.ends_with(".localhost") {
+        return host;
+    }
+
+    let parts: Vec<&str> = host.split('.').collect();
+    if parts.len() <= 2 {
+        return host;
+    }
+
+    let known_second_levels = ["co", "com", "org", "net", "edu", "gov", "ac", "ne", "mil"];
+    let len = parts.len();
+    if len >= 3 && known_second_levels.contains(&parts[len - 2]) && parts[len - 1].len() == 2 {
+        return parts[len - 3..].join(".");
+    }
+
+    parts[len - 2..].join(".")
+}
+
+/// Validate active page URL against bound target domain.
+pub fn validate_origin(active_url: &str, bound_domain: &str) -> Result<()> {
+    if active_url.trim().is_empty() {
+        bail!("Cannot verify origin: active tab URL is empty or missing");
+    }
+
+    let raw = active_url.trim().to_lowercase();
+    let (scheme, host_with_port) = if let Some(idx) = raw.find("://") {
+        (&raw[..idx], &raw[idx + 3..])
+    } else {
+        ("https", raw.as_str())
+    };
+
+    let host = host_with_port
+        .split('/')
+        .next()
+        .unwrap_or("")
+        .split(':')
+        .next()
+        .unwrap_or("");
+
+    let is_localhost = host == "localhost"
+        || host == "127.0.0.1"
+        || host == "::1"
+        || host.ends_with(".localhost")
+        || host.starts_with("127.");
+
+    if scheme == "http" {
+        if !is_localhost {
+            bail!(
+                "Insecure origin scheme 'http' for non-localhost URL '{active_url}'. Only https is allowed."
+            );
+        }
+    } else if scheme != "https" {
+        bail!(
+            "Invalid origin scheme '{scheme}' in URL '{active_url}'. Only https (or localhost http) is permitted."
+        );
+    }
+
+    let active_etld = extract_etld_plus_one(host);
+    let bound_etld = extract_etld_plus_one(bound_domain);
+
+    if active_etld != bound_etld {
+        bail!(
+            "Origin mismatch: active URL '{active_url}' (eTLD+1: '{active_etld}') does not match bound domain '{bound_domain}' (eTLD+1: '{bound_etld}')"
+        );
+    }
+
+    Ok(())
 }
 
 /// Check card number with Luhn algorithm.
@@ -278,20 +364,26 @@ impl AgentCardEngine {
             return Ok(HashMap::new());
         }
 
-        // Parse either a map or list
-        if let Ok(map) = serde_json::from_str::<HashMap<String, Card>>(&content) {
-            return Ok(map);
-        }
-
-        if let Ok(list) = serde_json::from_str::<Vec<Card>>(&content) {
+        let mut map = if let Ok(map) = serde_json::from_str::<HashMap<String, Card>>(&content) {
+            map
+        } else if let Ok(list) = serde_json::from_str::<Vec<Card>>(&content) {
             let mut map = HashMap::new();
             for c in list {
                 map.insert(c.id.clone(), c);
             }
-            return Ok(map);
+            map
+        } else {
+            bail!("Failed to deserialize cards.json into card map or list");
+        };
+
+        // Treat INJECTING on load as LOCKED (burned / invalidated from crash mid-injection)
+        for card in map.values_mut() {
+            if card.status == CardStatus::Injecting {
+                card.status = CardStatus::Locked;
+            }
         }
 
-        bail!("Failed to deserialize cards.json into card map or list");
+        Ok(map)
     }
 
     fn write_raw(&self, cards: &HashMap<String, Card>) -> Result<()> {
@@ -372,6 +464,8 @@ impl AgentCardEngine {
             currency: currency.unwrap_or("USD").to_uppercase(),
             status,
             created_at: now,
+            idempotency_token: None,
+            injected_at: None,
         };
 
         let mut cards = self.read_raw()?;
@@ -437,6 +531,7 @@ impl AgentCardEngine {
         card_id: &str,
         amount_usd: f64,
         merchant: Option<&str>,
+        idempotency_key: Option<&str>,
     ) -> Result<Card> {
         if amount_usd < 0.0 {
             bail!("Charge amount cannot be negative");
@@ -446,6 +541,14 @@ impl AgentCardEngine {
         let card = cards
             .get_mut(card_id)
             .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
+
+        if card.status == CardStatus::Charged {
+            if let Some(key) = idempotency_key {
+                if card.idempotency_token.as_deref() == Some(key) {
+                    return Ok(card.clone());
+                }
+            }
+        }
 
         if card.status != CardStatus::Active {
             bail!(
@@ -475,6 +578,9 @@ impl AgentCardEngine {
         }
 
         card.status = CardStatus::Charged;
+        if let Some(key) = idempotency_key {
+            card.idempotency_token = Some(key.to_string());
+        }
         let updated = card.clone();
         self.write_raw(&cards)?;
 
@@ -553,8 +659,33 @@ impl AgentCardEngine {
         target_container: &str,
         submit: bool,
         split_exp: bool,
+        current_url: Option<&str>,
+        has_checkout_form: Option<bool>,
+        idempotency_token: Option<&str>,
     ) -> Result<CardInjectionResult> {
-        let card = self.get_card(card_id)?;
+        let mut cards = self.read_raw()?;
+        let card = cards
+            .get_mut(card_id)
+            .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
+
+        // Idempotency token check: if already injected with the same token, return cached result
+        if let Some(tok) = idempotency_token {
+            if card.idempotency_token.as_deref() == Some(tok)
+                && matches!(card.status, CardStatus::Injecting | CardStatus::Locked)
+            {
+                return Ok(CardInjectionResult {
+                    status: "already_injected".into(),
+                    card_id: card.id.clone(),
+                    screen,
+                    target_container: target_container.into(),
+                    merchant: card.merchant.clone(),
+                    card_status: card.status,
+                    card_number_masked: card.masked_card_number(),
+                    submitted: submit,
+                    commands: Vec::new(),
+                });
+            }
+        }
 
         if card.status != CardStatus::Active {
             bail!(
@@ -564,13 +695,63 @@ impl AgentCardEngine {
             );
         }
 
-        let cmds = self.build_injection_commands(&card, submit, split_exp);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
 
-        let masked_pan = card.masked_card_number();
-        let card_id_str = card.id.clone();
-        let card_merchant = card.merchant.clone();
+        if let Some(injected_at) = card.injected_at {
+            if now - injected_at < 60 {
+                bail!(
+                    "Double-submit prevented: card '{}' was injected recently at {}",
+                    card_id,
+                    injected_at
+                );
+            }
+        }
 
-        // Lock card immediately upon injection
+        let active_url = current_url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot inject card '{}': active tab URL must be verified before typing secrets",
+                card_id
+            )
+        })?;
+
+        validate_origin(active_url, &card.merchant)?;
+
+        if let Some(form_ok) = has_checkout_form {
+            if !form_ok {
+                bail!(
+                    "Cannot inject card '{}': no checkout form detected on active page '{}'",
+                    card_id,
+                    active_url
+                );
+            }
+        }
+
+        // Transition ACTIVE -> INJECTING (persisted to disk) BEFORE keystroke commands
+        let effective_tok = idempotency_token
+            .map(String::from)
+            .unwrap_or_else(|| format!("tok_{}", &uuid::Uuid::new_v4().to_string()[..8]));
+
+        let card_to_inject = {
+            let card = cards
+                .get_mut(card_id)
+                .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
+            card.status = CardStatus::Injecting;
+            card.injected_at = Some(now);
+            card.idempotency_token = Some(effective_tok);
+            card.clone()
+        };
+        self.write_raw(&cards)?;
+
+        let cmds = self.build_injection_commands(&card_to_inject, submit, split_exp);
+
+        let masked_pan = card_to_inject.masked_card_number();
+        let card_id_str = card_to_inject.id.clone();
+        let card_merchant = card_to_inject.merchant.clone();
+
+        // Transition INJECTING -> LOCKED immediately after typing
         let locked = self.lock_card(card_id)?;
 
         Ok(CardInjectionResult {
@@ -661,7 +842,7 @@ mod tests {
         assert_eq!(card.status, CardStatus::PendingApproval);
 
         // Cannot charge pending card
-        let err = engine.charge_card(&card.id, 10.0, None);
+        let err = engine.charge_card(&card.id, 10.0, None, None);
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("ACTIVE"));
 
@@ -670,16 +851,24 @@ mod tests {
         assert_eq!(approved.status, CardStatus::Active);
 
         // Charge exceeding limit fails
-        let over_err = engine.charge_card(&card.id, 40.0, None);
+        let over_err = engine.charge_card(&card.id, 40.0, None, None);
         assert!(over_err.is_err());
         assert!(over_err.unwrap_err().to_string().contains("exceeds"));
 
         // Charge within limit succeeds and locks card to CHARGED
-        let charged = engine.charge_card(&card.id, 30.0, None).unwrap();
+        let charged = engine
+            .charge_card(&card.id, 30.0, None, Some("charge-1"))
+            .unwrap();
         assert_eq!(charged.status, CardStatus::Charged);
 
-        // Cannot recharge card
-        let recharge_err = engine.charge_card(&card.id, 5.0, None);
+        // Idempotent charge replay with same key succeeds
+        let replay = engine
+            .charge_card(&card.id, 30.0, None, Some("charge-1"))
+            .unwrap();
+        assert_eq!(replay.status, CardStatus::Charged);
+
+        // Cannot recharge card with new or missing key
+        let recharge_err = engine.charge_card(&card.id, 5.0, None, None);
         assert!(recharge_err.is_err());
     }
 
@@ -695,7 +884,16 @@ mod tests {
         assert_eq!(card.status, CardStatus::Active);
 
         let res = engine
-            .inject_card(0, &card.id, "agent-computer", true, false)
+            .inject_card(
+                0,
+                &card.id,
+                "agent-computer",
+                true,
+                false,
+                Some("https://amazon.com/checkout"),
+                Some(true),
+                None,
+            )
             .unwrap();
         assert_eq!(res.status, "injected");
         assert_eq!(res.card_status, CardStatus::Locked);
@@ -703,8 +901,194 @@ mod tests {
         assert!(!res.commands.is_empty());
 
         // Card is now locked: cannot inject again
-        let err = engine.inject_card(0, &card.id, "agent-computer", false, false);
+        let err = engine.inject_card(
+            0,
+            &card.id,
+            "agent-computer",
+            false,
+            false,
+            Some("https://amazon.com/checkout"),
+            Some(true),
+            None,
+        );
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("ACTIVE"));
+    }
+
+    #[test]
+    fn test_origin_validation_and_form_check() {
+        let tmp_dir = TempDir::new();
+        let cards_file = tmp_dir.path().join("cards.json");
+        let mut engine = AgentCardEngine::new(Some(cards_file));
+
+        let card = engine
+            .mint_card("amazon.com", 20.0, 25.0, None, None)
+            .unwrap();
+
+        // 1. Phishing domain rejected
+        let phish_err = engine.inject_card(
+            0,
+            &card.id,
+            "agent-computer",
+            false,
+            false,
+            Some("https://evil-phish.com/checkout"),
+            Some(true),
+            None,
+        );
+        assert!(phish_err.is_err());
+        assert!(
+            phish_err
+                .unwrap_err()
+                .to_string()
+                .contains("Origin mismatch")
+        );
+
+        // 2. Insecure HTTP on non-localhost rejected
+        let http_err = engine.inject_card(
+            0,
+            &card.id,
+            "agent-computer",
+            false,
+            false,
+            Some("http://amazon.com/checkout"),
+            Some(true),
+            None,
+        );
+        assert!(http_err.is_err());
+        assert!(
+            http_err
+                .unwrap_err()
+                .to_string()
+                .contains("Insecure origin scheme")
+        );
+
+        // 3. Missing checkout form rejected
+        let form_err = engine.inject_card(
+            0,
+            &card.id,
+            "agent-computer",
+            false,
+            false,
+            Some("https://amazon.com/blog"),
+            Some(false),
+            None,
+        );
+        assert!(form_err.is_err());
+        assert!(
+            form_err
+                .unwrap_err()
+                .to_string()
+                .contains("no checkout form")
+        );
+
+        // 4. Missing active tab URL rejected
+        let no_url_err = engine.inject_card(
+            0,
+            &card.id,
+            "agent-computer",
+            false,
+            false,
+            None,
+            Some(true),
+            None,
+        );
+        assert!(no_url_err.is_err());
+        assert!(
+            no_url_err
+                .unwrap_err()
+                .to_string()
+                .contains("active tab URL must be verified")
+        );
+
+        // 5. Valid https subdomain matching eTLD+1 succeeds
+        let valid_res = engine.inject_card(
+            0,
+            &card.id,
+            "agent-computer",
+            false,
+            false,
+            Some("https://checkout.amazon.com/pay"),
+            Some(true),
+            None,
+        );
+        assert!(valid_res.is_ok());
+        assert_eq!(valid_res.unwrap().card_status, CardStatus::Locked);
+    }
+
+    #[test]
+    fn test_injecting_crash_recovery_and_idempotency() {
+        let tmp_dir = TempDir::new();
+        let cards_file = tmp_dir.path().join("cards.json");
+
+        // Manually write a card in INJECTING state to simulate crash during typing
+        let json_crash = serde_json::json!({
+            "card_crashed": {
+                "id": "card_crashed",
+                "card_number": "4111222233334444",
+                "exp_month": "12",
+                "exp_year": "28",
+                "cvv": "123",
+                "merchant": "amazon.com",
+                "spending_limit_usd": 20.0,
+                "currency": "USD",
+                "status": "INJECTING",
+                "created_at": 1000
+            }
+        });
+        std::fs::write(
+            &cards_file,
+            serde_json::to_string_pretty(&json_crash).unwrap(),
+        )
+        .unwrap();
+
+        let mut engine = AgentCardEngine::new(Some(cards_file.clone()));
+        let loaded = engine.get_card("card_crashed").unwrap();
+        // INJECTING status on load must be treated as LOCKED
+        assert_eq!(loaded.status, CardStatus::Locked);
+
+        // Cannot inject card that crashed mid-injection
+        let err = engine.inject_card(
+            0,
+            "card_crashed",
+            "agent-computer",
+            false,
+            false,
+            Some("https://amazon.com/checkout"),
+            Some(true),
+            None,
+        );
+        assert!(err.is_err());
+
+        // Test idempotency token replay
+        let active_card = engine
+            .mint_card("amazon.com", 20.0, 25.0, None, Some("card_idem"))
+            .unwrap();
+        let res1 = engine.inject_card(
+            0,
+            &active_card.id,
+            "agent-computer",
+            true,
+            false,
+            Some("https://amazon.com/checkout"),
+            Some(true),
+            Some("token_xyz_1"),
+        );
+        assert!(res1.is_ok());
+        assert_eq!(res1.unwrap().status, "injected");
+
+        // Retrying with same idempotency token returns already_injected without double submitting
+        let res2 = engine.inject_card(
+            0,
+            &active_card.id,
+            "agent-computer",
+            true,
+            false,
+            Some("https://amazon.com/checkout"),
+            Some(true),
+            Some("token_xyz_1"),
+        );
+        assert!(res2.is_ok());
+        assert_eq!(res2.unwrap().status, "already_injected");
     }
 }

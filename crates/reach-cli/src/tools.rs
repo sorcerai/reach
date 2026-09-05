@@ -13,6 +13,93 @@ pub struct ToolContext<'a> {
     pub agent: Option<&'a crate::agent::AgentState>,
     pub profile_broker: Option<&'a crate::profile::ProfileBroker>,
     pub cookie_jars: Option<&'a crate::profile::CookieJarService>,
+    pub owner: Option<String>,
+}
+
+pub fn resolve_owner(
+    ctx: &ToolContext<'_>,
+    args: &serde_json::Value,
+    screen: u32,
+) -> Option<String> {
+    if let Some(owner) = &ctx.owner {
+        if !owner.trim().is_empty() {
+            return Some(owner.clone());
+        }
+    }
+    if let Some(owner) = args.get("owner").and_then(|v| v.as_str()) {
+        if !owner.trim().is_empty() {
+            return Some(owner.to_string());
+        }
+    }
+    if let Some(agent) = ctx.agent {
+        if let Some(info) = agent.screen_info(screen) {
+            if let Some(owner) = info.owner {
+                if !owner.trim().is_empty() {
+                    return Some(owner);
+                }
+            }
+        }
+    }
+    None
+}
+
+pub fn profile_lock_error_value(err: &crate::profile::ProfileLockError) -> serde_json::Value {
+    match err {
+        crate::profile::ProfileLockError::Locked { profile, holder } => {
+            serde_json::json!({
+                "error": "profile_locked",
+                "profile": profile,
+                "holder": holder,
+            })
+        }
+        crate::profile::ProfileLockError::Timeout {
+            profile,
+            timeout_ms,
+            holder,
+        } => serde_json::json!({
+            "error": "profile_lock_timeout",
+            "profile": profile,
+            "timeout_ms": timeout_ms,
+            "holder": holder,
+        }),
+        crate::profile::ProfileLockError::Io { profile, source } => {
+            serde_json::json!({
+                "error": "profile_lock_io_error",
+                "profile": profile,
+                "message": source.to_string(),
+            })
+        }
+    }
+}
+
+pub fn acquire_tool_profile_lease(
+    ctx: &ToolContext<'_>,
+    tool: &str,
+    args: &serde_json::Value,
+    screen: u32,
+) -> Result<Option<crate::profile::ProfileLease>, ToolResponse> {
+    if tool != "browse" && tool != "page_text" {
+        return Ok(None);
+    }
+
+    if let Some(broker) = ctx.profile_broker {
+        let (profile_name, _) = resolve_profile_name(args, screen);
+        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let owner = resolve_owner(ctx, args, screen);
+        let holder =
+            crate::profile::LockHolderInfo::new(Some(screen), Some(tool.to_string()), owner);
+        match broker.acquire_with_holder(&profile_name, timeout_ms, Some(holder)) {
+            Ok(lease) => Ok(Some(lease)),
+            Err(e) => {
+                let err_val = profile_lock_error_value(&e);
+                Err(ToolResponse::error(
+                    serde_json::to_string(&err_val).unwrap_or_else(|_| e.to_string()),
+                ))
+            }
+        }
+    } else {
+        Ok(None)
+    }
 }
 
 /// Resolve the noVNC URL for a sandbox using the configured public host.
@@ -198,13 +285,18 @@ pub async fn dispatch(
         }
     }
 
+    let _profile_lease = match acquire_tool_profile_lease(ctx, tool, args, screen) {
+        Ok(l) => l,
+        Err(err_resp) => return err_resp,
+    };
+
     let _busy_guard = if is_active_tool(tool) {
         ctx.agent.map(|a| a.mark_busy(screen))
     } else {
         None
     };
 
-    match tool {
+    let resp = match tool {
         "screenshot" => match ctx.docker.screenshot(target, &display).await {
             Ok(bytes) => {
                 use base64::Engine;
@@ -267,25 +359,6 @@ pub async fn dispatch(
                 profile_name.clone()
             } else {
                 ProfileMount::container_path_for(&profile_name)
-            };
-
-            let _lease = if let Some(broker) = ctx.profile_broker {
-                let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                let holder = crate::profile::LockHolderInfo::new(
-                    Some(screen),
-                    Some("browse".to_string()),
-                    None,
-                );
-                match broker.acquire_with_holder(&profile_name, timeout_ms, Some(holder)) {
-                    Ok(l) => Some(l),
-                    Err(e) => {
-                        return ToolResponse::error(format!(
-                            "profile '{profile_name}' is locked: {e}"
-                        ));
-                    }
-                }
-            } else {
-                None
             };
 
             let declared_jars = parse_jars(args);
@@ -359,25 +432,6 @@ pub async fn dispatch(
                 profile_name.clone()
             } else {
                 ProfileMount::container_path_for(&profile_name)
-            };
-
-            let _lease = if let Some(broker) = ctx.profile_broker {
-                let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                let holder = crate::profile::LockHolderInfo::new(
-                    Some(screen),
-                    Some("page_text".to_string()),
-                    None,
-                );
-                match broker.acquire_with_holder(&profile_name, timeout_ms, Some(holder)) {
-                    Ok(l) => Some(l),
-                    Err(e) => {
-                        return ToolResponse::error(format!(
-                            "profile '{profile_name}' is locked: {e}"
-                        ));
-                    }
-                }
-            } else {
-                None
             };
 
             let declared_jars = parse_jars(args);
@@ -459,9 +513,9 @@ pub async fn dispatch(
                 Ok(out) => {
                     if let Some(agent) = ctx.agent {
                         if out.status == "auth_required" {
-                            agent.set_takeover(screen, true, Some(vnc.clone()));
+                            let _ = agent.set_takeover(screen, true, Some(vnc.clone()));
                         } else if out.status == "authenticated" {
-                            agent.set_takeover(screen, false, None);
+                            let _ = agent.set_takeover(screen, false, None);
                         }
                     }
                     let body = serde_json::json!({
@@ -520,7 +574,20 @@ pub async fn dispatch(
             Err(e) => ToolResponse::error(e.to_string()),
         },
         _ => ToolResponse::error(format!("unknown tool: {tool}")),
+    };
+
+    if let Some(agent) = ctx.agent {
+        if let Some(info) = agent.screen_info(screen) {
+            if info.phase == crate::agent::ScreenPhase::HumanActive {
+                return ToolResponse::error(format!(
+                    "executed_during_takeover: screen {screen} transitioned to HumanActive (handoff_gen: {})",
+                    info.handoff_gen
+                ));
+            }
+        }
     }
+
+    resp
 }
 
 async fn sh(ctx: &ToolContext<'_>, target: &str, screen: u32, cmd: &str) -> ToolResponse {
@@ -685,6 +752,7 @@ mod tests {
             agent: None,
             profile_broker: None,
             cookie_jars: None,
+            owner: None,
         };
 
         // Command injection attempt should be rejected before shell execution
@@ -702,5 +770,41 @@ mod tests {
         });
         let resp2 = dispatch(&ctx, "key", &empty_payload, "test-sandbox").await;
         assert!(resp2.is_error);
+    }
+
+    #[tokio::test]
+    async fn test_dispatch_acquires_and_releases_profile_lease_with_holder_info() {
+        let docker = DockerClient::new(None).unwrap();
+        let broker = crate::profile::ProfileBroker::new(std::path::PathBuf::from(
+            "/tmp/reach-test-profile-dispatch",
+        ));
+        let ctx = ToolContext {
+            docker: &docker,
+            public_host: "localhost".into(),
+            agent: None,
+            profile_broker: Some(&broker),
+            cookie_jars: None,
+            owner: Some("test-agent".into()),
+        };
+
+        // Pre-lock profile "work"
+        let _lease = broker.acquire("work", 0).expect("acquire should succeed");
+
+        let args = serde_json::json!({
+            "url": "https://example.com",
+            "use_profile": "work",
+            "screen": 1,
+        });
+
+        // Calling browse should fail with profile_locked error
+        let resp = dispatch(&ctx, "browse", &args, "test-sandbox").await;
+        assert!(resp.is_error);
+        let content_text = match &resp.content[0] {
+            crate::mcp::ContentBlock::Text { text } => text,
+            _ => panic!("expected text content"),
+        };
+        let err_json: serde_json::Value = serde_json::from_str(content_text).unwrap();
+        assert_eq!(err_json["error"], "profile_locked");
+        assert_eq!(err_json["profile"], "work");
     }
 }

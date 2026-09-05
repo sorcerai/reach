@@ -81,6 +81,9 @@ pub struct ChargeArgs {
 
     #[arg(long, help = "Merchant domain")]
     pub merchant: Option<String>,
+
+    #[arg(long, help = "Optional idempotency key")]
+    pub idempotency_key: Option<String>,
 }
 
 #[derive(Args, Debug)]
@@ -99,6 +102,12 @@ pub struct InjectArgs {
 
     #[arg(long, help = "Split expiration into month then Tab then year")]
     pub split_exp: bool,
+
+    #[arg(long, help = "Active page URL for origin check")]
+    pub current_url: Option<String>,
+
+    #[arg(long, help = "Idempotency token to prevent double-submitting")]
+    pub idempotency_token: Option<String>,
 }
 
 pub async fn run(args: CardArgs) -> anyhow::Result<()> {
@@ -124,6 +133,7 @@ pub async fn run(args: CardArgs) -> anyhow::Result<()> {
                     .map(|s| match s.to_uppercase().as_str() {
                         "PENDING_APPROVAL" => CardStatus::PendingApproval,
                         "ACTIVE" => CardStatus::Active,
+                        "INJECTING" => CardStatus::Injecting,
                         "CHARGED" => CardStatus::Charged,
                         "LOCKED" => CardStatus::Locked,
                         "EXPIRED" => CardStatus::Expired,
@@ -153,6 +163,7 @@ pub async fn run(args: CardArgs) -> anyhow::Result<()> {
                     let status_colored = match c.status {
                         CardStatus::Active => status_str.green().to_string(),
                         CardStatus::PendingApproval => status_str.yellow().to_string(),
+                        CardStatus::Injecting => status_str.yellow().to_string(),
                         CardStatus::Charged => status_str.blue().to_string(),
                         CardStatus::Locked => status_str.red().to_string(),
                         CardStatus::Expired => status_str.dimmed().to_string(),
@@ -184,6 +195,7 @@ pub async fn run(args: CardArgs) -> anyhow::Result<()> {
                 &charge_args.id,
                 charge_args.amount,
                 charge_args.merchant.as_deref(),
+                charge_args.idempotency_key.as_deref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&card.to_safe_view())?);
         }
@@ -194,6 +206,9 @@ pub async fn run(args: CardArgs) -> anyhow::Result<()> {
                 &inj_args.container,
                 inj_args.submit,
                 inj_args.split_exp,
+                inj_args.current_url.as_deref(),
+                None,
+                inj_args.idempotency_token.as_deref(),
             )?;
             println!("{}", serde_json::to_string_pretty(&res)?);
         }

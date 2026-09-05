@@ -25,6 +25,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         agent: None,
         profile_broker: Some(&profile_broker),
         cookie_jars: Some(&cookie_jars),
+        owner: None,
     };
 
     tracing::info!(target = args.target, "MCP stdio bridge started");

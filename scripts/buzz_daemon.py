@@ -324,9 +324,12 @@ def buzz_list_channels(
 class ReachApiClient:
     """HTTP Client for Reach Screen Leasing and Handoff State Machine."""
 
+    handoff_gen: Optional[int] = None
+
     def __init__(self, api_url: str = DEFAULT_API_URL, lease_token: Optional[str] = None) -> None:
         self.api_url = api_url.rstrip("/")
         self.lease_token = lease_token
+        self.handoff_gen = None
 
     def lease_screen(self, screen: int, owner: str = "ReachBot") -> Dict[str, Any]:
         """POST /agent/screens/{screen}/lease."""
@@ -341,8 +344,11 @@ class ReachApiClient:
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8") or "{}")
-                if isinstance(data, dict) and data.get("token"):
-                    self.lease_token = data["token"]
+                if isinstance(data, dict):
+                    if data.get("token"):
+                        self.lease_token = data["token"]
+                    if "handoff_gen" in data:
+                        self.handoff_gen = int(data["handoff_gen"])
                 return data
         except urllib.error.HTTPError as err:
             body = err.read().decode("utf-8", errors="replace")
@@ -405,7 +411,10 @@ class ReachApiClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8") or "{}")
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+                if isinstance(data, dict) and "handoff_gen" in data:
+                    self.handoff_gen = int(data["handoff_gen"])
+                return data
         except Exception as exc:
             logger.warning("Request takeover for screen %s failed: %s", screen, exc)
             return {"error": str(exc)}
@@ -442,7 +451,10 @@ class ReachApiClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8") or "{}")
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+                if isinstance(data, dict) and "handoff_gen" in data:
+                    self.handoff_gen = int(data["handoff_gen"])
+                return data
         except Exception as exc:
             logger.error("Ack handback for screen %s failed: %s", screen, exc)
             return {"status": "error", "error": str(exc)}
@@ -506,6 +518,7 @@ class BuzzDaemon:
         self,
         screen: int,
         lease_token: Optional[str] = None,
+        handoff_gen: Optional[int] = None,
         step_callback: Optional[Callable[[StepRecord], None]] = None,
     ) -> ReachDriver:
         return ReachDriver(
@@ -514,6 +527,7 @@ class BuzzDaemon:
             model=self.model,
             max_steps=self.max_steps,
             lease_token=lease_token,
+            handoff_gen=handoff_gen,
             step_callback=step_callback,
             enable_audit=True,
             interactive=False,
@@ -545,7 +559,17 @@ class BuzzDaemon:
             novnc_url,
         )
 
-        # 1. Post takeover alert to Buzz thread with direct noVNC link
+        # 1. Inform Reach agent state machine and retrieve takeover URL (with human_token if minted)
+        takeover_res = self.reach_client.request_takeover(
+            screen=screen,
+            reason=reason,
+            novnc_url=novnc_url,
+            token=token,
+        )
+        if isinstance(takeover_res, dict) and takeover_res.get("takeover_url"):
+            novnc_url = takeover_res["takeover_url"]
+
+        # 2. Post takeover alert to Buzz thread with direct noVNC link
         buzz_send_takeover_alert(
             channel=channel,
             screen=screen,
@@ -554,14 +578,6 @@ class BuzzDaemon:
             reply_to=reply_to,
             relay_url=self.relay_url,
             private_key=self.private_key,
-        )
-
-        # 2. Inform Reach agent state machine
-        self.reach_client.request_takeover(
-            screen=screen,
-            reason=reason,
-            novnc_url=novnc_url,
-            token=token,
         )
 
         # 3. Poll / wait for HumanDone phase
@@ -670,11 +686,20 @@ class BuzzDaemon:
                     logger.warning("Failed to post visual diff update: %s", post_err)
 
             # 4. Invoke driving loop
-            driver = self.driver_factory(
-                screen=task.screen,
-                lease_token=lease_token,
-                step_callback=on_step_callback,
-            )
+            handoff_gen = getattr(self.reach_client, "handoff_gen", None)
+            try:
+                driver = self.driver_factory(
+                    screen=task.screen,
+                    lease_token=lease_token,
+                    handoff_gen=handoff_gen,
+                    step_callback=on_step_callback,
+                )
+            except TypeError:
+                driver = self.driver_factory(
+                    screen=task.screen,
+                    lease_token=lease_token,
+                    step_callback=on_step_callback,
+                )
             driver_result = driver.drive(goal=task.goal, initial_url=task.initial_url)
 
             # 5. Interactive takeover integration
@@ -689,11 +714,20 @@ class BuzzDaemon:
                 if handback_success:
                     # Resume execution after handback
                     logger.info("Resuming CUA execution post-handback for goal: %s", task.goal)
-                    resume_driver = self.driver_factory(
-                        screen=task.screen,
-                        lease_token=lease_token,
-                        step_callback=on_step_callback,
-                    )
+                    resumed_gen = getattr(self.reach_client, "handoff_gen", None)
+                    try:
+                        resume_driver = self.driver_factory(
+                            screen=task.screen,
+                            lease_token=lease_token,
+                            handoff_gen=resumed_gen,
+                            step_callback=on_step_callback,
+                        )
+                    except TypeError:
+                        resume_driver = self.driver_factory(
+                            screen=task.screen,
+                            lease_token=lease_token,
+                            step_callback=on_step_callback,
+                        )
                     driver_result = resume_driver.drive(
                         goal=f"Complete remaining tasks for: {task.goal}"
                     )
