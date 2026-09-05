@@ -771,6 +771,7 @@ impl DockerClient {
             "selector": opts.selector,
             "timeout_ms": opts.timeout_ms,
             "user_data_dir": opts.user_data_dir,
+            "hydrated_cookies": opts.hydrated_cookies,
         });
 
         let payload_str =
@@ -969,6 +970,7 @@ pub struct PageTextOptions {
     /// Persistent Chrome user data dir inside the container.
     pub user_data_dir: Option<String>,
     pub display: Option<String>,
+    pub hydrated_cookies: Option<Vec<crate::profile::Cookie>>,
 }
 
 /// Parsed output from the embedded `page_text` Python helper.
@@ -983,6 +985,8 @@ pub struct PageTextOutput {
     pub title: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
+    #[serde(default)]
+    pub cookies: Vec<crate::profile::Cookie>,
 }
 
 /// Inputs to [`DockerClient::auth_handoff`].
@@ -1066,6 +1070,7 @@ wait_for = payload.get("wait_for")
 selector = payload.get("selector")
 timeout_ms = int(payload.get("timeout_ms") or 30000)
 user_data_dir = payload.get("user_data_dir")
+hydrated_cookies = payload.get("hydrated_cookies") or []
 
 if not url:
     print(json.dumps({"status": "error", "message": "missing url"}))
@@ -1088,9 +1093,19 @@ try:
                 headless=False,
                 args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
             )
+            if hydrated_cookies:
+                try:
+                    import time
+                    now = time.time()
+                    for c in hydrated_cookies:
+                        if c.get("expires", -1) <= 0:
+                            c["expires"] = int(now + 86400 * 30)
+                    ctx.add_cookies(hydrated_cookies)
+                except Exception:
+                    pass
             has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
             state_file = "/workspace/.reach/state.json"
-            if not has_cookies and os.path.exists(state_file):
+            if not has_cookies and not hydrated_cookies and os.path.exists(state_file):
                 try:
                     with open(state_file) as f:
                         state = json.load(f)
@@ -1119,6 +1134,16 @@ try:
                     ctx = browser.new_context()
             else:
                 ctx = browser.new_context()
+            if hydrated_cookies:
+                try:
+                    import time
+                    now = time.time()
+                    for c in hydrated_cookies:
+                        if c.get("expires", -1) <= 0:
+                            c["expires"] = int(now + 86400 * 30)
+                    ctx.add_cookies(hydrated_cookies)
+                except Exception:
+                    pass
             page = ctx.new_page()
             owner = browser
 
@@ -1138,11 +1163,17 @@ try:
             else:
                 text = page.locator("body").inner_text()
 
+            try:
+                cookies_out = ctx.cookies()
+            except Exception:
+                cookies_out = []
+
             result = {
                 "status": "ok",
                 "url": page.url,
                 "title": page.title(),
                 "text": text,
+                "cookies": cookies_out,
             }
         finally:
             try:

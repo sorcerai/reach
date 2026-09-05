@@ -45,6 +45,8 @@ pub struct AppState {
     pub bind_host: String,
     pub auth_token: Option<String>,
     pub agent: AgentState,
+    pub profile_broker: Arc<reach_cli::profile::ProfileBroker>,
+    pub cookie_jars: Arc<reach_cli::profile::CookieJarService>,
 }
 
 impl AppState {
@@ -110,6 +112,13 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/agent/screens/{id}/lease", post(agent_lease_handler))
         .route("/agent/screens/{id}/lease", delete(agent_release_handler))
         .route("/agent/screens/{id}/takeover", post(agent_takeover_handler))
+        .route("/agent/screens/{id}/handback", post(agent_handback_handler))
+        .route("/agent/screens/{id}/ack", post(agent_ack_handler))
+        .route("/agent/screens/{id}/wait", get(agent_wait_handler))
+        .route(
+            "/agent/screens/{id}/connected",
+            post(agent_connected_handler),
+        )
         .route("/tools", get(tools_list_handler).post(tools_post_handler))
         .route("/tools/{tool}", post(tool_call_handler))
         .layer(axum::middleware::from_fn_with_state(
@@ -146,6 +155,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .or_else(|| std::env::var("REACH_AUTH_TOKEN").ok())
         .filter(|t| !t.trim().is_empty());
 
+    let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::default_broker());
+    let cookie_jars = Arc::new(reach_cli::profile::CookieJarService::default_service());
     let state = Arc::new(AppState {
         docker,
         default_sandbox: args.sandbox,
@@ -153,6 +164,8 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         bind_host: host.clone(),
         auth_token,
         agent,
+        profile_broker,
+        cookie_jars,
     });
 
     println!("Live view host: {}", state.public_host);
@@ -278,7 +291,10 @@ async fn agent_screens_handler(
         .map(|s| ScreenInfoResponse {
             id: s.id,
             owner: s.owner,
+            phase: s.phase,
+            handoff_gen: s.handoff_gen,
             takeover_pending: s.takeover_pending,
+            takeover_reason: s.takeover_reason,
             takeover_url: s.takeover_url,
             leased_at: s.leased_at,
             novnc_url: novnc_url(&state.public_host, novnc_base + s.id as u16),
@@ -306,11 +322,79 @@ fn default_release_owner() -> String {
     "default".to_string()
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Default, serde::Deserialize)]
 pub struct TakeoverRequest {
-    pub pending: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
     #[serde(default)]
     pub url: Option<String>,
+    #[serde(default)]
+    pub pending: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+pub struct WaitQuery {
+    #[serde(default)]
+    pub phase: Option<String>,
+    #[serde(default)]
+    pub timeout: Option<u64>,
+}
+
+fn validate_tool_screen(
+    state: &AppState,
+    screen: u32,
+    headers: &HeaderMap,
+) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(active_token) = state.agent.lease_token(screen) {
+        let provided = headers.get("x-lease-token").and_then(|v| v.to_str().ok());
+        if provided != Some(&active_token) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "forbidden: invalid or missing X-Lease-Token for leased screen"
+                })),
+            ));
+        }
+    }
+
+    if let Some(info) = state.agent.screen_info(screen) {
+        if let Some(gen_hdr) = headers.get("x-handoff-gen").and_then(|v| v.to_str().ok()) {
+            if let Ok(expected_gen) = gen_hdr.trim().parse::<u64>() {
+                if expected_gen != info.handoff_gen {
+                    return Err((
+                        StatusCode::CONFLICT,
+                        Json(serde_json::json!({
+                            "error": "stale_plan",
+                            "expected_gen": info.handoff_gen,
+                            "provided_gen": expected_gen,
+                        })),
+                    ));
+                }
+            } else {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "error": "invalid X-Handoff-Gen header"
+                    })),
+                ));
+            }
+        }
+
+        if info.phase != reach_cli::agent::ScreenPhase::AgentActive
+            && info.phase != reach_cli::agent::ScreenPhase::Idle
+        {
+            return Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "takeover_active",
+                    "phase": info.phase,
+                    "handoff_gen": info.handoff_gen,
+                })),
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 async fn agent_lease_handler(
@@ -383,8 +467,156 @@ async fn agent_takeover_handler(
         }
     }
 
-    state.agent.set_takeover(id, body.pending, body.url);
-    Ok(Json(serde_json::json!({ "status": "ok", "id": id })))
+    if body.pending == Some(false) {
+        state.agent.set_takeover(id, false, None);
+        return Ok(Json(serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "phase": state.agent.phase(id),
+            "handoff_gen": state.agent.handoff_gen(id),
+        })));
+    }
+
+    match state.agent.request_takeover(id, body.reason, body.url) {
+        Ok(screen) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "phase": screen.phase,
+            "handoff_gen": screen.handoff_gen,
+        }))),
+        Err(e) => {
+            let status = match e {
+                reach_cli::agent::TakeoverError::NotFound(_) => StatusCode::NOT_FOUND,
+                reach_cli::agent::TakeoverError::InvalidPhase { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            Err((status, Json(serde_json::json!({ "error": e.to_string() }))))
+        }
+    }
+}
+
+async fn agent_handback_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match state.agent.human_handback(id) {
+        Ok(screen) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "phase": screen.phase,
+            "handoff_gen": screen.handoff_gen,
+        }))),
+        Err(e) => {
+            let status = match e {
+                reach_cli::agent::TakeoverError::NotFound(_) => StatusCode::NOT_FOUND,
+                reach_cli::agent::TakeoverError::InvalidPhase { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            Err((status, Json(serde_json::json!({ "error": e.to_string() }))))
+        }
+    }
+}
+
+async fn agent_ack_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    if let Some(active_token) = state.agent.lease_token(id) {
+        let provided = headers.get("x-lease-token").and_then(|v| v.to_str().ok());
+        if provided != Some(&active_token) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "forbidden: invalid or missing X-Lease-Token for leased screen"
+                })),
+            ));
+        }
+    }
+
+    match state.agent.agent_ack(id) {
+        Ok(screen) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "phase": screen.phase,
+            "handoff_gen": screen.handoff_gen,
+        }))),
+        Err(e) => {
+            let status = match e {
+                reach_cli::agent::TakeoverError::NotFound(_) => StatusCode::NOT_FOUND,
+                reach_cli::agent::TakeoverError::InvalidPhase { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            Err((status, Json(serde_json::json!({ "error": e.to_string() }))))
+        }
+    }
+}
+
+async fn agent_connected_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    match state.agent.human_connected(id) {
+        Ok(screen) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "phase": screen.phase,
+            "handoff_gen": screen.handoff_gen,
+        }))),
+        Err(e) => {
+            let status = match e {
+                reach_cli::agent::TakeoverError::NotFound(_) => StatusCode::NOT_FOUND,
+                reach_cli::agent::TakeoverError::InvalidPhase { .. } => StatusCode::CONFLICT,
+                _ => StatusCode::BAD_REQUEST,
+            };
+            Err((status, Json(serde_json::json!({ "error": e.to_string() }))))
+        }
+    }
+}
+
+async fn agent_wait_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+    axum::extract::Query(query): axum::extract::Query<WaitQuery>,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let target_phase = match query.phase.as_deref() {
+        Some(s) => match s.parse::<reach_cli::agent::ScreenPhase>() {
+            Ok(p) => p,
+            Err(e) => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({ "error": e })),
+                ));
+            }
+        },
+        None => reach_cli::agent::ScreenPhase::HumanDone,
+    };
+
+    let timeout_secs = query.timeout.unwrap_or(600);
+    let timeout = std::time::Duration::from_secs(timeout_secs);
+
+    match state.agent.wait_for_phase(id, target_phase, timeout).await {
+        Ok(screen) => Ok(Json(serde_json::json!({
+            "status": "ok",
+            "id": id,
+            "phase": screen.phase,
+            "handoff_gen": screen.handoff_gen,
+        }))),
+        Err(reach_cli::agent::WaitError::NotFound(sid)) => Err((
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": format!("screen {sid} not found") })),
+        )),
+        Err(reach_cli::agent::WaitError::Timeout {
+            id: sid,
+            phase,
+            handoff_gen,
+        }) => Ok(Json(serde_json::json!({
+            "status": "timeout",
+            "id": sid,
+            "phase": phase,
+            "handoff_gen": handoff_gen,
+        }))),
+    }
 }
 
 async fn mcp_handler(
@@ -395,17 +627,7 @@ async fn mcp_handler(
     if req.method == "tools/call" {
         let args = req.params.get("arguments").cloned().unwrap_or_default();
         let screen = reach_cli::tools::screen_for(&args);
-        if let Some(active_token) = state.agent.lease_token(screen) {
-            let provided = headers.get("x-lease-token").and_then(|v| v.to_str().ok());
-            if provided != Some(&active_token) {
-                return Err((
-                    StatusCode::FORBIDDEN,
-                    Json(serde_json::json!({
-                        "error": "forbidden: invalid or missing X-Lease-Token for leased screen"
-                    })),
-                ));
-            }
-        }
+        validate_tool_screen(&state, screen, &headers)?;
     }
 
     Ok(Json(handle_mcp(&state, &req).await))
@@ -428,17 +650,64 @@ async fn tool_call_handler(
     Json(args): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let screen = reach_cli::tools::screen_for(&args);
-    if let Some(active_token) = state.agent.lease_token(screen) {
-        let provided = headers.get("x-lease-token").and_then(|v| v.to_str().ok());
-        if provided != Some(&active_token) {
-            return Err((
-                StatusCode::FORBIDDEN,
-                Json(serde_json::json!({
-                    "error": "forbidden: invalid or missing X-Lease-Token for leased screen"
-                })),
-            ));
+    validate_tool_screen(&state, screen, &headers)?;
+
+    let _profile_lease = if tool == "browse" || tool == "page_text" {
+        let (profile_name, _) = reach_cli::tools::resolve_profile_name(&args, screen);
+        let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+        let holder = reach_cli::profile::LockHolderInfo::new(
+            Some(screen),
+            Some(tool.clone()),
+            headers
+                .get("x-owner")
+                .and_then(|v| v.to_str().ok())
+                .map(String::from),
+        );
+        match state
+            .profile_broker
+            .acquire_with_holder(&profile_name, timeout_ms, Some(holder))
+        {
+            Ok(lease) => Some(lease),
+            Err(e) => {
+                let status = match e {
+                    reach_cli::profile::ProfileLockError::Locked { .. } => StatusCode::LOCKED,
+                    reach_cli::profile::ProfileLockError::Timeout { .. } => StatusCode::LOCKED,
+                    reach_cli::profile::ProfileLockError::Io { .. } => {
+                        StatusCode::INTERNAL_SERVER_ERROR
+                    }
+                };
+                let err_body = match e {
+                    reach_cli::profile::ProfileLockError::Locked { profile, holder } => {
+                        serde_json::json!({
+                            "error": "profile_locked",
+                            "profile": profile,
+                            "holder": holder,
+                        })
+                    }
+                    reach_cli::profile::ProfileLockError::Timeout {
+                        profile,
+                        timeout_ms,
+                        holder,
+                    } => serde_json::json!({
+                        "error": "profile_lock_timeout",
+                        "profile": profile,
+                        "timeout_ms": timeout_ms,
+                        "holder": holder,
+                    }),
+                    reach_cli::profile::ProfileLockError::Io { profile, source } => {
+                        serde_json::json!({
+                            "error": "profile_lock_io_error",
+                            "profile": profile,
+                            "message": source.to_string(),
+                        })
+                    }
+                };
+                return Err((status, Json(err_body)));
+            }
         }
-    }
+    } else {
+        None
+    };
 
     let sandbox_arg = args.get("sandbox").and_then(|v| v.as_str());
     let target = match resolve_sandbox(&state, sandbox_arg).await {
@@ -455,6 +724,8 @@ async fn tool_call_handler(
         docker: &state.docker,
         public_host: state.public_host.clone(),
         agent: Some(&state.agent),
+        profile_broker: Some(&state.profile_broker),
+        cookie_jars: Some(&state.cookie_jars),
     };
     let result = dispatch(&ctx, &tool, &args, &target).await;
     Ok(Json(serde_json::to_value(result).unwrap_or_default()))
@@ -513,6 +784,8 @@ async fn handle_mcp(state: &AppState, req: &JsonRpcRequest) -> JsonRpcResponse {
                 docker: &state.docker,
                 public_host: state.public_host.clone(),
                 agent: Some(&state.agent),
+                profile_broker: Some(&state.profile_broker),
+                cookie_jars: Some(&state.cookie_jars),
             };
             let result = dispatch(&ctx, tool, &args, &target).await;
             JsonRpcResponse::success(req.id.clone(), serde_json::to_value(result).unwrap())
@@ -538,6 +811,12 @@ mod tests {
     fn test_state(auth_token: Option<&str>) -> Arc<AppState> {
         let docker = DockerClient::new(None).unwrap();
         let agent = AgentState::new(2);
+        let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::new(
+            std::path::PathBuf::from("/tmp/reach-test-profiles"),
+        ));
+        let cookie_jars = Arc::new(reach_cli::profile::CookieJarService::new(
+            std::path::PathBuf::from("/tmp/reach-test-jars"),
+        ));
         Arc::new(AppState {
             docker,
             default_sandbox: None,
@@ -545,6 +824,8 @@ mod tests {
             bind_host: "127.0.0.1".into(),
             auth_token: auth_token.map(String::from),
             agent,
+            profile_broker,
+            cookie_jars,
         })
     }
 
@@ -868,5 +1149,206 @@ mod tests {
             .unwrap();
         let res = app.oneshot(req).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_takeover_state_machine_http_endpoints_and_gating() {
+        let state = test_state(None);
+        let app = build_app(state.clone());
+
+        // 1. Lease screen 0 for an agent
+        let lease = state.agent.lease_screen(0, "agent-eva").unwrap();
+        assert_eq!(state.agent.handoff_gen(0), Some(1));
+        assert_eq!(
+            state.agent.phase(0),
+            Some(reach_cli::agent::ScreenPhase::AgentActive)
+        );
+
+        // Tool execution with correct X-Handoff-Gen = 1 passes phase validation
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tools/click")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .header("X-Lease-Token", &lease.token)
+            .header("X-Handoff-Gen", "1")
+            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        // Since docker client in test_state is a dummy, dispatch may fail with internal server error
+        // or 500 when resolving sandbox, but it MUST NOT be 409!
+        assert_ne!(res.status(), StatusCode::CONFLICT);
+
+        // Tool execution with stale X-Handoff-Gen = 99 -> 409 Conflict {"error": "stale_plan"}
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tools/click")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .header("X-Lease-Token", &lease.token)
+            .header("X-Handoff-Gen", "99")
+            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json.get("error").unwrap(), "stale_plan");
+
+        // 2. POST /agent/screens/0/takeover with reason and url -> moves to HandoffPending, gen increments to 2
+        let req = Request::builder()
+            .method("POST")
+            .uri("/agent/screens/0/takeover")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .header("X-Lease-Token", &lease.token)
+            .body(Body::from(
+                r#"{"reason": "CAPTCHA challenge", "url": "http://127.0.0.1:6080/vnc.html"}"#,
+            ))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            state.agent.phase(0),
+            Some(reach_cli::agent::ScreenPhase::HandoffPending)
+        );
+        assert_eq!(state.agent.handoff_gen(0), Some(2));
+
+        // 3. Tool execution while takeover is active -> 409 Conflict {"error": "takeover_active", ...}
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tools/click")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .header("X-Lease-Token", &lease.token)
+            .header("X-Handoff-Gen", "2")
+            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json.get("error").unwrap(), "takeover_active");
+        assert_eq!(body_json.get("phase").unwrap(), "HandoffPending");
+        assert_eq!(body_json.get("handoff_gen").unwrap(), 2);
+
+        // Also test MCP endpoint tool call gets 409 Conflict
+        let mcp_call = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "click",
+                "arguments": { "screen": 0, "x": 10, "y": 10 }
+            }
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .header("X-Lease-Token", &lease.token)
+            .body(Body::from(serde_json::to_vec(&mcp_call).unwrap()))
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // 4. POST /agent/screens/0/handback (e.g. human clicks banner) -> moves to HumanDone, gen increments to 3
+        let req = Request::builder()
+            .method("POST")
+            .uri("/agent/screens/0/handback")
+            .header("Host", "127.0.0.1:4200")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            state.agent.phase(0),
+            Some(reach_cli::agent::ScreenPhase::HumanDone)
+        );
+        assert_eq!(state.agent.handoff_gen(0), Some(3));
+
+        // 5. GET /agent/screens/0/wait?phase=HumanDone returns immediately since already HumanDone
+        let req = Request::builder()
+            .method("GET")
+            .uri("/agent/screens/0/wait?phase=HumanDone&timeout=5")
+            .header("Host", "127.0.0.1:4200")
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json.get("status").unwrap(), "ok");
+        assert_eq!(body_json.get("phase").unwrap(), "HumanDone");
+        assert_eq!(body_json.get("handoff_gen").unwrap(), 3);
+
+        // 6. POST /agent/screens/0/ack -> moves HumanDone to AgentActive, gen increments to 4
+        let req = Request::builder()
+            .method("POST")
+            .uri("/agent/screens/0/ack")
+            .header("Host", "127.0.0.1:4200")
+            .header("X-Lease-Token", &lease.token)
+            .body(Body::empty())
+            .unwrap();
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(
+            state.agent.phase(0),
+            Some(reach_cli::agent::ScreenPhase::AgentActive)
+        );
+        assert_eq!(state.agent.handoff_gen(0), Some(4));
+
+        // 7. After ack, tool execution with gen 4 is no longer rejected with 409
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tools/click")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .header("X-Lease-Token", &lease.token)
+            .header("X-Handoff-Gen", "4")
+            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_ne!(res.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_tool_call_locked_profile_returns_http_423() {
+        let state = test_state(None);
+        let app = build_app(state.clone());
+
+        // Acquire lock on profile "test-work" via state.profile_broker
+        let _lease = state
+            .profile_broker
+            .acquire("test-work", 0)
+            .expect("should lock");
+
+        // Try calling /tools/browse with use_profile "test-work"
+        let req = Request::builder()
+            .method("POST")
+            .uri("/tools/browse")
+            .header("Host", "127.0.0.1:4200")
+            .header("Content-Type", "application/json")
+            .body(Body::from(
+                r#"{"url": "https://github.com", "use_profile": "test-work"}"#,
+            ))
+            .unwrap();
+        let res = app.oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::LOCKED);
+        assert_eq!(res.status().as_u16(), 423);
+
+        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
+        assert_eq!(body_json.get("error").unwrap(), "profile_locked");
+        assert_eq!(body_json.get("profile").unwrap(), "test-work");
     }
 }

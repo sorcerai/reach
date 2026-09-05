@@ -1,3 +1,4 @@
+pub mod browse;
 pub mod connect;
 pub mod create;
 pub mod destroy;
@@ -26,6 +27,8 @@ pub enum Command {
     Exec(exec::ExecArgs),
     /// Start MCP SSE server proxying to sandbox(es)
     Serve(serve::ServeArgs),
+    /// Open a URL in Chrome with profile broker and cookie jar hydration
+    Browse(browse::BrowseArgs),
     /// Open noVNC in browser
     Vnc(vnc::VncArgs),
     /// Capture a screenshot from a sandbox
@@ -41,6 +44,7 @@ pub async fn run(cmd: Command) -> anyhow::Result<()> {
         Command::Connect(args) => connect::run(args).await,
         Command::Exec(args) => exec::run(args).await,
         Command::Serve(args) => serve::run(args).await,
+        Command::Browse(args) => browse::run(args).await,
         Command::Vnc(args) => vnc::run(args).await,
         Command::Screenshot(args) => screenshot::run(args).await,
     }

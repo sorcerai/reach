@@ -1,5 +1,7 @@
 //! Shared MCP tool dispatcher used by both `serve` (SSE/HTTP) and `connect` (stdio).
 
+#![allow(clippy::collapsible_if)]
+
 use crate::docker::{
     AuthHandoffOptions, DockerClient, PageTextOptions, ProfileMount, Sandbox, novnc_url,
 };
@@ -9,6 +11,8 @@ pub struct ToolContext<'a> {
     pub docker: &'a DockerClient,
     pub public_host: String,
     pub agent: Option<&'a crate::agent::AgentState>,
+    pub profile_broker: Option<&'a crate::profile::ProfileBroker>,
+    pub cookie_jars: Option<&'a crate::profile::CookieJarService>,
 }
 
 /// Resolve the noVNC URL for a sandbox using the configured public host.
@@ -34,27 +38,96 @@ pub fn requested_screen(args: &serde_json::Value) -> Result<u32, String> {
     Ok(screen_for(args))
 }
 
+pub fn parse_jars(args: &serde_json::Value) -> Vec<String> {
+    if let Some(arr) = args.get("jars").and_then(|v| v.as_array()) {
+        arr.iter()
+            .filter_map(|v| v.as_str().map(|s| s.trim().to_string()))
+            .filter(|s| !s.is_empty())
+            .collect()
+    } else if let Some(s) = args.get("jars").and_then(|v| v.as_str()) {
+        s.split(',')
+            .map(|p| p.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .collect()
+    } else {
+        vec![]
+    }
+}
+
+pub fn resolve_profile_name(args: &serde_json::Value, screen: u32) -> (String, bool) {
+    let explicit_ephemeral = args
+        .get("ephemeral")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let explicit_profile = args
+        .get("use_profile")
+        .or_else(|| args.get("profile"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    if explicit_ephemeral {
+        (format!("/tmp/ctx-{}", uuid::Uuid::new_v4()), true)
+    } else if let Some(p) = explicit_profile {
+        let is_ephemeral = p.starts_with("/tmp/ctx-");
+        (p, is_ephemeral)
+    } else if args.get("jars").is_some() {
+        // Jars declared without explicit profile name: launch ephemeral browser context
+        (format!("/tmp/ctx-{}", uuid::Uuid::new_v4()), true)
+    } else if screen > 0 {
+        (format!("default-screen{screen}"), false)
+    } else {
+        ("default".to_string(), false)
+    }
+}
+
 pub fn browse_command(url: &str, profile_dir: &str) -> String {
+    browse_command_with_hydration(url, profile_dir, None)
+}
+
+pub fn browse_command_with_hydration(
+    url: &str,
+    profile_dir: &str,
+    hydrated_json: Option<&str>,
+) -> String {
+    let escaped_json = hydrated_json
+        .map(|j| format!("'''{}'''", j.replace('\\', "\\\\").replace('\'', "\\'")))
+        .unwrap_or_else(|| "None".to_string());
+
     format!(
         "mkdir -p '{p}' && \
          python3 -c \"import os, json, time; \
            p = '{p}'; \
            sf = '/workspace/.reach/state.json'; \
-           has_c = any(os.path.exists(os.path.join(p, sub)) for sub in ['Default/Network/Cookies', 'Default/Cookies', 'Cookies']); \
-           if not has_c and os.path.exists(sf): \
+           hydrated_str = {escaped_json}; \
+           hydrated = json.loads(hydrated_str) if hydrated_str else None; \
+           if hydrated and hydrated.get('cookies'): \
                try: \
-                   with open(sf) as f: state = json.load(f); \
-                   cookies = state.get('cookies', []); \
-                   if cookies: \
-                       from playwright.sync_api import sync_playwright; \
-                       now = time.time(); \
-                       for c in cookies: \
-                           if c.get('expires', -1) <= 0: c['expires'] = int(now + 86400 * 30); \
-                       with sync_playwright() as pw: \
-                           ctx = pw.chromium.launch_persistent_context(p, headless=True, args=['--no-sandbox']); \
-                           ctx.add_cookies(cookies); \
-                           ctx.close(); \
-               except Exception: pass\" 2>/dev/null || true; \
+                   from playwright.sync_api import sync_playwright; \
+                   now = time.time(); \
+                   cookies = hydrated.get('cookies', []); \
+                   for c in cookies: \
+                       if c.get('expires', -1) <= 0: c['expires'] = int(now + 86400 * 30); \
+                   with sync_playwright() as pw: \
+                       ctx = pw.chromium.launch_persistent_context(p, headless=True, args=['--no-sandbox']); \
+                       ctx.add_cookies(cookies); \
+                       ctx.close(); \
+               except Exception: pass; \
+           else: \
+               has_c = any(os.path.exists(os.path.join(p, sub)) for sub in ['Default/Network/Cookies', 'Default/Cookies', 'Cookies']); \
+               if not has_c and os.path.exists(sf): \
+                   try: \
+                       with open(sf) as f: state = json.load(f); \
+                       cookies = state.get('cookies', []); \
+                       if cookies: \
+                           from playwright.sync_api import sync_playwright; \
+                           now = time.time(); \
+                           for c in cookies: \
+                               if c.get('expires', -1) <= 0: c['expires'] = int(now + 86400 * 30); \
+                           with sync_playwright() as pw: \
+                               ctx = pw.chromium.launch_persistent_context(p, headless=True, args=['--no-sandbox']); \
+                               ctx.add_cookies(cookies); \
+                               ctx.close(); \
+                   except Exception: pass\" 2>/dev/null || true; \
          reach-chrome --no-sandbox --disable-gpu --no-first-run \
          --user-data-dir='{p}' '{u}' >/dev/null 2>&1 &",
         p = profile_dir,
@@ -111,6 +184,19 @@ pub async fn dispatch(
 ) -> ToolResponse {
     let screen = screen_for(args);
     let display = display_for(screen);
+
+    if let Some(agent) = ctx.agent {
+        if let Some(info) = agent.screen_info(screen) {
+            if info.phase != crate::agent::ScreenPhase::AgentActive
+                && info.phase != crate::agent::ScreenPhase::Idle
+            {
+                return ToolResponse::error(format!(
+                    "takeover is active on screen {screen} (phase: {:?}, handoff_gen: {})",
+                    info.phase, info.handoff_gen
+                ));
+            }
+        }
+    }
 
     let _busy_guard = if is_active_tool(tool) {
         ctx.agent.map(|a| a.mark_busy(screen))
@@ -176,21 +262,49 @@ pub async fn dispatch(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank");
-            let profile = match args.get("use_profile").and_then(|v| v.as_str()) {
-                Some(p) => p.to_string(),
-                None => {
-                    if screen > 0 {
-                        format!("default-screen{screen}")
-                    } else {
-                        "default".to_string()
+            let (profile_name, is_ephemeral) = resolve_profile_name(args, screen);
+            let profile_dir = if is_ephemeral {
+                profile_name.clone()
+            } else {
+                ProfileMount::container_path_for(&profile_name)
+            };
+
+            let _lease = if let Some(broker) = ctx.profile_broker {
+                let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let holder = crate::profile::LockHolderInfo::new(
+                    Some(screen),
+                    Some("browse".to_string()),
+                    None,
+                );
+                match broker.acquire_with_holder(&profile_name, timeout_ms, Some(holder)) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        return ToolResponse::error(format!(
+                            "profile '{profile_name}' is locked: {e}"
+                        ));
                     }
                 }
+            } else {
+                None
             };
+
+            let declared_jars = parse_jars(args);
+            let hydrated_json = if !declared_jars.is_empty() {
+                if let Some(jars_svc) = ctx.cookie_jars {
+                    let st = jars_svc.hydrate_jars(&declared_jars);
+                    serde_json::to_string(&st).ok()
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
             sh(
                 ctx,
                 target,
                 screen,
-                &browse_command(url, &ProfileMount::container_path_for(&profile)),
+                &browse_command_with_hydration(url, &profile_dir, hydrated_json.as_deref()),
             )
             .await
         }
@@ -240,6 +354,40 @@ pub async fn dispatch(
                 Some(u) if !u.is_empty() => u.to_string(),
                 _ => return ToolResponse::error("page_text: missing required `url`"),
             };
+            let (profile_name, is_ephemeral) = resolve_profile_name(args, screen);
+            let user_data_dir = if is_ephemeral {
+                profile_name.clone()
+            } else {
+                ProfileMount::container_path_for(&profile_name)
+            };
+
+            let _lease = if let Some(broker) = ctx.profile_broker {
+                let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                let holder = crate::profile::LockHolderInfo::new(
+                    Some(screen),
+                    Some("page_text".to_string()),
+                    None,
+                );
+                match broker.acquire_with_holder(&profile_name, timeout_ms, Some(holder)) {
+                    Ok(l) => Some(l),
+                    Err(e) => {
+                        return ToolResponse::error(format!(
+                            "profile '{profile_name}' is locked: {e}"
+                        ));
+                    }
+                }
+            } else {
+                None
+            };
+
+            let declared_jars = parse_jars(args);
+            let hydrated_cookies = if !declared_jars.is_empty() {
+                ctx.cookie_jars
+                    .map(|svc| svc.hydrate_jars(&declared_jars).cookies)
+            } else {
+                None
+            };
+
             let opts = PageTextOptions {
                 url,
                 wait_for: args
@@ -254,18 +402,22 @@ pub async fn dispatch(
                     .get("timeout_ms")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(30_000),
-                user_data_dir: Some(ProfileMount::container_path_for(
-                    args.get("use_profile")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("default"),
-                )),
+                user_data_dir: Some(user_data_dir),
                 display: Some(display.clone()),
+                hydrated_cookies,
             };
             match ctx.docker.page_text(target, &opts).await {
-                Ok(out) => match serde_json::to_string_pretty(&out) {
-                    Ok(s) => ToolResponse::text(s),
-                    Err(e) => ToolResponse::error(e.to_string()),
-                },
+                Ok(out) => {
+                    if !declared_jars.is_empty() && !out.cookies.is_empty() {
+                        if let Some(jars_svc) = ctx.cookie_jars {
+                            let _ = jars_svc.dump_cookies_to_jars(&out.cookies, &declared_jars);
+                        }
+                    }
+                    match serde_json::to_string_pretty(&out) {
+                        Ok(s) => ToolResponse::text(s),
+                        Err(e) => ToolResponse::error(e.to_string()),
+                    }
+                }
                 Err(e) => ToolResponse::error(e.to_string()),
             }
         }
@@ -531,6 +683,8 @@ mod tests {
             docker: &docker,
             public_host: "localhost".into(),
             agent: None,
+            profile_broker: None,
+            cookie_jars: None,
         };
 
         // Command injection attempt should be rejected before shell execution
