@@ -119,3 +119,36 @@ def test_buzz_list_channels():
         res = plugin.buzz_list_channels()
         assert res["ok"] is True
         mock_cli.assert_called_once_with(["channels", "list"])
+
+
+def test_register_plugin():
+    registered_tools = []
+
+    class DummyContext:
+        def register_tool(self, name, toolset, schema, handler, description, emoji):
+            registered_tools.append((name, toolset, schema, handler, description, emoji))
+
+        def get_config(self, key, default=None):
+            if key == "relay_url":
+                return "http://relay.internal:3000"
+            if key == "private_key":
+                return "nsec1override"
+            return default
+
+    ctx = DummyContext()
+    plugin.register(ctx)
+    assert len(registered_tools) == 5
+    tool_names = [t[0] for t in registered_tools]
+    assert "buzz_send_message" in tool_names
+    assert "buzz_send_takeover_alert" in tool_names
+    assert "buzz_post_visual_diff" in tool_names
+    assert "buzz_get_messages" in tool_names
+    assert "buzz_list_channels" in tool_names
+
+    # Verify config resolution
+    assert plugin.get_relay_url() == "http://relay.internal:3000"
+    assert plugin.get_private_key() == "nsec1override"
+
+    # Reset ctx
+    plugin._ctx = None
+

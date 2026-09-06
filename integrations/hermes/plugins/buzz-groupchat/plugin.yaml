@@ -2,9 +2,20 @@ name: buzz-groupchat
 version: "0.1.0"
 description: "Multi-Bot Groupchat surface: integrate with self-hosted Buzz (ariaserver:3000) for persistent history, @mentions, visual diff audit reels, and human takeover cards."
 author: "Reach Team"
-enabled_by_default: true
+kind: standalone
+provides_tools: [buzz_send_message, buzz_send_takeover_alert, buzz_post_visual_diff, buzz_get_messages, buzz_list_channels]
+config_schema:
+  relay_url:
+    type: str
+    default: "http://100.124.38.17:3000"
+    description: "Buzz relay URL"
+  channel:
+    type: str
+    default: "general"
+    description: "Default Buzz channel name or ID"
 
 tools:
+
   - name: buzz_send_message
     description: "Send a message or status update to a Buzz channel or thread."
     parameters:

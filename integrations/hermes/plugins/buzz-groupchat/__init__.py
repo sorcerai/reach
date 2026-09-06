@@ -20,14 +20,27 @@ DEFAULT_RELAY_URL = "http://100.124.38.17:3000"
 DEFAULT_NOVNC_BASE = "http://100.124.38.17:6080/vnc.html?autoconnect=true"
 
 
+_ctx: Any = None
+
+
+def _cfg(key: str, default: Any = None) -> Any:
+    if _ctx is None:
+        return default
+    try:
+        return _ctx.get_config(key, default)
+    except Exception:
+        return default
+
+
 def get_relay_url() -> str:
     """Return configured Buzz relay URL."""
-    return os.environ.get("BUZZ_RELAY_URL", DEFAULT_RELAY_URL).rstrip("/")
+    cfg_val = _cfg("relay_url")
+    return (str(cfg_val) if cfg_val else os.environ.get("BUZZ_RELAY_URL", DEFAULT_RELAY_URL)).rstrip("/")
 
 
 def get_private_key() -> Optional[str]:
     """Return configured Buzz private key (hex or nsec)."""
-    return os.environ.get("BUZZ_PRIVATE_KEY")
+    return _cfg("private_key") or os.environ.get("BUZZ_PRIVATE_KEY")
 
 
 def find_buzz_cli() -> Optional[str]:
@@ -176,3 +189,99 @@ def buzz_list_channels(relay_url: Optional[str] = None) -> Dict[str, Any]:
             else:
                 os.environ.pop("BUZZ_RELAY_URL", None)
     return run_buzz_cli(args)
+
+
+# --------------------------------------------------------------------------
+# Hermes Registration
+# --------------------------------------------------------------------------
+
+PLUGIN_TOOLS: Dict[str, tuple] = {
+    "buzz_send_message": (
+        buzz_send_message,
+        "Send a message or status update to a Buzz channel or thread.",
+        {
+            "type": "object",
+            "required": ["channel", "content"],
+            "properties": {
+                "channel": {"type": "string", "description": "Target channel ID or name."},
+                "content": {"type": "string", "description": "Message content (supports markdown and @mentions)."},
+                "reply_to": {"type": "string", "description": "Optional parent message ID to reply in a thread."},
+                "broadcast": {"type": "boolean", "default": False, "description": "Whether to also broadcast thread reply to the channel."},
+            },
+        },
+    ),
+    "buzz_send_takeover_alert": (
+        buzz_send_takeover_alert,
+        "Post an interactive Human Takeover alert to a Buzz channel or thread when 2FA, Captcha, or credentials require human intervention.",
+        {
+            "type": "object",
+            "required": ["channel", "screen", "reason"],
+            "properties": {
+                "channel": {"type": "string", "description": "Target Buzz channel ID or name."},
+                "screen": {"type": "integer", "description": "Screen ID where human intervention is required."},
+                "reason": {"type": "string", "description": "Reason human intervention is needed (e.g., 2FA prompt, CAPTCHA, manual review)."},
+                "novnc_url": {"type": "string", "description": "Optional direct noVNC URL. If omitted, defaults to REACH_NOVNC_URL or http://100.124.38.17:6080/vnc.html."},
+                "reply_to": {"type": "string", "description": "Optional thread ID to post the takeover request under."},
+            },
+        },
+    ),
+    "buzz_post_visual_diff": (
+        buzz_post_visual_diff,
+        "Post a visual diff audit reel / screenshot summary to a Buzz channel or thread.",
+        {
+            "type": "object",
+            "required": ["channel", "summary"],
+            "properties": {
+                "channel": {"type": "string", "description": "Target Buzz channel ID or name."},
+                "summary": {"type": "string", "description": "Text summary of the action and visual diff results."},
+                "screenshot_path": {"type": "string", "description": "Path to the local screenshot or audit reel image."},
+                "diff_percent": {"type": "number", "description": "Optional perceptual hash or visual difference percentage (0.0 to 100.0)."},
+                "tokens_saved": {"type": "integer", "description": "Optional count of tokens saved by pHash change gating."},
+                "reply_to": {"type": "string", "description": "Optional thread ID to post under."},
+            },
+        },
+    ),
+    "buzz_get_messages": (
+        buzz_get_messages,
+        "Read recent messages from a Buzz channel or thread to check for @mentions or user instructions.",
+        {
+            "type": "object",
+            "required": ["channel"],
+            "properties": {
+                "channel": {"type": "string", "description": "Channel ID or name."},
+                "limit": {"type": "integer", "default": 20, "description": "Maximum number of messages to retrieve."},
+            },
+        },
+    ),
+    "buzz_list_channels": (
+        buzz_list_channels,
+        "List available channels on the Buzz relay.",
+        {
+            "type": "object",
+            "properties": {
+                "relay_url": {"type": "string", "description": "Optional Buzz relay URL override."},
+            },
+        },
+    ),
+}
+
+
+def _handler(fn: Any) -> Any:
+    def run(args: Optional[Dict[str, Any]] = None, **kw: Any) -> str:
+        return json.dumps(fn(**(args or {})))
+    return run
+
+
+def register(ctx: Any) -> None:
+    global _ctx
+    _ctx = ctx
+    for name, (fn, description, params) in PLUGIN_TOOLS.items():
+        ctx.register_tool(
+            name=name,
+            toolset="buzz",
+            schema={"name": name, "description": description, "parameters": params},
+            handler=_handler(fn),
+            description=description,
+            emoji="🐝",
+        )
+
