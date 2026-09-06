@@ -31,7 +31,7 @@ Capture the sandbox display as a PNG image.
 
 ## click
 
-Click at a position on the screen.
+Click at a position or target element on the screen.
 
 **Parameters:**
 
@@ -39,13 +39,17 @@ Click at a position on the screen.
 {
   "type": "object",
   "properties": {
+    "ref": {
+      "type": "string",
+      "description": "Target element reference from AXTree (e.g. '@e1'). Resolves coordinates automatically."
+    },
     "x": {
       "type": "integer",
-      "description": "X coordinate in pixels"
+      "description": "X coordinate in pixels (required if ref is omitted)"
     },
     "y": {
       "type": "integer",
-      "description": "Y coordinate in pixels"
+      "description": "Y coordinate in pixels (required if ref is omitted)"
     },
     "button": {
       "type": "string",
@@ -58,8 +62,7 @@ Click at a position on the screen.
       "default": 1,
       "description": "Number of clicks (2 for double-click)"
     }
-  },
-  "required": ["x", "y"]
+  }
 }
 ```
 
@@ -69,14 +72,12 @@ Click at a position on the screen.
 {
   "name": "click",
   "arguments": {
-    "x": 640,
-    "y": 360,
-    "button": "left"
+    "ref": "@e4"
   }
 }
 ```
 
-**Implementation:** Uses `xdotool mousemove --sync <x> <y> click <button>`.
+**Implementation:** If `ref` is supplied, coordinates are resolved via the active AXTree reference map; otherwise uses `xdotool mousemove --sync <x> <y> click <button>`.
 
 ---
 
@@ -94,6 +95,20 @@ Type text via the keyboard.
       "type": "string",
       "description": "Text to type"
     },
+    "ref": {
+      "type": "string",
+      "description": "Target element reference from AXTree (e.g. '@e2'). Automatically clicks to focus."
+    },
+    "clear": {
+      "type": "boolean",
+      "default": false,
+      "description": "Select all and clear existing field content before typing"
+    },
+    "submit": {
+      "type": "boolean",
+      "default": false,
+      "description": "Automatically send Return key after typing"
+    },
     "delay_ms": {
       "type": "integer",
       "default": 12,
@@ -110,12 +125,14 @@ Type text via the keyboard.
 {
   "name": "type",
   "arguments": {
-    "text": "hello world"
+    "ref": "@e3",
+    "text": "ground beef 1lb",
+    "submit": true
   }
 }
 ```
 
-**Implementation:** Uses `xdotool type --delay <delay_ms> "<text>"`.
+**Implementation:** Uses `xdotool type --delay <delay_ms> "<text>"` (plus `xdotool key Return` when `submit: true`).
 
 ---
 
@@ -157,7 +174,7 @@ Send a key combination.
 
 ## browse
 
-Navigate Chrome to a URL.
+Navigate Chrome to a URL, optionally returning an inline accessibility tree snapshot in a single turn.
 
 **Parameters:**
 
@@ -168,6 +185,15 @@ Navigate Chrome to a URL.
     "url": {
       "type": "string",
       "description": "URL to navigate to"
+    },
+    "snapshot": {
+      "type": "boolean",
+      "default": false,
+      "description": "If true, automatically captures and returns the compact AXTree after navigation (combines browse + page_text into 1 turn)"
+    },
+    "query": {
+      "type": "string",
+      "description": "Keyword filter when snapshot=true (e.g. 'Login', 'Checkout', 'Search')"
     },
     "use_profile": {
       "type": "string",
@@ -184,11 +210,14 @@ Navigate Chrome to a URL.
 {
   "name": "browse",
   "arguments": {
-    "url": "https://example.com",
-    "use_profile": "default"
+    "url": "https://books.toscrape.com",
+    "snapshot": true,
+    "query": "Travel"
   }
 }
 ```
+
+**Returns:** Single-turn navigation result including compact AXTree and actionable `help: [...]` hints when `snapshot: true`.
 
 **Implementation:** Launches or navigates the headed Chrome instance on the virtual display through the `reach-chrome` wrapper (Google Chrome on amd64, Playwright Chromium on arm64). The page is visible through VNC/noVNC.
 
@@ -284,9 +313,9 @@ Execute a Playwright Python script inside the sandbox.
 
 ## page_text
 
-Navigate to a URL using Playwright (real Chromium on the sandbox display) and return the visible text content. This is the right tool for JavaScript-heavy single-page apps that Scrapling can't render.
+Navigate to a URL using Playwright (real Chromium on the sandbox display) and return compact accessibility tree (AXTree) and/or visible text. Elements in the AXTree receive semantic references (`@e1`, `@e2`, ...) that can be directly passed to `click(ref="@e1")` or `type(ref="@e2", text="...", submit=true)`.
 
-The browser is launched headed on Xvfb so you can watch the page through noVNC if you need to debug. Pass `use_profile` to reuse a persistent Chrome profile created with `reach create --persist-profile <name>` and skip re-authenticating every session.
+The browser is launched headed on Xvfb so you can watch the page through noVNC. Pass `use_profile` to reuse a persistent Chrome profile, or pass `jars: ["domain.com"]` to automatically hydrate and persist domain cookies from disk jars (`~/.reach/jars/`).
 
 **Parameters:**
 
@@ -298,6 +327,27 @@ The browser is launched headed on Xvfb so you can watch the page through noVNC i
     "url": {
       "type": "string",
       "description": "URL to load"
+    },
+    "query": {
+      "type": "string",
+      "description": "Keyword filter for AXTree and text (e.g. 'Login', 'Add to cart', 'username')"
+    },
+    "format": {
+      "type": "string",
+      "enum": ["axtree", "text", "both"],
+      "default": "both",
+      "description": "Format of output to include"
+    },
+    "view": {
+      "type": "string",
+      "enum": ["compact", "full"],
+      "default": "compact",
+      "description": "View mode: 'compact' caps output to max_lines; 'full' returns all lines uncapped"
+    },
+    "max_lines": {
+      "type": "integer",
+      "default": 200,
+      "description": "Maximum number of lines returned when view is compact"
     },
     "wait_for": {
       "type": "string",
@@ -316,6 +366,11 @@ The browser is launched headed on Xvfb so you can watch the page through noVNC i
       "type": "string",
       "description": "Persistent Chrome profile name (see `reach create --persist-profile`)"
     },
+    "jars": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of domains to hydrate cookies from and dump back to ~/.reach/jars/"
+    },
     "sandbox": {
       "type": "string"
     }
@@ -329,21 +384,26 @@ The browser is launched headed on Xvfb so you can watch the page through noVNC i
 {
   "name": "page_text",
   "arguments": {
-    "url": "https://www.threads.com/@todie.ai/post/DWzHGm0FRJw",
-    "wait_for": "article",
-    "use_profile": "threads"
+    "url": "https://books.toscrape.com",
+    "query": "Travel"
   }
 }
 ```
 
-**Returns:** JSON object with `status`, `text`, `url`, and `title` fields.
+**Returns:** JSON object with compact `axtree`, `elements_count`, `matches_count`, and deterministic `help: [...]` action suggestions:
 
 ```json
 {
   "status": "ok",
-  "url": "https://www.threads.com/...",
-  "title": "Threads",
-  "text": "..."
+  "url": "https://books.toscrape.com/",
+  "title": "All products | Books to Scrape - Sandbox",
+  "query": "Travel",
+  "matches_count": 1,
+  "elements_count": 114,
+  "axtree": "[@e4: link \"Travel\" x=90 y=277 w=38 h=16]",
+  "help": [
+    "Run click(ref=\"@e4\")"
+  ]
 }
 ```
 
