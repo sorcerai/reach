@@ -273,11 +273,17 @@ pub struct PageTextModelResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub matches_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub elements_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub axtree: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub help: Option<Vec<String>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub truncated: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -290,30 +296,69 @@ pub fn format_page_text_response(
     requested_format: &str,
     view_mode: &str,
     max_lines: usize,
+    query: Option<&str>,
 ) -> PageTextModelResponse {
     let elements_count = out.refs.as_ref().map(|r| r.len());
     let is_full = view_mode.eq_ignore_ascii_case("full");
     let mut any_truncated = false;
+    let query_clean = query.and_then(|q| {
+        let trimmed = q.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed)
+        }
+    });
 
-    let axtree = match requested_format {
-        "text" => None,
+    let (axtree, query_matches_axtree) = match requested_format {
+        "text" => (None, None),
         _ => {
             if let Some(tree) = out.axtree {
                 let lines: Vec<&str> = tree.lines().collect();
-                if !is_full && lines.len() > max_lines {
-                    let preview = lines[..max_lines].join("\n");
-                    any_truncated = true;
-                    Some(format!(
-                        "{}\n... [truncated {} lines ({} total). Pass view=\"full\" or a CSS `selector` to narrow]",
-                        preview,
-                        lines.len() - max_lines,
-                        lines.len()
-                    ))
+                let (filtered_lines, match_count) = if let Some(q) = query_clean {
+                    let terms: Vec<String> = q
+                        .split_whitespace()
+                        .map(|t| t.to_lowercase())
+                        .collect();
+                    let matches: Vec<&str> = lines
+                        .iter()
+                        .copied()
+                        .filter(|line| {
+                            let lower = line.to_lowercase();
+                            terms.iter().any(|t| lower.contains(t))
+                        })
+                        .collect();
+                    let count = matches.len();
+                    (matches, Some(count))
                 } else {
-                    Some(tree)
+                    (lines, None)
+                };
+
+                if !is_full && filtered_lines.len() > max_lines {
+                    let preview = filtered_lines[..max_lines].join("\n");
+                    any_truncated = true;
+                    (
+                        Some(format!(
+                            "{}\n... [truncated {} lines ({} total). Pass view=\"full\" or a CSS `selector` to narrow]",
+                            preview,
+                            filtered_lines.len() - max_lines,
+                            filtered_lines.len()
+                        )),
+                        match_count,
+                    )
+                } else if filtered_lines.is_empty() && query_clean.is_some() {
+                    (
+                        Some(format!(
+                            "... [0 matching elements found for query \"{}\"]",
+                            query_clean.unwrap()
+                        )),
+                        match_count,
+                    )
+                } else {
+                    (Some(filtered_lines.join("\n")), match_count)
                 }
             } else {
-                None
+                (None, None)
             }
         }
     };
@@ -323,17 +368,33 @@ pub fn format_page_text_response(
         _ => {
             if let Some(txt) = out.text {
                 let lines: Vec<&str> = txt.lines().collect();
-                if !is_full && lines.len() > max_lines {
-                    let preview = lines[..max_lines].join("\n");
+                let filtered_lines: Vec<&str> = if let Some(q) = query_clean {
+                    let terms: Vec<String> = q
+                        .split_whitespace()
+                        .map(|t| t.to_lowercase())
+                        .collect();
+                    lines
+                        .into_iter()
+                        .filter(|line| {
+                            let lower = line.to_lowercase();
+                            terms.iter().any(|t| lower.contains(t))
+                        })
+                        .collect()
+                } else {
+                    lines
+                };
+
+                if !is_full && filtered_lines.len() > max_lines {
+                    let preview = filtered_lines[..max_lines].join("\n");
                     any_truncated = true;
                     Some(format!(
                         "{}\n... [truncated {} lines ({} total). Pass view=\"full\" or a CSS `selector` to narrow]",
                         preview,
-                        lines.len() - max_lines,
-                        lines.len()
+                        filtered_lines.len() - max_lines,
+                        filtered_lines.len()
                     ))
                 } else {
-                    Some(txt)
+                    Some(filtered_lines.join("\n"))
                 }
             } else {
                 None
@@ -341,13 +402,49 @@ pub fn format_page_text_response(
         }
     };
 
+    // Extract deterministic help hints based on visible element refs
+    let mut help_hints = Vec::new();
+    if let Some(ref tree_content) = axtree {
+        let mut refs_found = Vec::new();
+        for word in tree_content.split_whitespace() {
+            if let Some(pos) = word.find("@e") {
+                let clean: String = word[pos..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '@')
+                    .collect();
+                if clean.len() >= 3 && !refs_found.contains(&clean) {
+                    refs_found.push(clean);
+                    if refs_found.len() >= 2 {
+                        break;
+                    }
+                }
+            }
+        }
+        if !refs_found.is_empty() {
+            help_hints.push(format!("Run click(ref=\"{}\")", refs_found[0]));
+            if refs_found.len() > 1 {
+                help_hints.push(format!(
+                    "Run type(ref=\"{}\", text=\"...\", submit=true)",
+                    refs_found[1]
+                ));
+            }
+        }
+    }
+
     PageTextModelResponse {
         status: out.status,
         url: out.url,
         title: out.title,
+        query: query_clean.map(|s| s.to_string()),
+        matches_count: query_matches_axtree,
         elements_count,
         axtree,
         text,
+        help: if !help_hints.is_empty() {
+            Some(help_hints)
+        } else {
+            None
+        },
         truncated: if any_truncated { Some(true) } else { None },
         message: out.message,
     }
@@ -453,6 +550,7 @@ pub async fn dispatch(
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let reference = args.get("ref").and_then(|v| v.as_str());
             let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
+            let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
 
             if let Some(ref_str) = reference {
                 match crate::refs::resolve_ref(target, screen, ref_str) {
@@ -473,6 +571,9 @@ pub async fn dispatch(
                             " && xdotool type -- '{}'",
                             text.replace('\'', "'\\''")
                         ));
+                        if submit {
+                            script.push_str(" && xdotool key Return");
+                        }
                         sh(ctx, target, screen, &script).await
                     }
                     None => ToolResponse::error(format!(
@@ -488,6 +589,9 @@ pub async fn dispatch(
                     "xdotool type -- '{}'",
                     text.replace('\'', "'\\''")
                 ));
+                if submit {
+                    script.push_str(" && xdotool key Return");
+                }
                 sh(ctx, target, screen, &script).await
             }
         }
@@ -512,6 +616,10 @@ pub async fn dispatch(
                 .get("url")
                 .and_then(|v| v.as_str())
                 .unwrap_or("about:blank");
+            let snapshot = args
+                .get("snapshot")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             let (profile_name, is_ephemeral) = resolve_profile_name(args, screen);
             let profile_dir = if is_ephemeral {
                 profile_name.clone()
@@ -532,13 +640,67 @@ pub async fn dispatch(
             };
 
             let cdp_port = 9222 + screen as u16;
-            sh(
-                ctx,
-                target,
-                screen,
-                &browse_command_full(url, &profile_dir, hydrated_json.as_deref(), Some(cdp_port)),
-            )
-            .await
+            let launch_cmd =
+                browse_command_full(url, &profile_dir, hydrated_json.as_deref(), Some(cdp_port));
+            let sh_resp = sh(ctx, target, screen, &launch_cmd).await;
+            if sh_resp.is_error || !snapshot {
+                return sh_resp;
+            }
+
+            // Inline snapshot requested: wait briefly and extract compact AXTree
+            let query = args.get("query").and_then(|v| v.as_str());
+            let requested_format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("axtree");
+            let view_mode = args
+                .get("view")
+                .and_then(|v| v.as_str())
+                .unwrap_or("compact");
+            let max_lines = args
+                .get("max_lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(200);
+            let opts = PageTextOptions {
+                url: url.to_string(),
+                wait_for: args
+                    .get("wait_for")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                selector: args
+                    .get("selector")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                format: Some(requested_format.to_string()),
+                timeout_ms: args
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15_000),
+                user_data_dir: Some(profile_dir),
+                display: Some(display.clone()),
+                hydrated_cookies: None,
+            };
+            match ctx.docker.page_text(target, &opts).await {
+                Ok(out) => {
+                    if let Some(map) = &out.refs {
+                        crate::refs::global_ref_table().set_refs(target, screen, map.clone());
+                        crate::refs::save_refs_to_disk(target, screen, map);
+                    }
+                    let resp = format_page_text_response(
+                        out,
+                        requested_format,
+                        view_mode,
+                        max_lines,
+                        query,
+                    );
+                    match serde_json::to_string_pretty(&resp) {
+                        Ok(s) => ToolResponse::text(s),
+                        Err(_) => sh_resp,
+                    }
+                }
+                Err(_) => sh_resp,
+            }
         }
         "scrape" => {
             let url = args.get("url").and_then(|v| v.as_str()).unwrap_or("");
@@ -631,6 +793,8 @@ pub async fn dispatch(
                 .map(|n| n as usize)
                 .unwrap_or(200);
 
+            let query = args.get("query").and_then(|v| v.as_str());
+
             let opts = PageTextOptions {
                 url,
                 wait_for: args
@@ -661,7 +825,13 @@ pub async fn dispatch(
                             let _ = jars_svc.dump_cookies_to_jars(&out.cookies, &declared_jars);
                         }
                     }
-                    let resp = format_page_text_response(out, requested_format, view_mode, max_lines);
+                    let resp = format_page_text_response(
+                        out,
+                        requested_format,
+                        view_mode,
+                        max_lines,
+                        query,
+                    );
                     match serde_json::to_string_pretty(&resp) {
                         Ok(s) => ToolResponse::text(s),
                         Err(e) => ToolResponse::error(e.to_string()),
@@ -1073,7 +1243,7 @@ mod tests {
             }],
         };
 
-        let resp = format_page_text_response(out, "both", "compact", 200);
+        let resp = format_page_text_response(out, "both", "compact", 200, None);
         assert_eq!(resp.status, "ok");
         assert_eq!(resp.elements_count, Some(1));
         assert!(resp.axtree.is_some());
@@ -1101,15 +1271,15 @@ mod tests {
             cookies: vec![],
         };
 
-        let resp_axtree = format_page_text_response(make_out(), "axtree", "compact", 200);
+        let resp_axtree = format_page_text_response(make_out(), "axtree", "compact", 200, None);
         assert!(resp_axtree.axtree.is_some());
         assert!(resp_axtree.text.is_none());
 
-        let resp_text = format_page_text_response(make_out(), "text", "compact", 200);
+        let resp_text = format_page_text_response(make_out(), "text", "compact", 200, None);
         assert!(resp_text.axtree.is_none());
         assert!(resp_text.text.is_some());
 
-        let resp_both = format_page_text_response(make_out(), "both", "compact", 200);
+        let resp_both = format_page_text_response(make_out(), "both", "compact", 200, None);
         assert!(resp_both.axtree.is_some());
         assert!(resp_both.text.is_some());
     }
@@ -1132,7 +1302,7 @@ mod tests {
             cookies: vec![],
         };
 
-        let compact_resp = format_page_text_response(out1, "axtree", "compact", 50);
+        let compact_resp = format_page_text_response(out1, "axtree", "compact", 50, None);
         assert_eq!(compact_resp.truncated, Some(true));
         let tree_str = compact_resp.axtree.unwrap();
         assert!(tree_str.contains("truncated 250 lines (300 total)"));
@@ -1149,9 +1319,47 @@ mod tests {
             cookies: vec![],
         };
 
-        let full_resp = format_page_text_response(out2, "axtree", "full", 50);
+        let full_resp = format_page_text_response(out2, "axtree", "full", 50, None);
         assert_eq!(full_resp.truncated, None);
         let tree_full = full_resp.axtree.unwrap();
         assert_eq!(tree_full.lines().count(), 300);
+    }
+
+    #[test]
+    fn test_format_page_text_query_filtering_and_help_hints() {
+        let tree = "\
+[@e1: button \"Sign in\"]\n\
+[@e2: link \"Help & FAQs\"]\n\
+[@e3: textbox \"Search items\"]\n\
+[@e4: button \"Add Ground Beef to cart\"]";
+
+        let out = crate::docker::PageTextOutput {
+            status: "ok".into(),
+            text: Some("Sign in\nHelp & FAQs\nSearch items\nAdd Ground Beef to cart".into()),
+            axtree: Some(tree.into()),
+            refs: None,
+            url: Some("https://example.com".into()),
+            title: Some("Example".into()),
+            message: None,
+            cookies: vec![],
+        };
+
+        // Query matching "beef ground"
+        let filtered = format_page_text_response(out.clone(), "axtree", "compact", 50, Some("beef ground"));
+        assert_eq!(filtered.query.as_deref(), Some("beef ground"));
+        assert_eq!(filtered.matches_count, Some(1));
+        let axtree_content = filtered.axtree.unwrap();
+        assert!(axtree_content.contains("@e4: button \"Add Ground Beef to cart\""));
+        assert!(!axtree_content.contains("@e1: button \"Sign in\""));
+
+        // Contextual help generated from the filtered ref @e4
+        let help = filtered.help.expect("expected help hints");
+        assert_eq!(help.len(), 1);
+        assert_eq!(help[0], "Run click(ref=\"@e4\")");
+
+        // Query with no match
+        let nomatch = format_page_text_response(out, "axtree", "compact", 50, Some("nonexistent_item"));
+        assert_eq!(nomatch.matches_count, Some(0));
+        assert!(nomatch.axtree.unwrap().contains("0 matching elements found"));
     }
 }

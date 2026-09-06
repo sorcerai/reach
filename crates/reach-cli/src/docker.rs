@@ -815,6 +815,14 @@ impl DockerClient {
     /// The Python helper launches headed Chromium on Xvfb (so the page is
     /// visible through noVNC) and prints a single JSON object on stdout.
     pub async fn page_text(&self, target: &str, opts: &PageTextOptions) -> Result<PageTextOutput> {
+        let screen_num: u32 = opts
+            .display
+            .as_deref()
+            .and_then(|d| d.strip_prefix(':'))
+            .and_then(|n| n.parse().ok())
+            .map(|d: u32| if d >= 99 { d - 99 } else { d })
+            .unwrap_or(0);
+
         let payload = serde_json::json!({
             "url": opts.url,
             "wait_for": opts.wait_for,
@@ -823,6 +831,7 @@ impl DockerClient {
             "timeout_ms": opts.timeout_ms,
             "user_data_dir": opts.user_data_dir,
             "hydrated_cookies": opts.hydrated_cookies,
+            "screen": screen_num,
         });
 
         let payload_str =
@@ -1148,69 +1157,109 @@ os.environ.setdefault("DISPLAY", ":99")
 
 try:
     with sync_playwright() as p:
-        if user_data_dir:
-            os.makedirs(user_data_dir, exist_ok=True)
-            ctx = p.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                headless=False,
-                args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
-            )
-            if hydrated_cookies:
-                try:
+        cdp_port = 9222 + screen_id
+        connected_cdp = False
+        ctx = None
+        page = None
+        owner = None
+
+        # Probe connecting over CDP to an existing headed browser session (e.g. from browse)
+        for attempt in range(3):
+            try:
+                browser = p.chromium.connect_over_cdp(f"http://127.0.0.1:{cdp_port}", timeout=500)
+                if browser.contexts:
+                    ctx = browser.contexts[0]
+                else:
+                    ctx = browser.new_context()
+                if ctx.pages:
+                    matching = [pg for pg in ctx.pages if url and (url in pg.url or pg.url in url)]
+                    page = matching[-1] if matching else ctx.pages[-1]
+                else:
+                    page = ctx.new_page()
+                owner = browser
+                connected_cdp = True
+                break
+            except Exception:
+                if attempt < 2:
                     import time
-                    now = time.time()
-                    for c in hydrated_cookies:
-                        if c.get("expires", -1) <= 0:
-                            c["expires"] = int(now + 86400 * 30)
-                    ctx.add_cookies(hydrated_cookies)
-                except Exception:
-                    pass
-            has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
-            state_file = "/workspace/.reach/state.json"
-            if not has_cookies and not hydrated_cookies and os.path.exists(state_file):
-                try:
-                    with open(state_file) as f:
-                        state = json.load(f)
-                    cookies = state.get("cookies", [])
-                    if cookies:
+                    time.sleep(0.15)
+
+        if not connected_cdp:
+            if user_data_dir:
+                os.makedirs(user_data_dir, exist_ok=True)
+                ctx = p.chromium.launch_persistent_context(
+                    user_data_dir=user_data_dir,
+                    headless=False,
+                    args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
+                )
+                if hydrated_cookies:
+                    try:
                         import time
                         now = time.time()
-                        for c in cookies:
+                        for c in hydrated_cookies:
                             if c.get("expires", -1) <= 0:
                                 c["expires"] = int(now + 86400 * 30)
-                        ctx.add_cookies(cookies)
-                except Exception:
-                    pass
-            page = ctx.new_page() if not ctx.pages else ctx.pages[0]
-            owner = ctx
-        else:
-            browser = p.chromium.launch(
-                headless=False,
-                args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
-            )
-            state_file = "/workspace/.reach/state.json"
-            if os.path.exists(state_file):
-                try:
-                    ctx = browser.new_context(storage_state=state_file)
-                except Exception:
-                    ctx = browser.new_context()
+                        ctx.add_cookies(hydrated_cookies)
+                    except Exception:
+                        pass
+                has_cookies = any(os.path.exists(os.path.join(user_data_dir, sub)) for sub in ["Default/Network/Cookies", "Default/Cookies", "Cookies"])
+                state_file = "/workspace/.reach/state.json"
+                if not has_cookies and not hydrated_cookies and os.path.exists(state_file):
+                    try:
+                        with open(state_file) as f:
+                            state = json.load(f)
+                        cookies = state.get("cookies", [])
+                        if cookies:
+                            import time
+                            now = time.time()
+                            for c in cookies:
+                                if c.get("expires", -1) <= 0:
+                                    c["expires"] = int(now + 86400 * 30)
+                            ctx.add_cookies(cookies)
+                    except Exception:
+                        pass
+                page = ctx.new_page() if not ctx.pages else ctx.pages[0]
+                owner = ctx
             else:
-                ctx = browser.new_context()
-            if hydrated_cookies:
-                try:
-                    import time
-                    now = time.time()
-                    for c in hydrated_cookies:
-                        if c.get("expires", -1) <= 0:
-                            c["expires"] = int(now + 86400 * 30)
-                    ctx.add_cookies(hydrated_cookies)
-                except Exception:
-                    pass
-            page = ctx.new_page()
-            owner = browser
+                browser = p.chromium.launch(
+                    headless=False,
+                    args=["--no-sandbox", "--disable-gpu", "--no-first-run"],
+                )
+                state_file = "/workspace/.reach/state.json"
+                if os.path.exists(state_file):
+                    try:
+                        ctx = browser.new_context(storage_state=state_file)
+                    except Exception:
+                        ctx = browser.new_context()
+                else:
+                    ctx = browser.new_context()
+                if hydrated_cookies:
+                    try:
+                        import time
+                        now = time.time()
+                        for c in hydrated_cookies:
+                            if c.get("expires", -1) <= 0:
+                                c["expires"] = int(now + 86400 * 30)
+                        ctx.add_cookies(hydrated_cookies)
+                    except Exception:
+                        pass
+                page = ctx.new_page()
+                owner = browser
 
         try:
-            page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+            if connected_cdp and page.url and (page.url == url or (url != "about:blank" and url in page.url)):
+                try:
+                    page.wait_for_load_state("domcontentloaded", timeout=min(5000, timeout_ms))
+                except Exception:
+                    pass
+            else:
+                try:
+                    page.goto(url, timeout=timeout_ms, wait_until="domcontentloaded")
+                except Exception:
+                    try:
+                        page.wait_for_load_state("domcontentloaded", timeout=min(5000, timeout_ms))
+                    except Exception:
+                        pass
             if wait_for:
                 page.wait_for_selector(wait_for, timeout=timeout_ms)
             else:

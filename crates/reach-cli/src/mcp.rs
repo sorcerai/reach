@@ -359,7 +359,7 @@ fn default_auth_timeout_seconds() -> u64 {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolResponse {
     pub content: Vec<ContentBlock>,
-    #[serde(default)]
+    #[serde(default, rename = "isError", alias = "is_error")]
     pub is_error: bool,
 }
 
@@ -504,6 +504,7 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                     "text": { "type": "string" },
                     "ref": { "type": "string", "description": "Optional element ref from page_text (e.g. '@e1' or 'e1') to focus before typing" },
                     "clear": { "type": "boolean", "default": false, "description": "Clear field before typing" },
+                    "submit": { "type": "boolean", "default": false, "description": "Automatically press Enter/Return after typing (combines fill + submit)" },
                     "sandbox": { "type": "string" },
                     "screen": { "type": "integer", "default": 0 }
                 }
@@ -531,6 +532,8 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                 "properties": {
                     "url": { "type": "string" },
                     "headed": { "type": "boolean", "default": true },
+                    "snapshot": { "type": "boolean", "default": false, "description": "If true, automatically captures and returns the compact AXTree after navigation (combines browse + page_text into 1 turn)" },
+                    "query": { "type": "string", "description": "Optional search term(s) to filter the inline snapshot AXTree" },
                     "sandbox": { "type": "string" },
                     "screen": { "type": "integer", "default": 0 }
                 }
@@ -605,6 +608,10 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "enum": ["axtree", "text", "both"],
                         "default": "both",
                         "description": "Output format: concise semantic AXTree with refs, raw text, or both"
+                    },
+                    "query": {
+                        "type": "string",
+                        "description": "Optional search term(s) to filter the AXTree and text to only lines containing matching keywords"
                     },
                     "view": {
                         "type": "string",
