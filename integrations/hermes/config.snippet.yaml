@@ -1,7 +1,16 @@
-# Merge into ~/.hermes/config.yaml inside reach-lab.
+# Merge into ~/.hermes/config.yaml (host or reach-lab). Required part:
 mcp_servers:
   reach:
-    url: http://127.0.0.1:4200/mcp
+    url: http://127.0.0.1:4200/mcp      # tools register as mcp__reach__<tool>
+plugins:
+  enabled: [reach-agent-computer]       # standalone user plugins are opt-in
+  entries:
+    reach-agent-computer:
+      settings:
+        api_url: http://127.0.0.1:4200  # reach REST (lease/takeover); no env vars needed
+# Install: ln -s <agent-computer>/integrations/hermes/plugins/reach-agent-computer ~/.hermes/plugins/
+#          ln -s <agent-computer>/integrations/hermes/skills/agent-computer      ~/.hermes/skills/
+# Everything below is reach-lab (Linux VM) specific; skip on a macOS host.
 gateway:
   # Linux/systemd-only: makes `hermes gateway` send sd_notify heartbeats and
   # lets the hermes-gateway.service unit run Type=notify with a matching

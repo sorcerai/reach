@@ -1,63 +1,15 @@
 name: reach-agent-computer
-version: "0.1.0"
-description: "Lease a reach Agent Computer screen per hermes profile, route reach tools to it, provide reach_drive CUA capabilities, and surface takeovers."
+version: "0.2.0"
+description: "Lease one reach Agent Computer screen per Hermes profile, route reach MCP tools to it, provide reach_drive (CUA via agy), and record human takeovers."
 author: "Reach Team"
-enabled_by_default: true
-
-tools:
-  - name: reach_lease_screen
-    description: "Lease an Agent Computer screen for this hermes profile or specified owner."
-    parameters:
-      type: object
-      properties:
-        screen:
-          type: integer
-          description: "Optional specific screen ID to lease. If omitted, leases first free screen."
-        owner:
-          type: string
-          description: "Optional lease owner identifier. Defaults to HERMES_PROFILE or 'default'."
-
-  - name: reach_release_screen
-    description: "Release the leased Agent Computer screen."
-    parameters:
-      type: object
-      properties:
-        screen:
-          type: integer
-          description: "Screen ID to release. Defaults to currently leased screen."
-        owner:
-          type: string
-          description: "Lease owner identifier. Defaults to HERMES_PROFILE or 'default'."
-
-  - name: reach_drive
-    description: "Run the CUA vision loop (Gemini 3.8 Flash via agy) to achieve a browser or desktop goal on Reach."
-    parameters:
-      type: object
-      required:
-        - goal
-      properties:
-        goal:
-          type: string
-          description: "Objective or task to accomplish on the desktop/browser."
-        screen:
-          type: integer
-          description: "Screen ID to drive. Defaults to currently leased screen or 0."
-        max_steps:
-          type: integer
-          default: 15
-          description: "Maximum number of vision-action steps to execute."
-        api_url:
-          type: string
-          description: "Reach server URL (default from REACH_AGENT_URL or http://127.0.0.1:4200)."
-        initial_url:
-          type: string
-          description: "Optional URL to navigate to before beginning the loop."
-
-  - name: reach_status
-    description: "Inspect the status of Reach Agent Computer screens, lease ownership, and live view URLs."
-    parameters:
-      type: object
-      properties:
-        screen:
-          type: integer
-          description: "Optional specific screen ID to inspect. If omitted, returns all screens."
+kind: standalone
+provides_tools: [reach_lease_screen, reach_release_screen, reach_status, reach_drive]
+provides_hooks: [on_session_start, pre_llm_call, pre_tool_call, post_tool_call, on_session_finalize]
+config_schema:
+  api_url:
+    type: str
+    default: "http://127.0.0.1:4200"
+    description: "reach host daemon base URL (REST + /mcp)"
+  repo_root:
+    type: str
+    description: "agent-computer checkout containing scripts/reach_drive.py (default: derived from plugin path)"
