@@ -15,9 +15,9 @@ pub struct ElementRef {
     #[serde(default)]
     pub selector: Option<String>,
     #[serde(default)]
-    pub point: Option<[i64; 2]>,
+    pub point: Option<[f64; 2]>,
     #[serde(default)]
-    pub box_bounds: Option<[i64; 4]>, // [x, y, width, height]
+    pub box_bounds: Option<[f64; 4]>, // [x, y, width, height]
     #[serde(default)]
     pub focused: bool,
     #[serde(default)]
@@ -29,10 +29,10 @@ impl ElementRef {
     /// Prefers explicit `point`, then center of `box_bounds`.
     pub fn target_coordinates(&self) -> Option<(i64, i64)> {
         if let Some([px, py]) = self.point {
-            return Some((px, py));
+            return Some((px.round() as i64, py.round() as i64));
         }
         if let Some([bx, by, bw, bh]) = self.box_bounds {
-            return Some((bx + bw / 2, by + bh / 2));
+            return Some(((bx + bw / 2.0).round() as i64, (by + bh / 2.0).round() as i64));
         }
         None
     }
@@ -160,8 +160,8 @@ mod tests {
             name: "Submit".into(),
             value: None,
             selector: None,
-            point: Some([320, 180]),
-            box_bounds: Some([300, 160, 40, 40]),
+            point: Some([320.0, 180.0]),
+            box_bounds: Some([300.0, 160.0, 40.0, 40.0]),
             focused: false,
             disabled: false,
         };
@@ -174,7 +174,7 @@ mod tests {
             value: None,
             selector: None,
             point: None,
-            box_bounds: Some([100, 200, 60, 20]),
+            box_bounds: Some([100.0, 200.0, 60.0, 20.0]),
             focused: false,
             disabled: false,
         };
@@ -195,6 +195,19 @@ mod tests {
     }
 
     #[test]
+    fn test_element_ref_deserialization_with_negative_zero_float() {
+        let json = r#"{
+            "ref": "e1",
+            "role": "link",
+            "name": "Wikipedia",
+            "point": [-0.0, 10.5],
+            "box_bounds": [-0.0, 0.0, 50.0, 50.0]
+        }"#;
+        let el: ElementRef = serde_json::from_str(json).unwrap();
+        assert_eq!(el.target_coordinates(), Some((0, 11)));
+    }
+
+    #[test]
     fn test_ref_table_store_and_lookup() {
         let table = RefTable::new();
         let mut refs = HashMap::new();
@@ -206,8 +219,8 @@ mod tests {
                 name: "Email".into(),
                 value: Some("alice@example.com".into()),
                 selector: Some("input[type=email]".into()),
-                point: Some([200, 300]),
-                box_bounds: Some([150, 280, 100, 40]),
+                point: Some([200.0, 300.0]),
+                box_bounds: Some([150.0, 280.0, 100.0, 40.0]),
                 focused: true,
                 disabled: false,
             },

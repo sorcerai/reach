@@ -1266,12 +1266,12 @@ try:
                         const isHeading = role === 'heading';
                         const isInteractive = !isHeading;
 
-                        const cx = Math.round(rect.left + rect.width / 2);
-                        const cy = Math.round(rect.top + rect.height / 2);
-                        const x = Math.round(rect.left);
-                        const y = Math.round(rect.top);
-                        const w = Math.round(rect.width);
-                        const h = Math.round(rect.height);
+                        const cx = Math.round(rect.left + rect.width / 2) + 0;
+                        const cy = Math.round(rect.top + rect.height / 2) + 0;
+                        const x = Math.round(rect.left) + 0;
+                        const y = Math.round(rect.top) + 0;
+                        const w = Math.round(rect.width) + 0;
+                        const h = Math.round(rect.height) + 0;
 
                         let refKey = null;
                         if (isInteractive) {

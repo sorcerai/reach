@@ -104,8 +104,8 @@ RUN useradd -m -s /bin/bash sandbox \
 # Chrome policies — disable auto-updates, first-run
 COPY config/chrome-policies.json /etc/opt/chrome/policies/managed/reach.json
 
-# Openbox config
-RUN mkdir -p /home/sandbox/.config/openbox
+# Openbox config and Chrome profiles
+RUN mkdir -p /home/sandbox/.config/openbox /home/sandbox/.config/google-chrome-profiles
 COPY config/openbox-rc.xml /home/sandbox/.config/openbox/rc.xml
 RUN chown -R sandbox:sandbox /home/sandbox
 

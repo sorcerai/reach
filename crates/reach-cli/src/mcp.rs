@@ -293,6 +293,10 @@ pub struct PageTextParams {
     pub selector: Option<String>,
     #[serde(default)]
     pub format: Option<String>,
+    #[serde(default)]
+    pub view: Option<String>,
+    #[serde(default)]
+    pub max_lines: Option<usize>,
     #[serde(default = "default_page_text_timeout")]
     pub timeout_ms: u64,
     #[serde(default)]
@@ -601,6 +605,17 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
                         "enum": ["axtree", "text", "both"],
                         "default": "both",
                         "description": "Output format: concise semantic AXTree with refs, raw text, or both"
+                    },
+                    "view": {
+                        "type": "string",
+                        "enum": ["compact", "full"],
+                        "default": "compact",
+                        "description": "View mode: 'compact' (capped at max_lines with truncation hint) or 'full'"
+                    },
+                    "max_lines": {
+                        "type": "integer",
+                        "default": 200,
+                        "description": "Maximum lines returned before truncation in compact mode"
                     },
                     "timeout_ms": {
                         "type": "integer",

@@ -259,6 +259,100 @@ pub fn build_scrape_command(screen: u32, payload_json: &str) -> String {
     )
 }
 
+/// Model-facing sanitized and token-compact representation of `page_text` output.
+///
+/// Strips sensitive browser `cookies` (P0 security) and drops the raw `refs`
+/// dictionary (which can span thousands of tokens). Interactive element tags
+/// like `[@e1: link "Title" ...]` remain inline in `axtree`, and their coordinates
+/// are stored in `GLOBAL_REF_TABLE` for backend resolution on `click`/`type`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct PageTextModelResponse {
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub elements_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub axtree: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Format and sanitize raw `PageTextOutput` for model consumption according to AXI standards.
+pub fn format_page_text_response(
+    out: crate::docker::PageTextOutput,
+    requested_format: &str,
+    view_mode: &str,
+    max_lines: usize,
+) -> PageTextModelResponse {
+    let elements_count = out.refs.as_ref().map(|r| r.len());
+    let is_full = view_mode.eq_ignore_ascii_case("full");
+    let mut any_truncated = false;
+
+    let axtree = match requested_format {
+        "text" => None,
+        _ => {
+            if let Some(tree) = out.axtree {
+                let lines: Vec<&str> = tree.lines().collect();
+                if !is_full && lines.len() > max_lines {
+                    let preview = lines[..max_lines].join("\n");
+                    any_truncated = true;
+                    Some(format!(
+                        "{}\n... [truncated {} lines ({} total). Pass view=\"full\" or a CSS `selector` to narrow]",
+                        preview,
+                        lines.len() - max_lines,
+                        lines.len()
+                    ))
+                } else {
+                    Some(tree)
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    let text = match requested_format {
+        "axtree" => None,
+        _ => {
+            if let Some(txt) = out.text {
+                let lines: Vec<&str> = txt.lines().collect();
+                if !is_full && lines.len() > max_lines {
+                    let preview = lines[..max_lines].join("\n");
+                    any_truncated = true;
+                    Some(format!(
+                        "{}\n... [truncated {} lines ({} total). Pass view=\"full\" or a CSS `selector` to narrow]",
+                        preview,
+                        lines.len() - max_lines,
+                        lines.len()
+                    ))
+                } else {
+                    Some(txt)
+                }
+            } else {
+                None
+            }
+        }
+    };
+
+    PageTextModelResponse {
+        status: out.status,
+        url: out.url,
+        title: out.title,
+        elements_count,
+        axtree,
+        text,
+        truncated: if any_truncated { Some(true) } else { None },
+        message: out.message,
+    }
+}
+
 /// Returns whether a tool performs active work on a screen.
 pub fn is_active_tool(tool: &str) -> bool {
     matches!(
@@ -521,6 +615,22 @@ pub async fn dispatch(
                 None
             };
 
+            let requested_format = args
+                .get("format")
+                .and_then(|v| v.as_str())
+                .unwrap_or("both");
+
+            let view_mode = args
+                .get("view")
+                .and_then(|v| v.as_str())
+                .unwrap_or("compact");
+
+            let max_lines = args
+                .get("max_lines")
+                .and_then(|v| v.as_u64())
+                .map(|n| n as usize)
+                .unwrap_or(200);
+
             let opts = PageTextOptions {
                 url,
                 wait_for: args
@@ -531,10 +641,7 @@ pub async fn dispatch(
                     .get("selector")
                     .and_then(|v| v.as_str())
                     .map(str::to_string),
-                format: args
-                    .get("format")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
+                format: Some(requested_format.to_string()),
                 timeout_ms: args
                     .get("timeout_ms")
                     .and_then(|v| v.as_u64())
@@ -554,7 +661,8 @@ pub async fn dispatch(
                             let _ = jars_svc.dump_cookies_to_jars(&out.cookies, &declared_jars);
                         }
                     }
-                    match serde_json::to_string_pretty(&out) {
+                    let resp = format_page_text_response(out, requested_format, view_mode, max_lines);
+                    match serde_json::to_string_pretty(&resp) {
                         Ok(s) => ToolResponse::text(s),
                         Err(e) => ToolResponse::error(e.to_string()),
                     }
@@ -926,5 +1034,124 @@ mod tests {
         let (prof_custom, eph_custom) = resolve_profile_name(&explicit_args, 0);
         assert_eq!(prof_custom, "custom-prof");
         assert!(!eph_custom);
+    }
+
+    #[test]
+    fn test_format_page_text_strips_cookies_and_raw_refs() {
+        let mut refs = std::collections::HashMap::new();
+        refs.insert(
+            "e1".to_string(),
+            crate::refs::ElementRef {
+                r#ref: "e1".into(),
+                role: "button".into(),
+                name: "Submit".into(),
+                value: None,
+                selector: None,
+                point: Some([10.0, 20.0]),
+                box_bounds: Some([0.0, 0.0, 50.0, 20.0]),
+                focused: false,
+                disabled: false,
+            },
+        );
+
+        let out = crate::docker::PageTextOutput {
+            status: "ok".into(),
+            text: Some("Page body text".into()),
+            axtree: Some("[@e1: button \"Submit\" x=0 y=0 w=50 h=20]".into()),
+            refs: Some(refs),
+            url: Some("https://example.com".into()),
+            title: Some("Example".into()),
+            message: None,
+            cookies: vec![crate::profile::Cookie {
+                name: "session_token".into(),
+                value: "super_secret_123".into(),
+                domain: "example.com".into(),
+                path: "/".into(),
+                http_only: Some(true),
+                secure: Some(true),
+                ..Default::default()
+            }],
+        };
+
+        let resp = format_page_text_response(out, "both", "compact", 200);
+        assert_eq!(resp.status, "ok");
+        assert_eq!(resp.elements_count, Some(1));
+        assert!(resp.axtree.is_some());
+        assert!(resp.text.is_some());
+        assert_eq!(resp.truncated, None);
+
+        let json = serde_json::to_string(&resp).unwrap();
+        // Zero cookies and zero raw coordinates in model response
+        assert!(!json.contains("session_token"));
+        assert!(!json.contains("super_secret_123"));
+        assert!(!json.contains("box_bounds"));
+        assert!(!json.contains("\"refs\":"));
+    }
+
+    #[test]
+    fn test_format_page_text_formats() {
+        let make_out = || crate::docker::PageTextOutput {
+            status: "ok".into(),
+            text: Some("Visible text".into()),
+            axtree: Some("[heading \"Title\"]".into()),
+            refs: None,
+            url: Some("https://example.com".into()),
+            title: Some("Example".into()),
+            message: None,
+            cookies: vec![],
+        };
+
+        let resp_axtree = format_page_text_response(make_out(), "axtree", "compact", 200);
+        assert!(resp_axtree.axtree.is_some());
+        assert!(resp_axtree.text.is_none());
+
+        let resp_text = format_page_text_response(make_out(), "text", "compact", 200);
+        assert!(resp_text.axtree.is_none());
+        assert!(resp_text.text.is_some());
+
+        let resp_both = format_page_text_response(make_out(), "both", "compact", 200);
+        assert!(resp_both.axtree.is_some());
+        assert!(resp_both.text.is_some());
+    }
+
+    #[test]
+    fn test_format_page_text_truncation_compact_vs_full() {
+        let long_tree = (1..=300)
+            .map(|i| format!("[@e{i}: link \"Link {i}\"]"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        let out1 = crate::docker::PageTextOutput {
+            status: "ok".into(),
+            text: None,
+            axtree: Some(long_tree.clone()),
+            refs: None,
+            url: Some("https://example.com".into()),
+            title: Some("Example".into()),
+            message: None,
+            cookies: vec![],
+        };
+
+        let compact_resp = format_page_text_response(out1, "axtree", "compact", 50);
+        assert_eq!(compact_resp.truncated, Some(true));
+        let tree_str = compact_resp.axtree.unwrap();
+        assert!(tree_str.contains("truncated 250 lines (300 total)"));
+        assert!(tree_str.contains("view=\"full\""));
+
+        let out2 = crate::docker::PageTextOutput {
+            status: "ok".into(),
+            text: None,
+            axtree: Some(long_tree),
+            refs: None,
+            url: Some("https://example.com".into()),
+            title: Some("Example".into()),
+            message: None,
+            cookies: vec![],
+        };
+
+        let full_resp = format_page_text_response(out2, "axtree", "full", 50);
+        assert_eq!(full_resp.truncated, None);
+        let tree_full = full_resp.axtree.unwrap();
+        assert_eq!(tree_full.lines().count(), 300);
     }
 }
