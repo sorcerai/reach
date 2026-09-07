@@ -109,15 +109,6 @@ fn live_view_tool_is_registered_and_has_no_required_fields() {
 }
 
 #[test]
-fn page_text_tool_requires_url() {
-    let tools = tool_definitions();
-    let pt = tools.iter().find(|t| t.name == "page_text").unwrap();
-    let required = pt.input_schema.get("required").unwrap();
-    let required: Vec<String> = serde_json::from_value(required.clone()).unwrap();
-    assert!(required.contains(&"url".into()));
-}
-
-#[test]
 fn auth_handoff_tool_requires_url() {
     let tools = tool_definitions();
     let ah = tools.iter().find(|t| t.name == "auth_handoff").unwrap();

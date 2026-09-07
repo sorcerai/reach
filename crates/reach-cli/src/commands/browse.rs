@@ -2,7 +2,7 @@ use clap::Args;
 use reach_cli::config::ReachConfig;
 use reach_cli::docker::{DockerClient, ProfileMount};
 use reach_cli::profile::{CookieJarService, LockHolderInfo, ProfileBroker};
-use reach_cli::tools::browse_command_full;
+use reach_cli::tools::browse_command_input;
 
 #[derive(Args, Clone, Debug)]
 pub struct BrowseArgs {
@@ -84,23 +84,19 @@ pub async fn run(args: BrowseArgs) -> anyhow::Result<()> {
     };
 
     let cdp_port = 9222 + args.screen as u16;
-    let cmd = browse_command_full(
+    let display = format!(":{}", 99 + args.screen);
+    let (command, payload) = browse_command_input(
         &args.url,
         &profile_dir,
         hydrated_json.as_deref(),
         Some(cdp_port),
+        &display,
+        None,
     );
-    let display = format!(":{}", 99 + args.screen);
-    docker
-        .exec(
-            &target,
-            &[
-                "bash".into(),
-                "-c".into(),
-                format!("DISPLAY={display} {cmd}"),
-            ],
-        )
-        .await?;
+    let result = docker.exec_input(&target, &command, &payload).await?;
+    if result.exit_code != 0 {
+        anyhow::bail!("browser launch or hydration failed");
+    }
 
     println!(
         "Opened {} in sandbox '{}' on screen {} (profile: {})",

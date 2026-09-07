@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, RwLock};
@@ -14,6 +15,8 @@ pub struct ElementRef {
     pub value: Option<String>,
     #[serde(default)]
     pub selector: Option<String>,
+    #[serde(default)]
+    pub backend_node_id: Option<i64>,
     #[serde(default)]
     pub point: Option<[f64; 2]>,
     #[serde(default)]
@@ -32,25 +35,113 @@ impl ElementRef {
             return Some((px.round() as i64, py.round() as i64));
         }
         if let Some([bx, by, bw, bh]) = self.box_bounds {
-            return Some(((bx + bw / 2.0).round() as i64, (by + bh / 2.0).round() as i64));
+            return Some((
+                (bx + bw / 2.0).round() as i64,
+                (by + bh / 2.0).round() as i64,
+            ));
         }
         None
     }
 }
 
+/// Identity of the observation that produced a reference set.
+///
+/// The container incarnation prevents refs surviving a computer restart. The lease attempt
+/// prevents refs crossing account/task leases, and the handoff generation prevents refs crossing
+/// human takeovers, releases, and acknowledgements.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub struct RefScope {
+    pub incarnation: String,
+    pub screen: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_gen: Option<u64>,
+    /// Generation of the successful page observation that produced these refs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub observation_gen: Option<u64>,
+}
+
+impl RefScope {
+    pub fn new(
+        incarnation: impl Into<String>,
+        screen: u32,
+        attempt_id: Option<String>,
+        handoff_gen: Option<u64>,
+    ) -> Self {
+        Self {
+            incarnation: incarnation.into(),
+            screen,
+            attempt_id: attempt_id.filter(|value| !value.is_empty()),
+            handoff_gen,
+            observation_gen: None,
+        }
+    }
+    pub fn with_observation_gen(mut self, observation_gen: Option<u64>) -> Self {
+        self.observation_gen = observation_gen;
+        self
+    }
+
+    fn storage_key(&self) -> String {
+        let encoded = serde_json::to_vec(self).expect("RefScope serializes");
+        let digest = Sha256::digest(encoded);
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+}
+
+/// Result of registering an observation. `token_map` maps the browser-produced refs to the
+/// fresh numeric refs returned to the model; `refs` contains the corresponding backend entries.
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotRefs {
+    pub refs: ScreenRefMap,
+    pub token_map: HashMap<String, String>,
+}
+
 /// Normalize an element reference by trimming whitespace and stripping any leading `@`.
 /// E.g. `"@e14"` -> `"e14"`, `"e14"` -> `"e14"`.
 pub fn normalize_ref(r: &str) -> &str {
-    r.trim().strip_prefix('@').unwrap_or(r.trim())
+    let trimmed = r.trim();
+    trimmed.strip_prefix('@').unwrap_or(trimmed)
+}
+
+fn is_numeric_ref(value: &str) -> bool {
+    let Some(digits) = value.strip_prefix('e') else {
+        return false;
+    };
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 pub type ScreenRefMap = HashMap<String, ElementRef>;
-pub type TargetScreenKey = (String, u32);
+pub type TargetScreenKey = RefScope;
 
-/// In-memory table storing active semantic refs per target sandbox and screen.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug)]
+struct RefTableInner {
+    entries: RwLock<HashMap<TargetScreenKey, ScreenRefMap>>,
+    page_targets: RwLock<HashMap<TargetScreenKey, PageIdentity>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct PageIdentity {
+    pub target_id: String,
+    #[serde(default)]
+    pub loader_id: Option<String>,
+}
+
+/// In-memory table storing active semantic refs per observation identity.
+#[derive(Debug, Clone)]
 pub struct RefTable {
-    entries: Arc<RwLock<HashMap<TargetScreenKey, ScreenRefMap>>>,
+    inner: Arc<RefTableInner>,
+}
+
+impl Default for RefTable {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(RefTableInner {
+                entries: RwLock::new(HashMap::new()),
+                page_targets: RwLock::new(HashMap::new()),
+            }),
+        }
+    }
 }
 
 impl RefTable {
@@ -58,36 +149,140 @@ impl RefTable {
         Self::default()
     }
 
-    /// Replace all registered refs for a given `(target, screen)` pair.
-    pub fn set_refs(&self, target: &str, screen: u32, refs: HashMap<String, ElementRef>) {
-        let mut map = self.entries.write().unwrap();
-        let normalized = refs
-            .into_iter()
-            .map(|(k, v)| (normalize_ref(&k).to_string(), v))
-            .collect();
-        map.insert((target.to_string(), screen), normalized);
+    /// Replace all registered refs for an observation and assign fresh numeric references.
+    pub fn set_refs(&self, scope: RefScope, refs: HashMap<String, ElementRef>) -> SnapshotRefs {
+        self.clear_screen(&scope.incarnation, scope.screen);
+        let mut normalized = HashMap::with_capacity(refs.len());
+        let mut token_map = HashMap::with_capacity(refs.len());
+
+        for (source_key, mut element) in refs {
+            let source = normalize_ref(&source_key).to_string();
+            if !is_numeric_ref(&source) {
+                continue;
+            }
+            let assigned = format!("e{}", uuid::Uuid::new_v4().as_u128());
+            element.r#ref = assigned.clone();
+            token_map.insert(source, assigned.clone());
+            normalized.insert(assigned, element);
+        }
+
+        self.inner
+            .entries
+            .write()
+            .expect("reference table lock poisoned")
+            .insert(scope.clone(), normalized.clone());
+        self.inner
+            .page_targets
+            .write()
+            .expect("reference table lock poisoned")
+            .remove(&scope);
+
+        SnapshotRefs {
+            refs: normalized,
+            token_map,
+        }
     }
 
-    /// Retrieve an `ElementRef` by name for a given screen.
-    pub fn get_ref(&self, target: &str, screen: u32, ref_name: &str) -> Option<ElementRef> {
+    /// Register the native page target associated with a snapshot.
+    pub fn set_page_identity(
+        &self,
+        scope: RefScope,
+        target_id: Option<String>,
+        loader_id: Option<String>,
+    ) {
+        let mut targets = self
+            .inner
+            .page_targets
+            .write()
+            .expect("reference table lock poisoned");
+        match (
+            target_id.filter(|id| !id.is_empty()),
+            loader_id.filter(|id| !id.is_empty()),
+        ) {
+            (Some(target_id), loader_id) => {
+                targets.insert(
+                    scope,
+                    PageIdentity {
+                        target_id,
+                        loader_id,
+                    },
+                );
+            }
+            _ => {
+                targets.remove(&scope);
+            }
+        }
+    }
+
+    pub fn set_page_target(&self, scope: RefScope, target_id: Option<String>) {
+        self.set_page_identity(scope, target_id, None);
+    }
+
+    pub fn page_identity(&self, scope: &RefScope) -> Option<PageIdentity> {
+        self.inner
+            .page_targets
+            .read()
+            .expect("reference table lock poisoned")
+            .get(scope)
+            .cloned()
+    }
+
+    pub fn page_target(&self, scope: &RefScope) -> Option<String> {
+        self.page_identity(scope).map(|identity| identity.target_id)
+    }
+
+    /// Retrieve an `ElementRef` by numeric ref for a given observation.
+    pub fn get_ref(&self, scope: &RefScope, ref_name: &str) -> Option<ElementRef> {
         let clean = normalize_ref(ref_name);
-        let map = self.entries.read().unwrap();
-        map.get(&(target.to_string(), screen))
+        if !is_numeric_ref(clean) {
+            return None;
+        }
+        self.inner
+            .entries
+            .read()
+            .expect("reference table lock poisoned")
+            .get(scope)
             .and_then(|screen_refs| screen_refs.get(clean).cloned())
     }
 
-    /// List all registered `ElementRef` items for a given screen.
-    pub fn list_refs(&self, target: &str, screen: u32) -> Vec<ElementRef> {
-        let map = self.entries.read().unwrap();
-        map.get(&(target.to_string(), screen))
+    /// List all registered `ElementRef` items for a given observation.
+    pub fn list_refs(&self, scope: &RefScope) -> Vec<ElementRef> {
+        self.inner
+            .entries
+            .read()
+            .expect("reference table lock poisoned")
+            .get(scope)
             .map(|screen_refs| screen_refs.values().cloned().collect())
             .unwrap_or_default()
     }
 
-    /// Clear all registered refs for a given screen (e.g. after top-level navigation).
-    pub fn clear(&self, target: &str, screen: u32) {
-        let mut map = self.entries.write().unwrap();
-        map.remove(&(target.to_string(), screen));
+    /// Clear all registered refs for a given observation.
+    pub fn clear(&self, scope: &RefScope) {
+        self.inner
+            .entries
+            .write()
+            .expect("reference table lock poisoned")
+            .remove(scope);
+        self.inner
+            .page_targets
+            .write()
+            .expect("reference table lock poisoned")
+            .remove(scope);
+    }
+    /// Clear all refs and native identities for one screen, regardless of observation generation.
+    pub fn clear_screen(&self, incarnation: &str, screen: u32) {
+        let scopes: Vec<_> = self
+            .inner
+            .entries
+            .read()
+            .expect("reference table lock poisoned")
+            .keys()
+            .filter(|scope| scope.incarnation == incarnation && scope.screen == screen)
+            .cloned()
+            .collect();
+        for scope in scopes {
+            self.clear(&scope);
+        }
     }
 }
 
@@ -96,6 +291,53 @@ static GLOBAL_REF_TABLE: LazyLock<RefTable> = LazyLock::new(RefTable::new);
 /// Access the global shared reference table.
 pub fn global_ref_table() -> &'static RefTable {
     &GLOBAL_REF_TABLE
+}
+
+/// Rewrite every exact `@e<number>` token in an AXTree using the fresh numeric refs.
+/// Non-reference text and unknown/non-token-looking strings remain byte-for-byte unchanged.
+pub fn rewrite_axtree(axtree: &str, token_map: &HashMap<String, String>) -> String {
+    let mut output = String::with_capacity(axtree.len());
+    let mut cursor = 0;
+    while cursor < axtree.len() {
+        let remaining = &axtree[cursor..];
+        let Some(relative_start) = remaining.find("@e") else {
+            output.push_str(remaining);
+            break;
+        };
+        let start = cursor + relative_start;
+        output.push_str(&axtree[cursor..start]);
+
+        let after_prefix = start + 2;
+        let digits_end = after_prefix
+            + axtree[after_prefix..]
+                .bytes()
+                .take_while(|byte| byte.is_ascii_digit())
+                .count();
+        if digits_end == after_prefix {
+            output.push_str("@e");
+            cursor = after_prefix;
+            continue;
+        }
+
+        let is_token_boundary = axtree[digits_end..]
+            .chars()
+            .next()
+            .map(|ch| !(ch.is_ascii_alphanumeric() || ch == '_'))
+            .unwrap_or(true);
+        let source = &axtree[start + 1..digits_end];
+        if is_token_boundary {
+            if let Some(replacement) = token_map.get(source) {
+                output.push('@');
+                output.push_str(replacement);
+            } else {
+                output.push_str(&axtree[start..digits_end]);
+            }
+        } else {
+            output.push_str(&axtree[start..digits_end]);
+        }
+        cursor = digits_end;
+    }
+    output
 }
 
 fn ref_storage_dir() -> Option<PathBuf> {
@@ -107,42 +349,124 @@ fn ref_storage_dir() -> Option<PathBuf> {
         .map(|h| PathBuf::from(h).join(".reach").join("refs"))
 }
 
-/// Persist refs to disk at `~/.reach/refs/{target}_screen_{screen}.json`.
-pub fn save_refs_to_disk(target: &str, screen: u32, refs: &HashMap<String, ElementRef>) {
-    if let Some(dir) = ref_storage_dir() {
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join(format!("{target}_screen_{screen}.json"));
-        if let Ok(data) = serde_json::to_string_pretty(refs) {
-            let _ = std::fs::write(file_path, data);
-        }
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredElementRef {
+    pub r#ref: String,
+    pub point: Option<[f64; 2]>,
+    pub box_bounds: Option<[f64; 4]>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StoredSnapshot {
+    scope: RefScope,
+    refs: HashMap<String, StoredElementRef>,
+}
+
+/// Persist only the opaque ref identity and geometry. Text, selectors, values, and state flags
+/// never enter the durable cache. The scope digest also avoids unsafe filename interpolation.
+pub fn save_refs_to_disk(scope: &RefScope, refs: &HashMap<String, ElementRef>) {
+    let Some(dir) = ref_storage_dir() else {
+        return;
+    };
+    let _ = std::fs::create_dir_all(&dir);
+    let file_path = dir.join(format!("scope_{}.json", scope.storage_key()));
+    let stored_refs = refs
+        .iter()
+        .filter(|(key, _)| is_numeric_ref(key))
+        .map(|(key, element)| {
+            (
+                key.clone(),
+                StoredElementRef {
+                    // The map key is the only accepted opaque identity; do not persist an
+                    // untrusted ElementRef.r#ref field.
+                    r#ref: key.clone(),
+                    point: element.point,
+                    box_bounds: element.box_bounds,
+                },
+            )
+        })
+        .collect();
+    let snapshot = StoredSnapshot {
+        scope: scope.clone(),
+        refs: stored_refs,
+    };
+    if let Ok(data) = serde_json::to_string(&snapshot) {
+        let _ = std::fs::write(file_path, data);
     }
 }
 
-/// Load refs from disk if present.
-pub fn load_refs_from_disk(target: &str, screen: u32) -> Option<HashMap<String, ElementRef>> {
+/// Load a scoped snapshot from disk, returning only geometry and opaque identity.
+pub fn load_refs_from_disk(scope: &RefScope) -> Option<HashMap<String, ElementRef>> {
     let dir = ref_storage_dir()?;
-    let file_path = dir.join(format!("{target}_screen_{screen}.json"));
+    let file_path = dir.join(format!("scope_{}.json", scope.storage_key()));
     let data = std::fs::read_to_string(file_path).ok()?;
-    serde_json::from_str(&data).ok()
+    let snapshot: StoredSnapshot = serde_json::from_str(&data).ok()?;
+    if snapshot.scope != *scope {
+        return None;
+    }
+    Some(
+        snapshot
+            .refs
+            .into_iter()
+            .map(|(key, stored)| {
+                (
+                    key,
+                    ElementRef {
+                        r#ref: stored.r#ref,
+                        role: String::new(),
+                        name: String::new(),
+                        value: None,
+                        selector: None,
+                        backend_node_id: None,
+                        point: stored.point,
+                        box_bounds: stored.box_bounds,
+                        focused: false,
+                        disabled: false,
+                    },
+                )
+            })
+            .collect(),
+    )
 }
 
-/// Resolve an element reference by name, checking in-memory `GLOBAL_REF_TABLE`
-/// first and falling back to persisted disk cache if available.
-pub fn resolve_ref(target: &str, screen: u32, ref_name: &str) -> Option<ElementRef> {
-    if let Some(el) = global_ref_table().get_ref(target, screen, ref_name) {
-        return Some(el);
-    }
-    // Attempt hydration from disk cache (for cross-process CLI calls)
-    if let Some(disk_refs) = load_refs_from_disk(target, screen) {
-        global_ref_table().set_refs(target, screen, disk_refs);
-        return global_ref_table().get_ref(target, screen, ref_name);
-    }
-    None
+/// Resolve only refs from the currently registered observation. Persisted snapshots are never
+/// hydrated implicitly, so a prior observation cannot become actionable accidentally.
+pub fn resolve_ref(scope: &RefScope, ref_name: &str) -> Option<ElementRef> {
+    global_ref_table().get_ref(scope, ref_name)
+}
+
+/// Resolve the native target identity captured for a snapshot.
+pub fn resolve_page_target(scope: &RefScope) -> Option<String> {
+    global_ref_table().page_target(scope)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scope(attempt_id: &str, handoff_gen: u64) -> RefScope {
+        RefScope::new(
+            "container:started",
+            0,
+            Some(attempt_id.into()),
+            Some(handoff_gen),
+        )
+    }
+
+    fn element(ref_name: &str, name: &str) -> ElementRef {
+        ElementRef {
+            r#ref: ref_name.into(),
+            role: "textbox".into(),
+            name: name.into(),
+            value: Some("secret-value".into()),
+            selector: Some("input[type=email]".into()),
+            backend_node_id: None,
+            point: Some([200.0, 300.0]),
+            box_bounds: Some([150.0, 280.0, 100.0, 40.0]),
+            focused: true,
+            disabled: false,
+        }
+    }
 
     #[test]
     fn test_normalize_ref() {
@@ -160,6 +484,7 @@ mod tests {
             name: "Submit".into(),
             value: None,
             selector: None,
+            backend_node_id: None,
             point: Some([320.0, 180.0]),
             box_bounds: Some([300.0, 160.0, 40.0, 40.0]),
             focused: false,
@@ -173,6 +498,7 @@ mod tests {
             name: "Help".into(),
             value: None,
             selector: None,
+            backend_node_id: None,
             point: None,
             box_bounds: Some([100.0, 200.0, 60.0, 20.0]),
             focused: false,
@@ -186,6 +512,7 @@ mod tests {
             name: "Label".into(),
             value: None,
             selector: None,
+            backend_node_id: None,
             point: None,
             box_bounds: None,
             focused: false,
@@ -208,37 +535,40 @@ mod tests {
     }
 
     #[test]
-    fn test_ref_table_store_and_lookup() {
+    fn snapshots_get_fresh_numeric_refs_and_stale_scopes_do_not_resolve() {
         let table = RefTable::new();
-        let mut refs = HashMap::new();
-        refs.insert(
-            "@e1".into(),
-            ElementRef {
-                r#ref: "e1".into(),
-                role: "textbox".into(),
-                name: "Email".into(),
-                value: Some("alice@example.com".into()),
-                selector: Some("input[type=email]".into()),
-                point: Some([200.0, 300.0]),
-                box_bounds: Some([150.0, 280.0, 100.0, 40.0]),
-                focused: true,
-                disabled: false,
-            },
+        let first_scope = scope("attempt-a", 1).with_observation_gen(Some(1));
+        let second_scope = scope("attempt-a", 1).with_observation_gen(Some(2));
+        let first = table.set_refs(
+            first_scope.clone(),
+            HashMap::from([("e1".into(), element("e1", "first"))]),
+        );
+        let second = table.set_refs(
+            second_scope.clone(),
+            HashMap::from([("e1".into(), element("e1", "second"))]),
+        );
+        let first_id = &first.token_map["e1"];
+        let second_id = &second.token_map["e1"];
+        assert_ne!(first_id, second_id);
+        assert!(is_numeric_ref(first_id) && is_numeric_ref(second_id));
+        assert!(table.get_ref(&first_scope, first_id).is_none());
+        assert_eq!(
+            table.get_ref(&second_scope, second_id).unwrap().name,
+            "second"
         );
 
-        table.set_refs("default-box", 0, refs);
+        let restarted = scope("attempt-a", 2);
+        assert!(table.get_ref(&restarted, second_id).is_none());
+        let new_computer = RefScope::new("different:started", 0, Some("attempt-a".into()), Some(1));
+        assert!(table.get_ref(&new_computer, second_id).is_none());
+    }
 
-        // Can look up with or without leading @
-        let found1 = table.get_ref("default-box", 0, "@e1");
-        assert!(found1.is_some());
-        assert_eq!(found1.unwrap().name, "Email");
-
-        let found2 = table.get_ref("default-box", 0, "e1");
-        assert!(found2.is_some());
-        assert_eq!(found2.unwrap().value, Some("alice@example.com".into()));
-
-        // Nonexistent ref returns None
-        assert!(table.get_ref("default-box", 0, "@e2").is_none());
-        assert!(table.get_ref("other-box", 0, "@e1").is_none());
+    #[test]
+    fn axtree_tokens_are_rewritten_exactly() {
+        let map = HashMap::from([(String::from("e1"), String::from("e42"))]);
+        assert_eq!(
+            rewrite_axtree("[@e1: button \"Save\"] text @e10 @e1foo", &map),
+            "[@e42: button \"Save\"] text @e10 @e1foo"
+        );
     }
 }

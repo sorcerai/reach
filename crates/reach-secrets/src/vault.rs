@@ -4,7 +4,11 @@
 //! (or path configured via `REACH_VAULT_PATH` or `config.toml`), Unix permission enforcement
 //! (0700 dir, 0600 file), domain normalization, and standard Base32 / HMAC-SHA1 TOTP generation.
 
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use hmac::{Hmac, Mac};
+use pbkdf2::pbkdf2_hmac;
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -95,11 +99,146 @@ pub struct VaultData {
     pub credentials: BTreeMap<String, Credential>,
 }
 
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum StoredData {
-    Structured(VaultData),
-    Flat(BTreeMap<String, Credential>),
+fn parse_stored_value(value: serde_json::Value) -> Result<VaultData, VaultError> {
+    if value
+        .as_object()
+        .is_some_and(|object| object.contains_key("credentials"))
+    {
+        Ok(serde_json::from_value(value)?)
+    } else {
+        Ok(VaultData {
+            credentials: serde_json::from_value(value)?,
+        })
+    }
+}
+
+const VAULT_KDF: &str = "pbkdf2_sha256";
+const VAULT_ITERATIONS: u32 = 100_000;
+const VAULT_SALT_LEN: usize = 16;
+const VAULT_NONCE_LEN: usize = 16;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct EncryptedEnvelope {
+    #[serde(rename = "_version")]
+    version: u8,
+    #[serde(rename = "_encrypted")]
+    encrypted: bool,
+    kdf: String,
+    iterations: u32,
+    salt: String,
+    nonce: String,
+    ciphertext: String,
+    tag: String,
+}
+
+fn vault_key() -> Option<String> {
+    std::env::var("REACH_VAULT_KEY")
+        .ok()
+        .filter(|key| !key.is_empty())
+}
+
+fn derive_vault_keys(passphrase: &str, salt: &[u8]) -> ([u8; 32], [u8; 32]) {
+    let mut derived = [0u8; 64];
+    pbkdf2_hmac::<Sha256>(passphrase.as_bytes(), salt, VAULT_ITERATIONS, &mut derived);
+    let mut enc = [0u8; 32];
+    let mut mac = [0u8; 32];
+    enc.copy_from_slice(&derived[..32]);
+    mac.copy_from_slice(&derived[32..]);
+    (enc, mac)
+}
+
+fn xor_keystream(data: &[u8], enc_key: &[u8; 32], nonce: &[u8]) -> Vec<u8> {
+    let mut output = vec![0u8; data.len()];
+    for (block_index, chunk) in data.chunks(32).enumerate() {
+        let mut mac =
+            Hmac::<Sha256>::new_from_slice(enc_key).expect("HMAC-SHA256 accepts every 32-byte key");
+        mac.update(nonce);
+        mac.update(&(block_index as u64).to_be_bytes());
+        let stream = mac.finalize().into_bytes();
+        let start = block_index * 32;
+        for (offset, byte) in chunk.iter().enumerate() {
+            output[start + offset] = *byte ^ stream[offset];
+        }
+    }
+    output
+}
+
+fn decode_encrypted(envelope: EncryptedEnvelope, passphrase: &str) -> Result<Vec<u8>, VaultError> {
+    if envelope.version != 1 || !envelope.encrypted || envelope.kdf != VAULT_KDF {
+        return Err(VaultError::Other(
+            "unsupported encrypted vault format".into(),
+        ));
+    }
+    if envelope.iterations != VAULT_ITERATIONS {
+        return Err(VaultError::Other(
+            "unsupported encrypted vault KDF parameters".into(),
+        ));
+    }
+    let salt = BASE64
+        .decode(envelope.salt)
+        .map_err(|_| VaultError::Other("invalid encrypted vault salt".into()))?;
+    let nonce = BASE64
+        .decode(envelope.nonce)
+        .map_err(|_| VaultError::Other("invalid encrypted vault nonce".into()))?;
+    let ciphertext = BASE64
+        .decode(envelope.ciphertext)
+        .map_err(|_| VaultError::Other("invalid encrypted vault ciphertext".into()))?;
+    let tag = BASE64
+        .decode(envelope.tag)
+        .map_err(|_| VaultError::Other("invalid encrypted vault authentication tag".into()))?;
+    if salt.len() != VAULT_SALT_LEN || nonce.len() != VAULT_NONCE_LEN || tag.len() != 32 {
+        return Err(VaultError::Other(
+            "invalid encrypted vault envelope lengths".into(),
+        ));
+    }
+
+    let (enc_key, mac_key) = derive_vault_keys(passphrase, &salt);
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts every 32-byte key");
+    mac.update(&salt);
+    mac.update(&nonce);
+    mac.update(&ciphertext);
+    mac.verify_slice(&tag)
+        .map_err(|_| VaultError::Other("encrypted vault authentication failed".into()))?;
+    Ok(xor_keystream(&ciphertext, &enc_key, &nonce))
+}
+
+#[cfg(unix)]
+fn random_vault_bytes<const N: usize>() -> Result<[u8; N], VaultError> {
+    use std::io::Read;
+    let mut bytes = [0u8; N];
+    std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
+    Ok(bytes)
+}
+
+#[cfg(not(unix))]
+fn random_vault_bytes<const N: usize>() -> Result<[u8; N], VaultError> {
+    Err(VaultError::Other(
+        "encrypted vault writes require an operating system random source".into(),
+    ))
+}
+
+fn encode_encrypted(plaintext: &[u8], passphrase: &str) -> Result<EncryptedEnvelope, VaultError> {
+    let salt = random_vault_bytes::<VAULT_SALT_LEN>()?;
+    let nonce = random_vault_bytes::<VAULT_NONCE_LEN>()?;
+    let (enc_key, mac_key) = derive_vault_keys(passphrase, &salt);
+    let ciphertext = xor_keystream(plaintext, &enc_key, &nonce);
+    let mut mac =
+        Hmac::<Sha256>::new_from_slice(&mac_key).expect("HMAC-SHA256 accepts every 32-byte key");
+    mac.update(&salt);
+    mac.update(&nonce);
+    mac.update(&ciphertext);
+    let tag = mac.finalize().into_bytes();
+    Ok(EncryptedEnvelope {
+        version: 1,
+        encrypted: true,
+        kdf: VAULT_KDF.into(),
+        iterations: VAULT_ITERATIONS,
+        salt: BASE64.encode(salt),
+        nonce: BASE64.encode(nonce),
+        ciphertext: BASE64.encode(ciphertext),
+        tag: BASE64.encode(tag),
+    })
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -314,12 +453,10 @@ pub fn hotp(key: &[u8], counter: u64) -> u32 {
         | (hash[offset + 3] as u32);
     binary_code % 1_000_000
 }
-
-/// Computes a 6-digit TOTP token at the given timestamp and time step (default 30s).
+/// Computes a 6-digit TOTP token at the given timestamp and time step.
 pub fn totp_at(key: &[u8], timestamp_secs: u64, step_secs: u64) -> String {
-    let time_step = timestamp_secs / step_secs;
-    let code = hotp(key, time_step);
-    format!("{code:06}")
+    let counter = timestamp_secs / step_secs.max(1);
+    format!("{:06}", hotp(key, counter))
 }
 
 /// Generates a 6-digit TOTP token from a Base32 secret at an explicit Unix timestamp.
@@ -449,17 +586,26 @@ impl Vault {
         }
 
         let _ = enforce_file_permissions(&self.path);
-
         let content = std::fs::read_to_string(&self.path)?;
         if content.trim().is_empty() {
             return Ok(VaultData::default());
         }
 
-        match serde_json::from_str::<StoredData>(&content) {
-            Ok(StoredData::Structured(v)) => Ok(v),
-            Ok(StoredData::Flat(m)) => Ok(VaultData { credentials: m }),
-            Err(e) => Err(VaultError::Json(e)),
+        let value: serde_json::Value = serde_json::from_str(&content)?;
+        if value
+            .as_object()
+            .and_then(|object| object.get("_encrypted"))
+            .and_then(serde_json::Value::as_bool)
+            == Some(true)
+        {
+            let key = vault_key().ok_or_else(|| {
+                VaultError::Other("vault is encrypted but REACH_VAULT_KEY is not configured".into())
+            })?;
+            let envelope: EncryptedEnvelope = serde_json::from_value(value)?;
+            let plaintext = decode_encrypted(envelope, &key)?;
+            return parse_stored_value(serde_json::from_slice(&plaintext)?);
         }
+        parse_stored_value(value)
     }
 
     /// Save vault data to disk, enforcing 0700 dir permissions and 0600 file permissions.
@@ -469,7 +615,33 @@ impl Vault {
             enforce_dir_permissions(parent)?;
         }
 
-        let json_str = serde_json::to_string_pretty(data)?;
+        let existing_encrypted = if self.path.exists() {
+            let content = std::fs::read_to_string(&self.path)?;
+            serde_json::from_str::<serde_json::Value>(&content)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .as_object()
+                        .and_then(|object| object.get("_encrypted"))
+                        .and_then(serde_json::Value::as_bool)
+                })
+                == Some(true)
+        } else {
+            false
+        };
+        let json_str = if existing_encrypted || vault_key().is_some() {
+            let key = vault_key().ok_or_else(|| {
+                VaultError::Other("vault is encrypted but REACH_VAULT_KEY is not configured".into())
+            })?;
+            // Python ReachVault expects its decrypted payload to be the flat
+            // domain-to-credential mapping, not the native structured wrapper.
+            let plaintext = serde_json::to_vec_pretty(&data.credentials)?;
+            serde_json::to_string_pretty(&encode_encrypted(&plaintext, &key)?)?
+        } else {
+            let plaintext = serde_json::to_vec_pretty(data)?;
+            String::from_utf8(plaintext)
+                .map_err(|_| VaultError::Other("vault JSON is not valid UTF-8".into()))?
+        };
 
         #[cfg(unix)]
         {
@@ -627,6 +799,7 @@ pub fn generate_totp(domain: &str) -> Result<String, VaultError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn test_domain_normalization() {
@@ -731,6 +904,9 @@ mod tests {
 
     #[test]
     fn test_vault_persistence_and_permissions() {
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         let c = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let nanos = std::time::SystemTime::now()
@@ -793,8 +969,86 @@ mod tests {
         assert!(!vault.delete("github.com"));
         assert_eq!(vault.get("github.com"), None);
         assert_eq!(vault.list().len(), 0);
+    }
+    #[test]
+    fn test_python_encrypted_vault_compatibility_and_tamper_rejection() {
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir =
+            std::env::temp_dir().join(format!("reach-encrypted-vault-test-{}", std::process::id()));
+        let vault_file = temp_dir.join("secrets.json");
+        let envelope = r#"{"_version":1,"_encrypted":true,"kdf":"pbkdf2_sha256","iterations":100000,"salt":"AAECAwQFBgcICQoLDA0ODw==","nonce":"EBESExQVFhcYGRobHB0eHw==","ciphertext":"yybiRrBOdSWJ+x8JwmNFGVEVWO26zqZ/OUD6b7n52iYFXq++40gVyGjPrP9eVp7oRmkGUgchbgOEmxyM4gC62L1PmNDNbjU42VMwT2gCuX/pnYjgw4vwbkFeFwUrEkw15R7IP9iTO3vG+RClwXq/","tag":"KUHg8einxvKcvctj0b4Qh3eerN7NYGFMQjt2wZDDajs="}"#;
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(&vault_file, envelope).unwrap();
 
-        // Clean up
-        let _ = std::fs::remove_dir_all(&temp_dir);
+        let vault = Vault::new(&vault_file);
+        unsafe { std::env::set_var("REACH_VAULT_KEY", "test-key") };
+        let cred = vault.load_data().unwrap().credentials["github.com"].clone();
+        assert_eq!(cred.username, "octocat");
+        assert_eq!(cred.password, "secret-pass");
+
+        let mut tampered = envelope.replace("yybi", "zybi");
+        std::fs::write(&vault_file, &tampered).unwrap();
+        assert!(vault.load_data().is_err());
+
+        tampered = envelope.replace("KUHg", "LUHg");
+        std::fs::write(&vault_file, tampered).unwrap();
+        assert!(vault.load_data().is_err());
+
+        unsafe { std::env::remove_var("REACH_VAULT_KEY") };
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+    #[test]
+    fn test_encrypted_save_round_trip() {
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!(
+            "reach-encrypted-vault-save-test-{}",
+            std::process::id()
+        ));
+        let vault_file = temp_dir.join("secrets.json");
+        let vault = Vault::new(&vault_file);
+        unsafe { std::env::set_var("REACH_VAULT_KEY", "write-key") };
+        let mut data = VaultData::default();
+        data.credentials.insert(
+            "example.com".into(),
+            Credential {
+                username: "user".into(),
+                password: "pass".into(),
+                totp_secret: None,
+            },
+        );
+        vault.save_data(&data).unwrap();
+        let raw = std::fs::read_to_string(&vault_file).unwrap();
+        assert!(raw.contains("\"_encrypted\": true"));
+        assert!(!raw.contains("\"password\": \"pass\""));
+        assert_eq!(vault.load_data().unwrap(), data);
+        unsafe { std::env::remove_var("REACH_VAULT_KEY") };
+        let _ = std::fs::remove_dir_all(temp_dir);
+    }
+
+    #[test]
+    fn test_plain_vault_never_silently_downgrades_encrypted_storage() {
+        let _env_guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let temp_dir = std::env::temp_dir().join(format!(
+            "reach-encrypted-vault-downgrade-test-{}",
+            std::process::id()
+        ));
+        let vault_file = temp_dir.join("secrets.json");
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        std::fs::write(
+            &vault_file,
+            r#"{"_version":1,"_encrypted":true,"kdf":"pbkdf2_sha256","iterations":100000,"salt":"AAECAwQFBgcICQoLDA0ODw==","nonce":"EBESExQVFhcYGRobHB0eHw==","ciphertext":"","tag":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="}"#,
+        )
+        .unwrap();
+
+        unsafe { std::env::remove_var("REACH_VAULT_KEY") };
+        let vault = Vault::new(&vault_file);
+        assert!(vault.load_data().is_err());
+        let _ = std::fs::remove_dir_all(temp_dir);
     }
 }

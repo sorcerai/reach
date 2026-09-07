@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 import urllib.error
@@ -16,6 +17,22 @@ import urllib.parse
 import urllib.request
 
 logger = logging.getLogger("agent_computer.browser_use")
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so credentials never leave the request origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"{msg} (refusing redirect of credential-bearing request)",
+            headers,
+            fp,
+        )
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
 
 
 class AgentComputerBrowserAdapter:
@@ -37,22 +54,42 @@ class AgentComputerBrowserAdapter:
         self.cdp_port = cdp_port if cdp_port is not None else (9222 + screen_id)
         self.novnc_port = 6080 + screen_id
         self.vault_path = vault_path
-        self.auth_token = auth_token
+        token = auth_token or os.environ.get("REACH_AUTH_TOKEN")
+        self.auth_token = token if token and token.strip() else None
+        self._owner: Optional[str] = None
         self._leased = False
         self._lease_token: Optional[str] = None
+        self._handoff_gen: Optional[int] = None
 
     @property
     def lease_token(self) -> Optional[str]:
-        """Active screen lease token returned by the supervisor."""
+        """Active screen lease capability returned by the supervisor."""
         return self._lease_token
 
-    def _get_headers(self, include_lease_token: bool = True) -> Dict[str, str]:
-        """Build request headers including auth and active lease token if available."""
+    @property
+    def handoff_gen(self) -> Optional[int]:
+        """Handoff generation retained from the lease response."""
+        return self._handoff_gen
+
+    def _allocation_headers(self) -> Dict[str, str]:
+        """Headers for lease allocation: optional supervisor bearer only.
+
+        The supervisor credential (constructor-held or REACH_AUTH_TOKEN)
+        authorizes allocation exclusively; it never accompanies ordinary
+        worker requests.
+        """
         headers = {"Content-Type": "application/json"}
-        if include_lease_token and self._lease_token:
-            headers["X-Lease-Token"] = self._lease_token
         if self.auth_token:
             headers["Authorization"] = f"Bearer {self.auth_token}"
+        return headers
+
+    def _worker_headers(self) -> Dict[str, str]:
+        """Headers for ordinary requests: retained lease capability only."""
+        headers = {"Content-Type": "application/json"}
+        if self._lease_token:
+            headers["X-Lease-Token"] = self._lease_token
+        if self._handoff_gen is not None:
+            headers["X-Handoff-Gen"] = str(self._handoff_gen)
         return headers
 
     @property
@@ -66,20 +103,24 @@ class AgentComputerBrowserAdapter:
         return f"http://{self.host}:{self.novnc_port}/vnc.html"
 
     def lease_screen(self, duration_sec: int = 600, owner: str = "browser-use") -> Dict[str, Any]:
-        """Lease the target screen from Agent Computer supervisor to prevent collision."""
+        """Lease the target screen from the Agent Computer supervisor.
+
+        Allocation is creation-only: an occupied screen (including one held
+        under the same owner label) is refused by the server and is never
+        recovered by re-allocating. The adapter fails closed on a refusal
+        instead of downgrading to unsupervised CDP; only an unreachable
+        supervisor keeps the standalone direct-CDP fallback.
+        """
         url = f"{self.api_url}/agent/screens/{self.screen_id}/lease"
         payload = json.dumps({"owner": owner}).encode()
-        headers = self._get_headers(include_lease_token=False)
         req = urllib.request.Request(
             url,
             data=payload,
-            headers=headers,
+            headers=self._allocation_headers(),
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
-                self._leased = True
-                self._owner = owner
+            with _OPENER.open(req, timeout=5) as resp:
                 raw = None
                 if hasattr(resp, "read"):
                     try:
@@ -90,46 +131,95 @@ class AgentComputerBrowserAdapter:
                             raw = data
                     except Exception:
                         pass
+                body: Dict[str, Any] = {}
                 if raw:
                     try:
-                        body = json.loads(raw)
-                        if isinstance(body, dict):
-                            self._lease_token = body.get("token")
+                        parsed = json.loads(raw)
+                        if isinstance(parsed, dict):
+                            body = parsed
                     except Exception:
-                        pass
-                logger.info(f"Leased screen {self.screen_id} for {duration_sec}s (owner: {owner})")
-                res = {"status": "leased", "screen": self.screen_id, "code": resp.status}
-                if self._lease_token:
-                    res["token"] = self._lease_token
-                return res
+                        body = {}
+                if not body.get("token"):
+                    raise RuntimeError(
+                        f"lease response for screen {self.screen_id} missing capability token"
+                    )
+                self._leased = True
+                self._owner = owner
+                self._lease_token = body["token"]
+                if "handoff_gen" in body:
+                    self._handoff_gen = int(body["handoff_gen"])
+                logger.info(
+                    f"Leased screen {self.screen_id} for {duration_sec}s (owner: {owner})"
+                )
+                return {
+                    "status": "leased",
+                    "screen": self.screen_id,
+                    "code": resp.status,
+                    "token": self._lease_token,
+                    "handoff_gen": self._handoff_gen,
+                }
+        except urllib.error.HTTPError as e:
+            logger.warning(
+                "Lease refused for screen %s (HTTP %s): %s", self.screen_id, e.code, e
+            )
+            raise RuntimeError(
+                f"lease refused for screen {self.screen_id}: HTTP {e.code}"
+            ) from e
         except urllib.error.URLError as e:
             logger.warning(
                 f"Could not contact supervisor at {url} ({e}); continuing with standalone CDP connection."
             )
             self._leased = False
             self._lease_token = None
+            self._handoff_gen = None
             return {"status": "unsupervised", "screen": self.screen_id, "error": str(e)}
 
     def release_screen(self) -> bool:
-        """Release leased screen back to the pool."""
+        """Release leased screen using the retained lease capability.
+
+        The capability rides in the X-Lease-Token header (with the retained
+        generation); the supervisor bearer and the token itself never appear
+        in the request body. On refusal (e.g. HTTP 409 while a human is
+        active) local lease state is retained — nothing is cleared on a
+        failed release.
+        """
         if not self._leased:
             return True
+        if not self._lease_token:
+            logger.warning(
+                "Cannot release screen %s without a lease capability", self.screen_id
+            )
+            return False
         url = f"{self.api_url}/agent/screens/{self.screen_id}/lease"
-        owner = getattr(self, "_owner", "browser-use")
+        owner = self._owner or "browser-use"
         payload = json.dumps({"owner": owner}).encode()
-        headers = self._get_headers(include_lease_token=True)
         req = urllib.request.Request(
             url,
             data=payload,
-            headers=headers,
+            headers=self._worker_headers(),
             method="DELETE",
         )
         try:
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with _OPENER.open(req, timeout=5) as resp:
+                if resp.status not in (200, 204):
+                    logger.warning(
+                        "Release of screen %s refused (HTTP %s); retaining lease state",
+                        self.screen_id,
+                        resp.status,
+                    )
+                    return False
                 self._leased = False
                 self._lease_token = None
+                self._handoff_gen = None
                 logger.info(f"Released screen {self.screen_id} (owner: {owner})")
-                return resp.status in (200, 204)
+                return True
+        except urllib.error.HTTPError as e:
+            logger.warning(
+                "Release of screen %s refused (HTTP %s); retaining lease state",
+                self.screen_id,
+                e.code,
+            )
+            return False
         except urllib.error.URLError as e:
             logger.warning(f"Failed to release screen {self.screen_id} on supervisor: {e}")
             return False

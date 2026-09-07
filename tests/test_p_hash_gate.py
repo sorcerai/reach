@@ -263,7 +263,11 @@ def test_report_html_marks_vlm_cached_and_metrics(tmp_path: Path):
             },
             {
                 "step_index": 2,
-                "action": {"kind": "terminate", "description": "Goal achieved"},
+                "action": {
+                    "kind": "terminate",
+                    "outcome": "completed",
+                    "description": "Goal achieved",
+                },
                 "vlm_cached": False,
                 "observation_summary": "Terminated",
                 "timestamp": "2026-09-05T00:00:02Z",
@@ -322,7 +326,13 @@ def test_driver_loop_skips_vlm_on_subthreshold_after_wait(
         }),
         json.dumps({
             "status": "SUCCESS",
-            "response": json.dumps({"action": {"kind": "terminate", "description": "Done after wait"}}),
+            "response": json.dumps({
+                "action": {
+                    "kind": "terminate",
+                    "outcome": "completed",
+                    "description": "Done after wait",
+                }
+            }),
         }),
     ]
 
@@ -333,6 +343,7 @@ def test_driver_loop_skips_vlm_on_subthreshold_after_wait(
         min_change_threshold=0.01,
         max_unchanged_ticks=2,  # Max 2 skipped ticks before force
         backoff_sec=0.01,
+        completion_text="Normal page",
     )
 
     with patch("time.sleep"):

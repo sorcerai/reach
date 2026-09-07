@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Reach Agent Card: Bounded Spending Engine & Checkout Injector.
+"""Reach Agent Card: Bounded Spending Engine & Native Checkout Authorization.
 
 Manages programmatically minted virtual cards for AI agents with bounded
-spending limits, human-in-the-loop approval gates, and out-of-band synthetic
-checkout form injection without exposing PAN/CVV to LLM context windows.
+spending limits, human-in-the-loop approval gates, and authenticated
+host-native checkout injection without exposing PAN/CVV to model context.
 
 Storage:
   ~/.reach/cards/cards.json (mode 0600, dir 0700) or REACH_CARD_PATH.
@@ -25,10 +25,16 @@ import tempfile
 import time
 from typing import Any, Callable, Dict, List, Optional, Union
 import urllib.error
-import urllib.parse
 import urllib.request
+import urllib.parse
 
 logger = logging.getLogger("agent_card")
+class _NoReachRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_API_OPENER = urllib.request.build_opener(_NoReachRedirect())
 
 DEFAULT_CARDS_DIR = Path.home() / ".reach" / "cards"
 DEFAULT_CARDS_FILE = DEFAULT_CARDS_DIR / "cards.json"
@@ -635,234 +641,87 @@ class AgentCardEngine:
         current_url: Optional[str] = None,
         has_checkout_form: Optional[bool] = None,
         idempotency_token: Optional[str] = None,
+        lease_token: Optional[str] = None,
+        handoff_gen: Optional[int] = None,
+        observation_gen: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Inject card details directly into checkout form on the target screen.
+        """Request authenticated native card injection.
 
-        Specifications:
-        - Card details (number, exp, cvv) are injected directly via CDP or synthetic input.
-        - Card details NEVER appear in the LLM model prompt or conversation history.
-        - Origin validation: verifies active page URL matches card merchant bound.
-        - Requires checkout form or credit card input on the active page.
-        - Idempotency check: prevents double-submitting a recently injected form.
-        - Transition ACTIVE -> INJECTING (persisted) before first keystroke.
-        - Transition INJECTING -> LOCKED immediately after typing.
+        PAN, expiration, and CVV stay in the host vault. This method never
+        constructs a script, synthetic input payload, or command containing
+        secret values.
         """
-        cards = self._read_raw()
-        if card_id not in cards:
-            raise KeyError(f"Card '{card_id}' not found")
-        card = cards[card_id]
-
-        # Idempotency token check: if already injected with the same idempotency token, return cached result
-        if idempotency_token and card.idempotency_token == idempotency_token:
-            if card.status in {CardStatus.INJECTING, CardStatus.LOCKED}:
-                logger.info(
-                    "Idempotent injection replay for card %s with token %s; skipping double-submit",
-                    card_id,
-                    idempotency_token,
-                )
-                return {
-                    "status": "already_injected",
-                    "card_id": card_id,
-                    "screen": screen,
-                    "target_container": target_container,
-                    "merchant": card.merchant,
-                    "card_status": card.status,
-                    "card_number_masked": mask_card_number(card.card_number),
-                    "submitted": submit,
-                    "method": method,
-                    "idempotent_replay": True,
-                    "idempotency_token": idempotency_token,
-                }
-
-        # Double-submit cooldown check
-        now = time.time()
-        if card.injected_at is not None and (now - card.injected_at) < 60:
-            raise ValueError(
-                f"Double-submit prevented: card '{card_id}' was injected recently at {card.injected_at}"
-            )
-
-        if card.status != CardStatus.ACTIVE:
-            raise ValueError(
-                f"Cannot inject card '{card_id}' with status '{card.status}'. "
-                "Card must be ACTIVE."
-            )
-
-        api = (api_url or DEFAULT_REACH_API).rstrip("/")
-
-        def _call_mcp(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-            if mcp_caller is not None:
-                return mcp_caller(tool_name, arguments)
-
+        card = self.get_card(card_id)
+        request: Dict[str, Any] = {
+            "kind": "card",
+            "domain": card.merchant,
+            "card_id": card.id,
+            "submit": bool(submit),
+        }
+        if mcp_caller is not None:
+            response = mcp_caller("inject", request)
+        else:
+            if not lease_token:
+                raise ValueError("authenticated lease_token is required for injection")
+            api = (api_url or DEFAULT_REACH_API).rstrip("/")
             payload = {
                 "jsonrpc": "2.0",
                 "id": int(time.time() * 1000) % 1_000_000,
                 "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
+                "params": {"name": "inject", "arguments": {**request, "screen": screen}},
             }
+            headers = {
+                "content-type": "application/json",
+                "X-Lease-Token": lease_token,
+            }
+            if handoff_gen is not None:
+                headers["X-Handoff-Gen"] = str(handoff_gen)
+            if observation_gen is not None:
+                headers["X-Observation-Gen"] = str(observation_gen)
             req = urllib.request.Request(
-                f"{api}/mcp",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"content-type": "application/json"},
-                method="POST",
+                f"{api}/mcp", data=json.dumps(payload).encode("utf-8"),
+                headers=headers, method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as r:
-                res = json.loads(r.read().decode("utf-8") or "{}")
-                if "error" in res:
-                    raise RuntimeError(f"MCP RPC Error: {res['error']}")
-                return res.get("result", {})
-
-        # Step 0: Read active tab URL and verify origin before typing secrets
-        active_url = current_url
-        page_text_res: Dict[str, Any] = {}
-        if not active_url or has_checkout_form is None:
             try:
-                page_text_res = _call_mcp("page_text", {"screen": screen})
-                if not isinstance(page_text_res, dict):
-                    page_text_res = {}
-            except Exception as e:
-                logger.debug("Failed to query page_text on screen %d: %s", screen, e)
-                page_text_res = {}
+                with _API_OPENER.open(req, timeout=30) as result:
+                    response = json.loads(result.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    body = {}
+                if exc.code == 428 and body.get("error") == "approval_required":
+                    return {"status": "approval_required", "digest": body.get("digest")}
+                if exc.code == 409:
+                    return {"status": "stale_observation"}
+                return {"status": "uncertain"}
+            except (urllib.error.URLError, TimeoutError, OSError):
+                return {"status": "uncertain"}
 
-            if not active_url:
-                active_url = (
-                    page_text_res.get("url")
-                    or page_text_res.get("active_url")
-                    or page_text_res.get("current_url")
-                )
-                if not active_url and "text" in page_text_res:
-                    try:
-                        parsed_text = json.loads(page_text_res["text"])
-                        if isinstance(parsed_text, dict):
-                            active_url = parsed_text.get("url")
-                    except Exception:
-                        pass
-
-        if not active_url:
-            raise RuntimeError("Failed to inspect active tab URL before card injection")
-
-        validate_origin(active_url, card.merchant)
-
-        # Verify checkout-like form or credit card input is present on the page
-        if has_checkout_form is not None:
-            form_present = bool(has_checkout_form)
-        else:
-            page_text = str(page_text_res.get("text", ""))
-            dom_html = str(page_text_res.get("html", ""))
-            form_present = check_checkout_form_present(
-                page_text=page_text,
-                dom_html=dom_html,
-                form_info=page_text_res,
-            )
-
-        if not form_present:
-            raise ValueError(
-                f"Cannot inject card '{card_id}': no checkout form or credit card input detected on active page '{active_url}'"
-            )
-
-        # Transition ACTIVE -> INJECTING (persisted to disk) BEFORE the first keystroke is sent
-        card.status = CardStatus.INJECTING
-        card.injected_at = now
-        effective_token = idempotency_token or f"tok_{secrets.token_hex(8)}"
-        card.idempotency_token = effective_token
-        cards[card_id] = card
-        self._write_raw(cards)
-
-        logger.info(
-            "Injecting card %s (%s) into screen %d on container %s (origin verified: %s)",
-            card.id,
-            mask_card_number(card.card_number),
-            screen,
-            target_container,
-            active_url,
-        )
-
-        # Step 0b: Re-verify active tab URL immediately before keystrokes/DOM injection (TOCTOU guard)
-        if current_url is not None:
-            try:
-                live_check = _call_mcp("page_text", {"screen": screen})
-                live_url = (
-                    live_check.get("url")
-                    or live_check.get("active_url")
-                    or live_check.get("current_url")
-                )
-                if live_url:
-                    validate_origin(live_url, card.merchant)
-            except Exception as e:
-                if isinstance(e, ValueError):
-                    raise
-                logger.debug("Pre-keystroke origin re-verification note: %s", e)
-
-        if method == "cdp":
-            # DOM field injection script
-            cdp_script = f"""
-            (() => {{
-                function setVal(sel, val) {{
-                    const el = document.querySelector(sel);
-                    if (el) {{
-                        el.value = val;
-                        el.dispatchEvent(new Event('input', {{ bubbles: true }}));
-                        el.dispatchEvent(new Event('change', {{ bubbles: true }}));
-                        return true;
-                    }}
-                    return false;
-                }}
-                const num = setVal('input[autocomplete="cc-number"], input[name*="card"], input[name*="cc_num"], input[id*="card_num"], input[id*="cardNumber"]', '{card.card_number}');
-                const exp = setVal('input[autocomplete="cc-exp"], input[name*="exp"], input[id*="exp"]', '{card.exp_month}/{card.exp_year}');
-                const cvv = setVal('input[autocomplete="cc-csc"], input[name*="cvv"], input[name*="cvc"], input[id*="cvv"]', '{card.cvv}');
-                return {{ num, exp, cvv }};
-            }})();
-            """
-            _call_mcp("playwright_eval", {"script": cdp_script, "screen": screen})
-        else:
-            # Synthetic keystrokes via Reach MCP:
-            # Step 1: Type card number into active/focused field
-            _call_mcp("type", {"text": card.card_number, "screen": screen})
-            time.sleep(delay_sec)
-
-            # Step 2: Tab to Expiration field
-            _call_mcp("key", {"combo": "Tab", "screen": screen})
-            time.sleep(delay_sec)
-
-            # Step 3: Type Expiration date
-            if split_exp:
-                _call_mcp("type", {"text": card.exp_month, "screen": screen})
-                time.sleep(delay_sec)
-                _call_mcp("key", {"combo": "Tab", "screen": screen})
-                time.sleep(delay_sec)
-                _call_mcp("type", {"text": card.exp_year, "screen": screen})
-            else:
-                _call_mcp("type", {"text": f"{card.exp_month}/{card.exp_year}", "screen": screen})
-            time.sleep(delay_sec)
-
-            # Step 4: Tab to CVV field
-            _call_mcp("key", {"combo": "Tab", "screen": screen})
-            time.sleep(delay_sec)
-
-            # Step 5: Type CVV
-            _call_mcp("type", {"text": card.cvv, "screen": screen})
-            time.sleep(delay_sec)
-
-            # Step 6: Submit if requested
-            if submit:
-                _call_mcp("key", {"combo": "Return", "screen": screen})
-                time.sleep(delay_sec)
-
-        # Transition INJECTING -> LOCKED immediately after typing
-        locked_card = self.lock_card(card_id)
-
-        # Return masked payload: Card details NEVER appear in response or LLM prompt!
+        if not isinstance(response, dict):
+            return {"status": "uncertain"}
+        if "result" in response:
+            result = response.get("result")
+            if not isinstance(result, dict) or result.get("isError") is not False:
+                return {"status": "uncertain"}
+            content = result.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
+                        try:
+                            response = json.loads(part.get("text", ""))
+                        except (TypeError, json.JSONDecodeError):
+                            return {"status": "uncertain"}
+                        break
+        status = response.get("status")
+        if status not in {"filled", "submitted", "auth_required", "rejected"}:
+            return {"status": "uncertain"}
         return {
-            "status": "injected",
-            "card_id": card_id,
-            "screen": screen,
-            "target_container": target_container,
-            "merchant": card.merchant,
-            "card_status": locked_card.status,
-            "card_number_masked": mask_card_number(card.card_number),
-            "submitted": submit,
-            "method": method,
-            "active_url": active_url,
-            "idempotency_token": effective_token,
+            "status": status,
+            "outcome": response.get("outcome", status),
+            "card_id": card.id,
+            "domain": card.merchant,
+            "submitted": bool(response.get("submitted", submit)),
         }
 
 
@@ -960,8 +819,11 @@ def inject_card(
     current_url: Optional[str] = None,
     has_checkout_form: Optional[bool] = None,
     idempotency_token: Optional[str] = None,
+    lease_token: Optional[str] = None,
+    handoff_gen: Optional[int] = None,
+    observation_gen: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Convenience functional API for out-of-band checkout injection."""
+    """Convenience functional API for authenticated native injection."""
     engine = get_default_engine(cards_path)
     return engine.inject_card(
         screen=screen,
@@ -969,13 +831,10 @@ def inject_card(
         target_container=target_container,
         api_url=api_url,
         mcp_caller=mcp_caller,
-        delay_sec=delay_sec,
         submit=submit,
-        split_exp=split_exp,
-        method=method,
-        current_url=current_url,
-        has_checkout_form=has_checkout_form,
-        idempotency_token=idempotency_token,
+        lease_token=lease_token,
+        handoff_gen=handoff_gen,
+        observation_gen=observation_gen,
     )
 
 
@@ -1013,11 +872,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_list = subparsers.add_parser("list", help="List virtual cards")
     p_list.add_argument("--merchant", default=None, help="Filter by merchant domain")
     p_list.add_argument("--status", default=None, help="Filter by card status")
-    p_list.add_argument(
-        "--unmask",
-        action="store_true",
-        help="Include unmasked card numbers in output",
-    )
 
     # approve <id>
     p_app = subparsers.add_parser("approve", help="Approve spending on a pending virtual card")
@@ -1035,45 +889,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     p_charge.add_argument("--idempotency-key", default=None, help="Optional idempotency key for charge")
 
     # inject <id> [--screen <id>]
-    p_inj = subparsers.add_parser("inject", help="Inject card details into checkout form")
+    p_inj = subparsers.add_parser(
+        "inject", help="Request authenticated host-native card injection"
+    )
     p_inj.add_argument("id", help="Card ID to inject")
     p_inj.add_argument("--screen", type=int, default=0, help="Screen ID (default 0)")
-    p_inj.add_argument(
-        "--container",
-        default="agent-computer",
-        help="Target container name (default agent-computer)",
-    )
-    p_inj.add_argument(
-        "--api-url",
-        default=DEFAULT_REACH_API,
-        help="Reach API URL (default http://127.0.0.1:4200)",
-    )
-    p_inj.add_argument(
-        "--submit",
-        action="store_true",
-        help="Press Return after typing CVV to submit form",
-    )
-    p_inj.add_argument(
-        "--split-exp",
-        action="store_true",
-        help="Split expiration date into MM then Tab then YY",
-    )
-    p_inj.add_argument(
-        "--delay",
-        type=float,
-        default=0.25,
-        help="Inter-keystroke delay in seconds (default 0.25)",
-    )
-    p_inj.add_argument(
-        "--current-url",
-        default=None,
-        help="Active tab URL override for testing or manual origin verification",
-    )
-    p_inj.add_argument(
-        "--idempotency-token",
-        default=None,
-        help="Unique idempotency token to prevent duplicate submission",
-    )
+    p_inj.add_argument("--api-url", default=DEFAULT_REACH_API, help="Reach API URL")
+    p_inj.add_argument("--submit", action="store_true")
+    p_inj.add_argument("--lease-token", required=True, help="Authenticated lease capability")
+    p_inj.add_argument("--handoff-gen", type=int, default=None)
+    p_inj.add_argument("--observation-gen", type=int, default=None)
 
     args = parser.parse_args(argv)
     engine = AgentCardEngine(cards_path=args.cards_path)
@@ -1091,8 +916,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if args.command == "list":
             cards = engine.list_cards(merchant=args.merchant, status=args.status)
-            out = [c.to_dict(mask=not args.unmask) for c in cards]
-            print(json.dumps(out, indent=2))
+            print(json.dumps([c.to_dict(mask=True) for c in cards], indent=2))
             return 0
 
         if args.command == "approve":
@@ -1119,16 +943,16 @@ def main(argv: Optional[List[str]] = None) -> int:
             res = engine.inject_card(
                 screen=args.screen,
                 card_id=args.id,
-                target_container=args.container,
                 api_url=args.api_url,
-                delay_sec=args.delay,
                 submit=args.submit,
-                split_exp=args.split_exp,
-                current_url=args.current_url,
-                idempotency_token=args.idempotency_token,
+                lease_token=args.lease_token,
+                handoff_gen=args.handoff_gen,
+                observation_gen=args.observation_gen,
             )
             print(json.dumps(res, indent=2))
-            return 0
+            return 0 if res.get("status") not in {
+                "uncertain", "approval_required", "stale_observation"
+            } else 1
 
     except Exception as e:
         sys.stderr.write(f"Error: {e}\n")

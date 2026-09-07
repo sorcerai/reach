@@ -30,6 +30,7 @@ fn test_screen_phase_lifecycle_and_generation_counter() {
             1,
             Some("Solve Cloudflare Turnstile".into()),
             Some("http://localhost:6081/vnc.html".into()),
+            agent.lease_token(1).as_deref(),
         )
         .expect("takeover request should succeed");
     assert_eq!(s.phase, ScreenPhase::HandoffPending);
@@ -48,20 +49,22 @@ fn test_screen_phase_lifecycle_and_generation_counter() {
 
     // Human connects -> HumanActive, gen 2
     let s = agent
-        .human_connected(1)
+        .human_connected(1, agent.human_token(1).as_deref())
         .expect("human_connected should succeed");
     assert_eq!(s.phase, ScreenPhase::HumanActive);
     assert_eq!(s.handoff_gen, 2);
 
     // Human hands back -> HumanDone, gen 3
     let s = agent
-        .human_handback(1)
+        .human_handback(1, agent.human_token(1).as_deref())
         .expect("human_handback should succeed");
     assert_eq!(s.phase, ScreenPhase::HumanDone);
     assert_eq!(s.handoff_gen, 3);
 
     // Agent acks -> AgentActive, gen 4, takeover cleared
-    let s = agent.agent_ack(1).expect("agent_ack should succeed");
+    let s = agent
+        .agent_ack(1, agent.lease_token(1).as_deref())
+        .expect("agent_ack should succeed");
     assert_eq!(s.phase, ScreenPhase::AgentActive);
     assert_eq!(s.handoff_gen, 4);
     assert!(!s.takeover_pending);
@@ -70,18 +73,25 @@ fn test_screen_phase_lifecycle_and_generation_counter() {
 
     // Second takeover cycle increments generation further
     let s = agent
-        .request_takeover(1, Some("Solve 2FA".into()), None)
+        .request_takeover(
+            1,
+            Some("Solve 2FA".into()),
+            None,
+            agent.lease_token(1).as_deref(),
+        )
         .expect("second takeover request should succeed");
     assert_eq!(s.phase, ScreenPhase::HandoffPending);
     assert_eq!(s.handoff_gen, 5);
 
     let s = agent
-        .human_handback(1)
+        .human_handback(1, agent.human_token(1).as_deref())
         .expect("direct handback should succeed");
     assert_eq!(s.phase, ScreenPhase::HumanDone);
     assert_eq!(s.handoff_gen, 6);
 
-    let s = agent.agent_ack(1).expect("agent_ack should succeed");
+    let s = agent
+        .agent_ack(1, agent.lease_token(1).as_deref())
+        .expect("agent_ack should succeed");
     assert_eq!(s.phase, ScreenPhase::AgentActive);
     assert_eq!(s.handoff_gen, 7);
 }
@@ -93,48 +103,62 @@ fn test_invalid_phase_transitions_rejected() {
 
     // Cannot human_connected from AgentActive
     assert!(matches!(
-        agent.human_connected(0),
+        agent.human_connected(0, agent.human_token(0).as_deref()),
         Err(TakeoverError::InvalidPhase { .. })
     ));
 
     // Cannot human_handback from AgentActive
     assert!(matches!(
-        agent.human_handback(0),
+        agent.human_handback(0, agent.human_token(0).as_deref()),
         Err(TakeoverError::InvalidPhase { .. })
     ));
 
     // Cannot agent_ack from AgentActive
     assert!(matches!(
-        agent.agent_ack(0),
+        agent.agent_ack(0, agent.lease_token(0).as_deref()),
         Err(TakeoverError::InvalidPhase { .. })
     ));
 
     // Move to HandoffPending
     agent
-        .request_takeover(0, Some("reason".into()), None)
+        .request_takeover(
+            0,
+            Some("reason".into()),
+            None,
+            agent.lease_token(0).as_deref(),
+        )
         .unwrap();
 
     // Cannot request takeover again when already HandoffPending
     assert!(matches!(
-        agent.request_takeover(0, Some("another".into()), None),
+        agent.request_takeover(
+            0,
+            Some("another".into()),
+            None,
+            agent.lease_token(0).as_deref()
+        ),
         Err(TakeoverError::InvalidPhase { .. })
     ));
 
     // Move to HumanActive
-    agent.human_connected(0).unwrap();
+    agent
+        .human_connected(0, agent.human_token(0).as_deref())
+        .unwrap();
 
     // Cannot request takeover from HumanActive
     assert!(matches!(
-        agent.request_takeover(0, None, None),
+        agent.request_takeover(0, None, None, agent.lease_token(0).as_deref()),
         Err(TakeoverError::InvalidPhase { .. })
     ));
 
     // Move to HumanDone
-    agent.human_handback(0).unwrap();
+    agent
+        .human_handback(0, agent.human_token(0).as_deref())
+        .unwrap();
 
     // Cannot human_connected from HumanDone
     assert!(matches!(
-        agent.human_connected(0),
+        agent.human_connected(0, agent.human_token(0).as_deref()),
         Err(TakeoverError::InvalidPhase { .. })
     ));
 }
@@ -144,9 +168,16 @@ async fn test_long_poll_wait_for_phase() {
     let agent = Arc::new(AgentState::new(1));
     let _ = agent.lease_screen(0, "bot").unwrap();
     agent
-        .request_takeover(0, Some("captcha".into()), None)
+        .request_takeover(
+            0,
+            Some("captcha".into()),
+            None,
+            agent.lease_token(0).as_deref(),
+        )
         .unwrap();
-    agent.human_connected(0).unwrap();
+    agent
+        .human_connected(0, agent.human_token(0).as_deref())
+        .unwrap();
 
     // Concurrent task: waits for HumanDone
     let agent_clone = Arc::clone(&agent);
@@ -158,7 +189,9 @@ async fn test_long_poll_wait_for_phase() {
 
     // Simulate human taking action and handing back after 50ms
     tokio::time::sleep(Duration::from_millis(50)).await;
-    agent.human_handback(0).unwrap();
+    agent
+        .human_handback(0, agent.human_token(0).as_deref())
+        .unwrap();
 
     let result = waiter
         .await
@@ -182,7 +215,12 @@ fn test_agent_cannot_eject_human_in_human_active() {
 
     // 1. In HandoffPending, agent CAN cancel takeover
     agent
-        .request_takeover(0, Some("need auth".into()), None)
+        .request_takeover(
+            0,
+            Some("need auth".into()),
+            None,
+            agent.lease_token(0).as_deref(),
+        )
         .unwrap();
     assert_eq!(agent.phase(0), Some(ScreenPhase::HandoffPending));
     let initial_gen = agent.handoff_gen(0).unwrap();
@@ -194,9 +232,16 @@ fn test_agent_cannot_eject_human_in_human_active() {
 
     // 2. Request takeover again and transition to HumanActive
     agent
-        .request_takeover(0, Some("need auth".into()), None)
+        .request_takeover(
+            0,
+            Some("need auth".into()),
+            None,
+            agent.lease_token(0).as_deref(),
+        )
         .unwrap();
-    agent.human_connected(0).unwrap();
+    agent
+        .human_connected(0, agent.human_token(0).as_deref())
+        .unwrap();
     assert_eq!(agent.phase(0), Some(ScreenPhase::HumanActive));
 
     // 3. In HumanActive, agent CANNOT cancel takeover or force-eject human
@@ -206,11 +251,15 @@ fn test_agent_cannot_eject_human_in_human_active() {
     assert!(matches!(eject_err, TakeoverError::InvalidPhase { .. }));
 
     // Cannot agent_ack either
-    let ack_err = agent.agent_ack(0).expect_err("cannot ack in HumanActive");
+    let ack_err = agent
+        .agent_ack(0, agent.lease_token(0).as_deref())
+        .expect_err("cannot ack in HumanActive");
     assert!(matches!(ack_err, TakeoverError::InvalidPhase { .. }));
 
     // Only human_handback transitions out of HumanActive
-    let handed_back = agent.human_handback(0).unwrap();
+    let handed_back = agent
+        .human_handback(0, agent.human_token(0).as_deref())
+        .unwrap();
     assert_eq!(handed_back.phase, ScreenPhase::HumanDone);
 }
 
@@ -221,7 +270,12 @@ fn test_human_token_minting_and_verification() {
 
     let base_url = "http://127.0.0.1:6080/vnc.html?autoconnect=1";
     let state = agent
-        .request_takeover(0, Some("login".into()), Some(base_url.into()))
+        .request_takeover(
+            0,
+            Some("login".into()),
+            Some(base_url.into()),
+            agent.lease_token(0).as_deref(),
+        )
         .unwrap();
 
     let token = state
@@ -231,8 +285,8 @@ fn test_human_token_minting_and_verification() {
 
     let takeover_url = state.takeover_url.expect("takeover_url should be set");
     assert!(
-        takeover_url.contains(&format!("token={}", token)),
-        "takeover_url must include minted token"
+        !takeover_url.contains(&token),
+        "human capabilities must not appear in public URLs"
     );
 
     // Verification succeeds with correct token
@@ -244,9 +298,13 @@ fn test_human_token_minting_and_verification() {
     assert!(!agent.has_human_token("bogus-token"));
 
     // Complete handoff cycle
-    agent.human_connected(0).unwrap();
-    agent.human_handback(0).unwrap();
-    agent.agent_ack(0).unwrap();
+    agent
+        .human_connected(0, agent.human_token(0).as_deref())
+        .unwrap();
+    agent
+        .human_handback(0, agent.human_token(0).as_deref())
+        .unwrap();
+    agent.agent_ack(0, agent.lease_token(0).as_deref()).unwrap();
 
     // After ack, human token is cleared
     assert_eq!(agent.human_token(0), None);

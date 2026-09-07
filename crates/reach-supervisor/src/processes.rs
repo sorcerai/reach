@@ -1,6 +1,9 @@
 use anyhow::{Context, Result};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
+use std::fs::OpenOptions;
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -193,18 +196,11 @@ impl Supervisor {
             .collect()
     }
 
-    /// Set (or clear) the VNC password. When set, `x11vnc` runs with
-    /// `-passwd <pw>` instead of `-nopw`.
+    /// Set (or clear) the VNC password. When set, `x11vnc` reads it from a
+    /// private file via `-passwdfile` instead of receiving it in argv.
     ///
-    /// Note: `x11vnc` is passed the password on its command line, so in
-    /// principle another process could catch it via `execve` tracing or a
-    /// race right at spawn time — `x11vnc` itself scrubs `-passwd <pw>`
-    /// from its own argv immediately after startup (confirmed: it does not
-    /// appear in `ps`/`/proc/<pid>/cmdline` once running), so this is not
-    /// the plaintext-in-`ps`-forever exposure it would be for most CLI
-    /// tools. Acceptable for phase 2 — the container itself is the trust
-    /// boundary — but not a substitute for `-rfbauth` if that boundary
-    /// ever moves.
+    /// The file is created immediately before startup with owner-only
+    /// permissions and is removed during graceful shutdown.
     pub fn with_vnc_password(mut self, vnc_password: Option<String>) -> Self {
         self.vnc_password = vnc_password;
         self
@@ -232,6 +228,39 @@ impl Supervisor {
         Self::new(display, width, height)
             .with_screens(screens)
             .with_vnc_password(vnc_password)
+    }
+
+    fn prepare_vnc_password_files(&self) -> Result<()> {
+        let Some(password) = self.vnc_password.as_deref() else {
+            return Ok(());
+        };
+
+        std::fs::create_dir_all("/run/reach")
+            .context("failed to create private Reach runtime directory")?;
+        for screen in self.screens() {
+            let path = format!("/run/reach/x11vnc-password-{}", screen.id);
+            let mut file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .with_context(|| format!("failed to create private VNC password file {path}"))?;
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to protect private VNC password file {path}"))?;
+            file.write_all(password.as_bytes())
+                .with_context(|| format!("failed to write private VNC password file {path}"))?;
+            file.write_all(b"\n")
+                .with_context(|| format!("failed to finish private VNC password file {path}"))?;
+        }
+        Ok(())
+    }
+
+    fn remove_vnc_password_files(&self) {
+        for screen in self.screens() {
+            let path = format!("/run/reach/x11vnc-password-{}", screen.id);
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     /// Build the process table — defines what runs and in what order.
@@ -277,14 +306,23 @@ impl Supervisor {
                 depends_on: vec![format!("xvfb-{i}")],
                 ready_check: ReadyCheck::Immediate,
             });
-
             specs.push(ProcessSpec {
                 name: format!("x11vnc-{i}"),
                 command: "x11vnc",
                 args: {
-                    let mut args = vec!["-display".to_string(), display.clone(), "-forever".into()];
+                    let mut args = vec![
+                        "-display".to_string(),
+                        display.clone(),
+                        "-forever".into(),
+                        "-localhost".into(),
+                        "-listen".into(),
+                        "127.0.0.1".into(),
+                    ];
                     match &self.vnc_password {
-                        Some(pw) => args.extend(["-passwd".into(), pw.clone()]),
+                        Some(_) => args.extend([
+                            "-passwdfile".into(),
+                            format!("/run/reach/x11vnc-password-{i}"),
+                        ]),
                         None => args.push("-nopw".into()),
                     }
                     args.extend(["-rfbport".into(), vnc_port.to_string(), "-shared".into()]);
@@ -303,12 +341,14 @@ impl Supervisor {
                 name: format!("novnc-{i}"),
                 command: "websockify",
                 args: vec![
-                    "--web".into(),
-                    "/opt/noVNC".into(),
+                    "--auth-plugin".into(),
+                    "reach_viewer_auth.ViewerTokenAuth".into(),
+                    "--auth-source".into(),
+                    "/run/reach/viewer-token".into(),
                     novnc_port.to_string(),
                     format!("localhost:{vnc_port}"),
                 ],
-                env: vec![],
+                env: vec![("PYTHONPATH", "/opt/reach".into())],
                 restart: RestartPolicy::Always {
                     max_restarts: 5,
                     backoff: Duration::from_secs(1),
@@ -323,7 +363,7 @@ impl Supervisor {
 
     /// Start all processes in dependency order.
     pub async fn start_all(&mut self) -> Result<()> {
-        let _ = inject_novnc_banner(std::path::Path::new("/opt/noVNC/vnc.html"));
+        self.prepare_vnc_password_files()?;
         let specs = self.process_table();
         for spec in specs {
             self.spawn_process(spec).await?;
@@ -336,6 +376,7 @@ impl Supervisor {
         tracing::info!(name = spec.name, cmd = spec.command, "starting process");
 
         let mut cmd = Command::new(spec.command);
+        cmd.env_remove("VNC_PASSWORD");
         cmd.args(&spec.args);
         for (k, v) in &spec.env {
             cmd.env(k, v);
@@ -427,6 +468,7 @@ impl Supervisor {
             }
             proc.state = ProcessState::Stopped;
         }
+        self.remove_vnc_password_files();
         Ok(())
     }
 
@@ -516,6 +558,7 @@ impl Supervisor {
                                 );
 
                                 let mut cmd = Command::new(proc.spec.command);
+                                cmd.env_remove("VNC_PASSWORD");
                                 cmd.args(&proc.spec.args);
                                 for (k, v) in &proc.spec.env {
                                     cmd.env(k, v);
@@ -678,89 +721,26 @@ pub fn clean_x11_locks() -> Result<()> {
     Ok(())
 }
 
-pub const NOVNC_BANNER_SNIPPET: &str = r##"<script id="reach-banner-injected">
-(function() {
-  if (document.getElementById("reach-takeover-banner")) return;
-  const s = document.createElement("style");
-  s.textContent = "#reach-takeover-banner{position:fixed;top:0;left:0;right:0;z-index:999999;background:rgba(24,24,37,0.95);backdrop-filter:blur(8px);color:#cdd6f4;border-bottom:2px solid #fab387;padding:10px 24px;display:none;justify-content:space-between;align-items:center;font-family:system-ui,sans-serif;box-shadow:0 4px 20px rgba(0,0,0,0.5)}.reach-banner-content{display:flex;align-items:center;gap:12px;font-size:14px;font-weight:500}.reach-pulse-dot{width:10px;height:10px;border-radius:50%;background:#fab387;box-shadow:0 0 10px #fab387;display:inline-block;animation:reach-pulse 1.5s infinite}@keyframes reach-pulse{0%,100%{transform:scale(0.95);opacity:0.8}50%{transform:scale(1.2);opacity:1}}#reach-takeover-reason{font-weight:700;color:#fab387}.reach-handback-btn{background:#89b4fa;color:#11111b;border:none;outline:none;font-weight:600;font-size:13px;padding:8px 18px;border-radius:8px;cursor:pointer;transition:all 0.2s ease}.reach-handback-btn:hover:not(:disabled){background:#b4befe}.reach-handback-btn:disabled{opacity:0.7;cursor:not-allowed}";
-  document.head.appendChild(s);
-  const b = document.createElement("div");
-  b.id = "reach-takeover-banner";
-  b.innerHTML = '<div class="reach-banner-content"><span class="reach-pulse-dot"></span><span class="reach-banner-msg">Agent is waiting: <span id="reach-takeover-reason">takeover requested</span></span></div><button id="reach-handback-btn" class="reach-handback-btn" type="button">Hand Back to Agent</button>';
-  document.body.appendChild(b);
-  const p = new URLSearchParams(window.location.search);
-  let id = p.has("screen") ? parseInt(p.get("screen"), 10) : (parseInt(window.location.port, 10) >= 6080 ? parseInt(window.location.port, 10) - 6080 : 0);
-  const api = p.get("api") ? p.get("api").replace(/\/$/, "") : window.location.protocol + "//" + window.location.hostname + ":4200";
-  const r = document.getElementById("reach-takeover-reason");
-  const btn = document.getElementById("reach-handback-btn");
-  if (p.get("reason")) { r.textContent = p.get("reason"); b.style.display = "flex"; }
-  async function poll() {
-    try {
-      const res = await fetch(api + "/agent/screens", { cache: "no-store" });
-      if (!res.ok) return;
-      const list = await res.json();
-      const cur = list.find(s => s.id === id);
-      if (cur && (cur.phase === "HandoffPending" || cur.phase === "HumanActive")) {
-        b.style.display = "flex";
-        if (cur.takeover_reason) r.textContent = cur.takeover_reason;
-        if (cur.phase === "HandoffPending") fetch(api + "/agent/screens/" + id + "/connected", { method: "POST" }).catch(() => {});
-      } else {
-        b.style.display = "none";
-      }
-    } catch (_) {}
-  }
-  setInterval(poll, 1500); poll();
-  btn.addEventListener("click", async () => {
-    btn.disabled = true; btn.textContent = "Handing back...";
-    try {
-      const res = await fetch(api + "/agent/screens/" + id + "/handback", { method: "POST" });
-      if (res.ok) {
-        btn.textContent = "Handed back \u{2713}";
-        r.textContent = "Control returned to agent";
-        setTimeout(() => { b.style.display = "none"; btn.disabled = false; btn.textContent = "Hand Back to Agent"; }, 1500);
-      } else { throw new Error("HTTP " + res.status); }
-    } catch (e) {
-      btn.disabled = false; btn.textContent = "Hand Back to Agent";
-      alert("Failed to hand back: " + e.message);
-    }
-  });
-})();
-</script>"##;
-
-pub fn inject_novnc_banner(vnc_html_path: &std::path::Path) -> std::io::Result<bool> {
-    if !vnc_html_path.exists() {
-        return Ok(false);
-    }
-    let content = std::fs::read_to_string(vnc_html_path)?;
-    if content.contains("reach-takeover-banner") || content.contains("reach-banner-injected") {
-        return Ok(false);
-    }
-    let new_content = if let Some(idx) = content.rfind("</body>") {
-        let mut s = content[..idx].to_string();
-        s.push_str(NOVNC_BANNER_SNIPPET);
-        s.push_str(&content[idx..]);
-        s
-    } else {
-        format!("{content}\n{NOVNC_BANNER_SNIPPET}")
-    };
-    std::fs::write(vnc_html_path, new_content)?;
-    Ok(true)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn x11vnc_uses_password_when_env_set() {
+    fn x11vnc_uses_password_file_without_plaintext_argv() {
         let sup = Supervisor::new(99, 1280, 720).with_vnc_password(Some("s3cret".into()));
         let x = sup
             .process_table()
             .into_iter()
             .find(|p| p.name == "x11vnc-0")
             .unwrap();
-        assert!(x.args.windows(2).any(|w| w == ["-passwd", "s3cret"]));
-        assert!(!x.args.iter().any(|a| a == "-nopw"));
+        assert!(x.args.iter().any(|a| a == "-localhost"));
+        assert!(
+            x.args
+                .windows(2)
+                .any(|w| { w == ["-passwdfile", "/run/reach/x11vnc-password-0"] })
+        );
+        assert!(!x.args.iter().any(|a| a == "s3cret"));
+        assert!(!x.args.iter().any(|a| a == "-passwd"));
     }
 
     #[test]
@@ -787,38 +767,5 @@ mod tests {
             t.iter()
                 .any(|p| p.name == "xvfb-1" && p.args.contains(&":100".to_string()))
         );
-    }
-
-    #[test]
-    fn test_inject_novnc_banner() {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("reach-novnc-test-{nanos}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let html_path = dir.join("vnc.html");
-
-        // Missing file returns false without error
-        assert!(!inject_novnc_banner(&html_path).unwrap());
-
-        // File with </body> tag gets script injected before </body>
-        std::fs::write(
-            &html_path,
-            "<html><head></head><body><h1>noVNC</h1></body></html>",
-        )
-        .unwrap();
-        assert!(inject_novnc_banner(&html_path).unwrap());
-
-        let injected = std::fs::read_to_string(&html_path).unwrap();
-        assert!(injected.contains("reach-takeover-banner"));
-        assert!(injected.contains("Hand Back to Agent"));
-        assert!(injected.contains("Agent is waiting:"));
-        assert!(injected.contains("/agent/screens/"));
-
-        // Idempotent: second injection does nothing
-        assert!(!inject_novnc_banner(&html_path).unwrap());
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -45,7 +45,6 @@ tools:
       required:
         - channel
         - screen
-        - reason
       properties:
         channel:
           type: string
@@ -53,39 +52,26 @@ tools:
         screen:
           type: integer
           description: "Screen ID where human intervention is required."
-        reason:
-          type: string
-          description: "Reason human intervention is needed (e.g., 2FA prompt, CAPTCHA, manual review)."
-        novnc_url:
-          type: string
-          description: "Optional direct noVNC URL. If omitted, defaults to REACH_NOVNC_URL or http://100.124.38.17:6080/vnc.html."
         reply_to:
           type: string
           description: "Optional thread ID to post the takeover request under."
 
   - name: buzz_post_visual_diff
-    description: "Post a visual diff audit reel / screenshot summary to a Buzz channel or thread."
+    description: "Post numeric visual-change metadata without screenshots or model text."
     parameters:
       type: object
       required:
         - channel
-        - summary
       properties:
         channel:
           type: string
           description: "Target Buzz channel ID or name."
-        summary:
-          type: string
-          description: "Text summary of the action and visual diff results."
-        screenshot_path:
-          type: string
-          description: "Path to the local screenshot or audit reel image."
         diff_percent:
           type: number
           description: "Optional perceptual hash or visual difference percentage (0.0 to 100.0)."
         tokens_saved:
           type: integer
-          description: "Optional count of tokens saved by pHash change gating."
+          description: "Optional estimated tokens saved; not a provider measurement."
         reply_to:
           type: string
           description: "Optional thread ID to post under."

@@ -589,15 +589,15 @@ fn t35_workflow_headed_and_headless_coexist() {
 // ═══════════════════════════════════════════════════════════
 
 /// Run an embedded Python helper from `reach_cli::docker` inside the
-/// container, passing its JSON payload via the named env var.
-fn run_embedded_python(env_var: &str, payload: &serde_json::Value, script: &str) -> String {
+/// container, passing its JSON payload on stdin.
+fn run_embedded_python(payload: &serde_json::Value, script: &str) -> String {
     use std::io::Write;
-    let payload_str = serde_json::to_string(payload).unwrap();
+    let payload = serde_json::to_vec(payload).unwrap();
 
     // Stage the script as a temp file inside the container so we don't
     // have to escape multi-line Python on the command line.
     let mut tmp = std::env::temp_dir();
-    tmp.push(format!("reach_e2e_{env_var}.py"));
+    tmp.push(format!("reach_e2e_helper_{}.py", std::process::id()));
     {
         let mut f = std::fs::File::create(&tmp).unwrap();
         f.write_all(script.as_bytes()).unwrap();
@@ -608,11 +608,7 @@ fn run_embedded_python(env_var: &str, payload: &serde_json::Value, script: &str)
     let cp = docker(&["cp", &host_path, &format!("{CONTAINER}:{container_path}")]);
     assert!(cp.status.success(), "docker cp failed: {}", stderr(&cp));
 
-    let cmd = format!(
-        "{env_var}={} python3 {container_path}",
-        shell_quote(&payload_str)
-    );
-    let out = sh(&cmd);
+    let out = docker_exec_with_stdin(&["python3".to_owned(), container_path], &payload);
     let _ = std::fs::remove_file(&tmp);
     if !out.status.success() {
         panic!(
@@ -625,18 +621,25 @@ fn run_embedded_python(env_var: &str, payload: &serde_json::Value, script: &str)
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
-fn shell_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('\'');
-    for ch in s.chars() {
-        if ch == '\'' {
-            out.push_str("'\\''");
-        } else {
-            out.push(ch);
-        }
-    }
-    out.push('\'');
-    out
+fn docker_exec_with_stdin(args: &[String], payload: &[u8]) -> std::process::Output {
+    use std::io::Write;
+    let mut child = Command::new("docker")
+        .arg("exec")
+        .arg("-i")
+        .arg(CONTAINER)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("docker not found");
+    child
+        .stdin
+        .take()
+        .expect("docker stdin unavailable")
+        .write_all(payload)
+        .expect("write docker stdin");
+    child.wait_with_output().expect("wait for docker exec")
 }
 
 fn last_json(stdout: &str) -> serde_json::Value {
@@ -657,13 +660,10 @@ fn t37_page_text_basic() {
     sleep_ms(500);
     let payload = serde_json::json!({
         "url": "https://example.com",
+        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/e2e-t37",
         "timeout_ms": 30000,
     });
-    let stdout = run_embedded_python(
-        "REACH_PAGE_TEXT_PAYLOAD",
-        &payload,
-        reach_cli::docker::PAGE_TEXT_SCRIPT,
-    );
+    let stdout = run_embedded_python(&payload, reach_cli::docker::PAGE_TEXT_SCRIPT);
     let parsed = last_json(&stdout);
     assert_eq!(parsed["status"], "ok", "page_text not ok: {stdout}");
     let text = parsed["text"].as_str().unwrap_or_default();
@@ -682,13 +682,10 @@ fn t38_page_text_selector() {
     let payload = serde_json::json!({
         "url": "https://example.com",
         "selector": "h1",
+        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/e2e-t38",
         "timeout_ms": 30000,
     });
-    let stdout = run_embedded_python(
-        "REACH_PAGE_TEXT_PAYLOAD",
-        &payload,
-        reach_cli::docker::PAGE_TEXT_SCRIPT,
-    );
+    let stdout = run_embedded_python(&payload, reach_cli::docker::PAGE_TEXT_SCRIPT);
     let parsed = last_json(&stdout);
     assert_eq!(
         parsed["status"], "ok",
@@ -715,13 +712,9 @@ fn t39_auth_handoff_returns_vnc_url() {
     // running on the Xvfb display.
     let payload = serde_json::json!({
         "url": "https://example.com",
-        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/_e2e",
+        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/e2e-t39",
     });
-    let stdout = run_embedded_python(
-        "REACH_AUTH_HANDOFF_PAYLOAD",
-        &payload,
-        reach_cli::docker::AUTH_HANDOFF_SCRIPT,
-    );
+    let stdout = run_embedded_python(&payload, reach_cli::docker::AUTH_HANDOFF_SCRIPT);
     let parsed = last_json(&stdout);
     assert_eq!(
         parsed["status"], "auth_required",
@@ -844,13 +837,24 @@ HTTPServer(('127.0.0.1', 8765), H).serve_forever()
     let _guard = ContainerProcGuard("[c]ookie.py");
     sleep_ms(500);
 
-    let profile = "/home/sandbox/.config/google-chrome-profiles/default";
+    let profile = "/home/sandbox/.config/google-chrome-profiles/e2e-t93";
 
-    // Headed browse (default profile, no `use_profile`) sets the cookie.
-    sh_ok(&reach_cli::tools::browse_command(
+    // Headed browse uses this explicitly scoped profile and sends its
+    // request payload through stdin.
+    let (browse_command, browse_payload) = reach_cli::tools::browse_command_input(
         "http://127.0.0.1:8765/",
         profile,
-    ));
+        None,
+        Some(9222),
+        ":99",
+        None,
+    );
+    let browse = docker_exec_with_stdin(&browse_command, &browse_payload);
+    assert!(
+        browse.status.success(),
+        "browse helper failed: {}",
+        stderr(&browse)
+    );
 
     // Chromium's SQLite cookie store batches writes and only commits them
     // to disk on a ~30s timer (confirmed empirically: killing the browser
@@ -891,11 +895,7 @@ HTTPServer(('127.0.0.1', 8765), H).serve_forever()
         "user_data_dir": profile,
         "timeout_ms": 15000,
     });
-    let stdout = run_embedded_python(
-        "REACH_PAGE_TEXT_PAYLOAD",
-        &payload,
-        reach_cli::docker::PAGE_TEXT_SCRIPT,
-    );
+    let stdout = run_embedded_python(&payload, reach_cli::docker::PAGE_TEXT_SCRIPT);
     let parsed = last_json(&stdout);
     assert_eq!(parsed["status"], "ok", "page_text not ok: {stdout}");
     let text = parsed["text"].as_str().unwrap_or_default();
@@ -1036,12 +1036,11 @@ fn rfb_security_types(port: u16) -> Vec<u8> {
 }
 
 // ═══════════════════════════════════════════════════════════
-// 96. COOKIE SHARING ACROSS SCREENS VIA STORAGE_STATE
-// ═══════════════════════════════════════════════════════════
+// 96. COOKIE SHARING VIA AN EXPLICIT PROFILE
 
 #[test]
 #[ignore]
-fn t96_cookie_set_on_screen0_visible_on_screen1() {
+fn t96_cookie_set_in_explicit_profile_visible_to_page_text() {
     ensure_container();
     let _ = sh("pkill -f chrome");
     sleep_ms(500);
@@ -1080,45 +1079,30 @@ HTTPServer(('127.0.0.1', 8766), H).serve_forever()
     let _guard = ContainerProcGuard("[c]ookie_8766.py");
     sleep_ms(500);
 
-    // Clean any prior state file
-    sh_ok("rm -f /workspace/.reach/state.json");
+    let profile = "/home/sandbox/.config/google-chrome-profiles/e2e-t96-shared";
 
-    // Authenticate on screen 0 via auth_handoff
+    // Authenticate into the explicitly scoped profile via auth_handoff.
     let payload_auth = serde_json::json!({
         "url": "http://127.0.0.1:8766/",
         "wait_for_url_contains": "/",
         "timeout_seconds": 15,
-        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/default",
+        "user_data_dir": profile,
     });
-    let stdout_auth = run_embedded_python(
-        "REACH_AUTH_HANDOFF_PAYLOAD",
-        &payload_auth,
-        reach_cli::docker::AUTH_HANDOFF_SCRIPT,
-    );
+    let stdout_auth = run_embedded_python(&payload_auth, reach_cli::docker::AUTH_HANDOFF_SCRIPT);
     let parsed_auth = last_json(&stdout_auth);
     assert_eq!(
         parsed_auth["status"], "authenticated",
         "auth_handoff failed: {stdout_auth}"
     );
 
-    // Verify /workspace/.reach/state.json exists
-    assert_eq!(
-        sh_code("test -f /workspace/.reach/state.json"),
-        0,
-        "state.json was not created"
-    );
-
-    // Now on screen 1, read using page_text with a fresh profile (default-screen1)
+    // Read from the same explicitly scoped profile; no global state fallback
+    // or screen-to-screen inheritance is involved.
     let payload_page = serde_json::json!({
         "url": "http://127.0.0.1:8766/",
-        "user_data_dir": "/home/sandbox/.config/google-chrome-profiles/default-screen1",
+        "user_data_dir": profile,
         "timeout_ms": 15000,
     });
-    let stdout_page = run_embedded_python(
-        "REACH_PAGE_TEXT_PAYLOAD",
-        &payload_page,
-        reach_cli::docker::PAGE_TEXT_SCRIPT,
-    );
+    let stdout_page = run_embedded_python(&payload_page, reach_cli::docker::PAGE_TEXT_SCRIPT);
     let parsed_page = last_json(&stdout_page);
     assert_eq!(
         parsed_page["status"], "ok",

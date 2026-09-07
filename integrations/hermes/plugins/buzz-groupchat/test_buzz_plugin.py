@@ -69,22 +69,22 @@ def test_buzz_send_message():
         )
 
 
-def test_buzz_send_takeover_alert():
+def test_buzz_send_takeover_alert(monkeypatch):
+    monkeypatch.setenv("REACH_AGENT_URL", "https://operator:private-canary@viewer.example:8443/api?token=private-canary")
     with patch.object(plugin, "run_buzz_cli") as mock_cli:
         mock_cli.return_value = {"ok": True, "data": {"id": "alert-1"}}
         res = plugin.buzz_send_takeover_alert(
             channel="ops",
             screen=0,
-            reason="SMS 2FA Challenge",
-            novnc_url="http://100.124.38.17:6080/vnc.html",
+            reply_to="thread",
         )
         assert res["ok"] is True
         args = mock_cli.call_args[0][0]
         assert args[0:3] == ["messages", "send", "--channel"]
         assert args[3] == "ops"
-        assert "SMS 2FA Challenge" in args[5]
-        assert "Display `0`" in args[5]
-        assert "Hand Back to Agent" in args[5]
+        assert "https://viewer.example:8443/viewer/0" in args[5]
+        assert "private-canary" not in args[5]
+        assert "6080" not in args[5]
         assert "--broadcast" in args
 
 
@@ -93,16 +93,18 @@ def test_buzz_post_visual_diff():
         mock_cli.return_value = {"ok": True, "data": {"id": "diff-1"}}
         res = plugin.buzz_post_visual_diff(
             channel="dev",
-            summary="Clicked login button and waited for dashboard",
             diff_percent=0.45,
             tokens_saved=1200,
         )
         assert res["ok"] is True
         args = mock_cli.call_args[0][0]
         content = args[5]
-        assert "Reach Visual Diff Audit" in content
-        assert "- **pHash Change**: `0.45%`" in content
-        assert "- **VLM Tokens Saved**: `1200` tokens" in content
+        assert "estimated" in content.lower()
+        assert "1200" in content
+        assert mock_cli.call_count == 1
+        rejected = plugin.buzz_post_visual_diff(channel="dev", tokens_saved="private-canary")
+        assert rejected["ok"] is False
+        assert mock_cli.call_count == 1
 
 
 def test_buzz_get_messages():
@@ -137,13 +139,7 @@ def test_register_plugin():
 
     ctx = DummyContext()
     plugin.register(ctx)
-    assert len(registered_tools) == 5
-    tool_names = [t[0] for t in registered_tools]
-    assert "buzz_send_message" in tool_names
-    assert "buzz_send_takeover_alert" in tool_names
-    assert "buzz_post_visual_diff" in tool_names
-    assert "buzz_get_messages" in tool_names
-    assert "buzz_list_channels" in tool_names
+    assert {tool[0] for tool in registered_tools} == set(plugin.PLUGIN_TOOLS)
 
     # Verify config resolution
     assert plugin.get_relay_url() == "http://relay.internal:3000"

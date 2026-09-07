@@ -43,6 +43,14 @@ detect_mode() {
 
 RESOLVED_MODE="$(detect_mode)"
 
+# OrbStack keeps the guest's raw endpoints private. Human/API access goes
+# through an explicit loopback tunnel (for example:
+# `ssh -N -L 127.0.0.1:6080:127.0.0.1:6080 ...`), never the VM IPv4.
+loopback_url() {
+    local port="$1"
+    echo "http://127.0.0.1:${port}"
+}
+
 # Time helper in milliseconds
 get_time_ms() {
     python3 -c "import time; print(int(time.time() * 1000))"
@@ -133,7 +141,7 @@ orb_spawn() {
     d_start=$((t_start - t_clone))
     d_total=$((t_start - t0))
 
-    # 3. Resolve dedicated IP address
+    # Resolve the guest address only for diagnostics; it is never published.
     local ip=""
     for _ in {1..30}; do
         ip="$(orb_get_ip "$name")"
@@ -142,35 +150,26 @@ orb_spawn() {
     done
 
     if [ -z "$ip" ]; then
-        error "Failed to acquire IP for [${name}]."
+        error "Failed to acquire guest IP for [${name}]."
         exit 1
     fi
 
-    local novnc_url="http://${ip}:6080/vnc.html?autoconnect=1&resize=remote"
-    local health_url="http://${ip}:8400/health"
+    local novnc_url="$(loopback_url 6080)/vnc.html?autoconnect=1&resize=remote"
+    local health_url="$(loopback_url 8400)/health"
 
+    warn "OrbStack raw endpoints are guest-private; use an authenticated loopback tunnel for ${name}."
     success "MicroVM [${BOLD}${name}${NC}] spawned in ${BOLD}${d_total}ms${NC} (clone: ${d_clone}ms, start: ${d_start}ms)!"
-    echo -e "  ${PURPLE}•${NC} IPv4:       ${BOLD}${ip}${NC}"
-    echo -e "  ${PURPLE}•${NC} noVNC:      ${BLUE}${novnc_url}${NC}"
-    echo -e "  ${PURPLE}•${NC} Supervisor: ${BLUE}${health_url}${NC}"
+    echo -e "  ${PURPLE}•${NC} Guest IPv4: ${BOLD}${ip}${NC} (not published)"
+    echo -e "  ${PURPLE}•${NC} noVNC (loopback tunnel): ${BLUE}${novnc_url}${NC}"
+    echo -e "  ${PURPLE}•${NC} Supervisor (loopback tunnel): ${BLUE}${health_url}${NC}"
 
-    # Perform healthcheck
-    orb_healthcheck "$name" "$ip"
+    # Perform an in-guest healthcheck, not a raw host-network probe.
+    orb_healthcheck "$name"
 }
 
 orb_healthcheck() {
     local name="$1"
-    local ip="${2:-}"
-    if [ -z "$ip" ]; then
-        ip="$(orb_get_ip "$name")"
-    fi
-
-    if [ -z "$ip" ]; then
-        error "Could not resolve IP for [${name}]."
-        return 1
-    fi
-
-    log "Running healthcheck on [${name}] (${ip})..."
+    log "Running in-guest healthcheck on [${name}] (loopback only)..."
 
     local healthy=false
     local attempts=0
@@ -178,13 +177,11 @@ orb_healthcheck() {
 
     while [ $attempts -lt $max_attempts ]; do
         attempts=$((attempts + 1))
-        # Check supervisor health JSON
         local health_resp
-        health_resp="$(curl -s --connect-timeout 1 "http://${ip}:8400/health" 2>/dev/null || true)"
+        health_resp="$(orb -m "$name" curl -s --connect-timeout 1 http://127.0.0.1:8400/health 2>/dev/null || true)"
         if echo "$health_resp" | grep -q '"status":"healthy"'; then
-            # Check noVNC HTTP 200
             local vnc_resp
-            vnc_resp="$(curl -sI --connect-timeout 1 "http://${ip}:6080/vnc.html" 2>/dev/null | head -n 1 || true)"
+            vnc_resp="$(orb -m "$name" curl -sI --connect-timeout 1 http://127.0.0.1:6080/vnc.html 2>/dev/null | head -n 1 || true)"
             if echo "$vnc_resp" | grep -q '200 OK'; then
                 healthy=true
                 break
@@ -268,9 +265,9 @@ find_available_port() {
 import socket, sys
 port = int(sys.argv[1])
 while port < 65535:
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s = socket.socket()
     try:
-        s.bind(('0.0.0.0', port))
+        s.bind(('127.0.0.1', port))
         s.close()
         print(port)
         break
@@ -279,8 +276,26 @@ while port < 65535:
 " "$start_port"
 }
 
+docker_network_name() {
+    local name="$1"
+    echo "reach-${name}"
+}
+
+docker_network_create() {
+    local name="$1"
+    local network
+    network="$(docker_network_name "$name")"
+    docker network create \
+        --driver bridge \
+        --opt com.docker.network.bridge.enable_icc=false \
+        --label reach.network.managed=true \
+        --label "reach.name=${name}" \
+        "$network" >/dev/null
+    echo "$network"
+}
 docker_spawn() {
     local name="$1"
+
     local vnc_port="${2:-}"
     local novnc_port="${3:-}"
     local health_port="${4:-}"
@@ -299,21 +314,30 @@ docker_spawn() {
 
     if docker ps -a --format '{{.Names}}' | grep -qx "$name"; then
         warn "Container [${name}] already exists. Nuking first..."
-        docker rm -f "$name" >/dev/null 2>&1
+        docker_nuke "$name"
     fi
 
     docker_golden_init
+    local network
+    network="$(docker_network_create "$name")"
+
 
     local t0 t1 duration
     t0=$(get_time_ms)
 
     local cid
-    cid="$(docker run -d \
+    if ! cid="$(docker run -d \
         --name "$name" \
-        -p "${vnc_port}:5900" \
-        -p "${novnc_port}:6080" \
-        -p "${health_port}:8400" \
-        "$GOLDEN_IMAGE")"
+        --label "reach.network=${network}" \
+        --network "$network" \
+        -p "127.0.0.1:${vnc_port}:5900" \
+        -p "127.0.0.1:${novnc_port}:6080" \
+        -p "127.0.0.1:${health_port}:8400" \
+        "$GOLDEN_IMAGE")"; then
+        docker network inspect "$network" >/dev/null 2>&1 && docker network rm "$network" >/dev/null 2>&1 || true
+        error "Docker sandbox [${name}] failed to start; managed network [${network}] was removed."
+        return 1
+    fi
 
     t1=$(get_time_ms)
     duration=$((t1 - t0))
@@ -379,7 +403,15 @@ docker_nuke() {
 
     local t0 t1 duration
     t0=$(get_time_ms)
+    local network=""
+    if docker inspect "$name" >/dev/null 2>&1; then
+        network="$(docker inspect -f '{{ index .Config.Labels "reach.network" }}' "$name" 2>/dev/null || true)"
+    fi
     docker rm -f "$name" >/dev/null 2>&1 || true
+    if [ -n "$network" ] \
+        && [ "$(docker network inspect -f '{{ index .Labels "reach.network.managed" }}' "$network" 2>/dev/null || true)" = "true" ]; then
+        docker network rm "$network" >/dev/null 2>&1 || true
+    fi
     t1=$(get_time_ms)
     duration=$((t1 - t0))
 

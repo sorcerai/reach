@@ -9,3 +9,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 psl = "2.1.229"
+hmac = ">=0.12,<0.13"
+pbkdf2 = ">=0.12,<0.13"
+sha2 = ">=0.10,<0.11"
+base64 = ">=0.22,<0.23"

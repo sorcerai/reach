@@ -12,8 +12,10 @@ pub mod record;
 pub mod recreate;
 pub mod replay;
 pub mod screenshot;
+pub mod security;
 pub mod serve;
 pub mod vault;
+pub mod viewer;
 pub mod vnc;
 
 use clap::Subcommand;
@@ -24,7 +26,7 @@ pub enum Command {
     Create(create::CreateArgs),
     /// Destroy a sandbox container
     Destroy(destroy::DestroyArgs),
-    /// Destroy and recreate a sandbox, keeping its workspace and profile volumes
+    /// Recreate a sandbox using its authorized lifecycle manifest
     Recreate(recreate::RecreateArgs),
     /// List running sandbox containers
     List,

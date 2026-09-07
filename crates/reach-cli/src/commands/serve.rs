@@ -9,7 +9,7 @@ use axum::{Json, Router};
 use clap::Args;
 use reach_cli::agent::{AgentState, ScreenInfoResponse};
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::{DockerClient, novnc_url};
+use reach_cli::docker::DockerClient;
 use reach_cli::mcp::{
     JsonRpcRequest, JsonRpcResponse, McpInitializeResult, ToolResponse, tool_definitions,
 };
@@ -49,6 +49,9 @@ pub struct AppState {
     pub agent: AgentState,
     pub profile_broker: Arc<reach_cli::profile::ProfileBroker>,
     pub cookie_jars: Arc<reach_cli::profile::CookieJarService>,
+    pub accounts: std::collections::BTreeMap<String, reach_cli::lease::AccountPolicy>,
+    pub viewer_sessions: super::viewer::ViewerSessions,
+    pub raw_viewer_token: String,
 }
 
 impl AppState {
@@ -104,6 +107,9 @@ pub fn normalize_host_target(target: &str) -> &str {
         .unwrap_or(target);
     extract_host(without_scheme)
 }
+async fn computer_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({"sandbox":state.default_sandbox}))
+}
 
 pub fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
@@ -111,14 +117,24 @@ pub fn build_app(state: Arc<AppState>) -> Router {
         .route("/mcp", get(sse_handler))
         .route("/sse", get(sse_handler))
         .route("/health", get(|| async { "ok" }))
+        .route("/agent/computer", get(computer_handler))
         .route("/agent/screens", get(agent_screens_handler))
         .route("/agent/screens/{id}", get(agent_screen_get_handler))
         .route("/agent/screens/{id}/lease", post(agent_lease_handler))
         .route("/agent/screens/{id}/lease", delete(agent_release_handler))
+        .route(
+            "/agent/screens/{id}/force-release",
+            post(agent_force_release_handler),
+        )
         .route("/agent/screens/{id}/takeover", post(agent_takeover_handler))
         .route("/agent/screens/{id}/handback", post(agent_handback_handler))
         .route("/agent/screens/{id}/ack", post(agent_ack_handler))
         .route("/agent/screens/{id}/wait", get(agent_wait_handler))
+        .route(
+            "/agent/screens/{id}/approval",
+            get(super::security::pending).post(super::security::approve),
+        )
+        .merge(super::viewer::router())
         .route(
             "/agent/screens/{id}/connected",
             post(agent_connected_handler),
@@ -146,30 +162,53 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         .unwrap_or_else(|| cfg.server.effective_public_host());
 
     let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let screens_count = match resolve_sandbox_name(&docker, args.sandbox.as_deref()).await {
-        Ok(name) => match docker.find(&name).await {
+    let default_sandbox = resolve_sandbox_name(&docker, args.sandbox.as_deref())
+        .await
+        .ok();
+    let screens_count = match default_sandbox.as_deref() {
+        Some(name) => match docker.find(name).await {
             Ok(sb) => sb.ports.screens.max(1),
             Err(_) => 1,
         },
-        Err(_) => 1,
+        None => 1,
     };
     let agent = AgentState::new(screens_count);
     let auth_token = args
         .auth_token
         .or_else(|| std::env::var("REACH_AUTH_TOKEN").ok())
         .filter(|t| !t.trim().is_empty());
+    if auth_token.is_none() {
+        anyhow::bail!("serving requires a configured supervisor authentication token");
+    }
 
+    let raw_viewer_token = uuid::Uuid::new_v4().to_string();
+    if let Some(target) = default_sandbox.as_deref() {
+        let helper = "import os,sys\nos.makedirs('/run/reach',mode=0o700,exist_ok=True)\nfd=os.open('/run/reach/viewer-token',os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)\nos.fchmod(fd,0o600)\nwith os.fdopen(fd,'wb') as f: f.write(sys.stdin.buffer.read())";
+        let receipt = docker
+            .exec_input(
+                target,
+                &["python3".into(), "-c".into(), helper.into()],
+                raw_viewer_token.as_bytes(),
+            )
+            .await?;
+        if receipt.exit_code != 0 {
+            anyhow::bail!("failed to initialize private viewer transport");
+        }
+    }
     let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::default_broker());
     let cookie_jars = Arc::new(reach_cli::profile::CookieJarService::default_service());
     let state = Arc::new(AppState {
         docker,
-        default_sandbox: args.sandbox,
+        default_sandbox,
         public_host,
         bind_host: host.clone(),
         auth_token,
         agent,
         profile_broker,
         cookie_jars,
+        accounts: cfg.accounts,
+        viewer_sessions: super::viewer::ViewerSessions::default(),
+        raw_viewer_token,
     });
 
     println!("Live view host: {}", state.public_host);
@@ -267,6 +306,36 @@ async fn auth_middleware(
     req: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Response {
+    if let Some(token) = req.headers().get("x-lease-token") {
+        let screen = token
+            .to_str()
+            .ok()
+            .and_then(|t| state.agent.screen_for_lease(t));
+        let path = req.uri().path();
+        let allowed = screen.is_some_and(|id| {
+            let prefix = format!("/agent/screens/{id}");
+            path == "/tools"
+                || path.starts_with("/tools/")
+                || path == "/mcp"
+                || path == "/sse"
+                || path == "/agent/screens"
+                || path == prefix
+                || path == format!("{prefix}/takeover")
+                || path == format!("{prefix}/ack")
+                || path == format!("{prefix}/wait")
+                || (path == format!("{prefix}/lease") && req.method() == axum::http::Method::DELETE)
+        });
+        if !allowed {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "invalid or out-of-scope lease capability"
+                })),
+            )
+                .into_response();
+        }
+        return next.run(req).await;
+    }
     if let Some(expected_token) = &state.auth_token {
         let path = req.uri().path();
         if path.starts_with("/agent")
@@ -365,6 +434,8 @@ async fn resolve_sandbox(state: &AppState, requested: Option<&str>) -> anyhow::R
 
 async fn agent_screens_handler(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<HumanTokenQuery>,
 ) -> Json<Vec<ScreenInfoResponse>> {
     let sb = match resolve_sandbox(&state, None).await {
         Ok(name) => state.docker.find(&name).await.ok(),
@@ -375,11 +446,17 @@ async fn agent_screens_handler(
         state.agent.ensure_screens(sb.ports.screens);
     }
 
-    let novnc_base = sb.as_ref().and_then(|s| s.ports.novnc).unwrap_or(6080);
-
     let snapshot = state.agent.snapshot();
     let res = snapshot
         .into_iter()
+        .filter(|s| {
+            let lease = headers.get("x-lease-token").and_then(|h| h.to_str().ok());
+            let human = extract_human_token(&headers, Some(&query));
+            lease.is_none_or(|token| s.lease_token.as_deref() == Some(token))
+                && human
+                    .as_deref()
+                    .is_none_or(|token| s.human_token.as_deref() == Some(token))
+        })
         .map(|s| ScreenInfoResponse {
             id: s.id,
             owner: s.owner,
@@ -389,7 +466,7 @@ async fn agent_screens_handler(
             takeover_reason: s.takeover_reason,
             takeover_url: s.takeover_url,
             leased_at: s.leased_at,
-            novnc_url: novnc_url(&state.public_host, novnc_base + s.id as u16),
+            novnc_url: format!("/viewer/{}", s.id),
             busy: s.busy,
         })
         .collect();
@@ -400,6 +477,7 @@ async fn agent_screens_handler(
 async fn agent_screen_get_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u32>,
+    headers: HeaderMap,
 ) -> Result<Json<ScreenInfoResponse>, (StatusCode, Json<serde_json::Value>)> {
     let sb = match resolve_sandbox(&state, None).await {
         Ok(name) => state.docker.find(&name).await.ok(),
@@ -410,9 +488,15 @@ async fn agent_screen_get_handler(
         state.agent.ensure_screens(sb.ports.screens);
     }
 
-    let novnc_base = sb.as_ref().and_then(|s| s.ports.novnc).unwrap_or(6080);
-
     if let Some(s) = state.agent.screen_info(id) {
+        if let Some(token) = headers.get("x-lease-token").and_then(|v| v.to_str().ok()) {
+            if s.lease_token.as_deref() != Some(token) {
+                return Err((
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({"error": "invalid_lease"})),
+                ));
+            }
+        }
         Ok(Json(ScreenInfoResponse {
             id: s.id,
             owner: s.owner,
@@ -422,7 +506,7 @@ async fn agent_screen_get_handler(
             takeover_reason: s.takeover_reason,
             takeover_url: s.takeover_url,
             leased_at: s.leased_at,
-            novnc_url: novnc_url(&state.public_host, novnc_base + s.id as u16),
+            novnc_url: format!("/viewer/{}", s.id),
             busy: s.busy,
         }))
     } else {
@@ -436,6 +520,14 @@ async fn agent_screen_get_handler(
 #[derive(Debug, serde::Deserialize)]
 pub struct LeaseRequest {
     pub owner: String,
+    #[serde(default)]
+    pub account: Option<String>,
+    #[serde(default)]
+    pub task_id: Option<String>,
+    #[serde(default)]
+    pub attempt_id: Option<String>,
+    #[serde(default)]
+    pub allow_exec: bool,
 }
 
 #[derive(Debug, Default, serde::Deserialize)]
@@ -455,8 +547,6 @@ pub struct TakeoverRequest {
     #[serde(default)]
     pub reason: Option<String>,
     #[serde(default)]
-    pub url: Option<String>,
-    #[serde(default)]
     pub pending: Option<bool>,
 }
 
@@ -468,16 +558,34 @@ pub struct WaitQuery {
     pub timeout: Option<u64>,
 }
 
-fn is_mutating_tool(tool: &str) -> bool {
-    matches!(tool, "click" | "type" | "key" | "browse")
-}
-
 fn validate_tool_screen(
     state: &AppState,
     screen: u32,
     headers: &HeaderMap,
-    tool: Option<&str>,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+    if let Some(token) = headers.get("x-lease-token") {
+        if state.default_sandbox.is_none() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "error": "No sandbox was bound at startup; restart with --sandbox"
+                })),
+            ));
+        }
+        if token
+            .to_str()
+            .ok()
+            .and_then(|t| state.agent.screen_for_lease(t))
+            != Some(screen)
+        {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": "lease capability does not authorize this screen"
+                })),
+            ));
+        }
+    }
     let is_leased = state.agent.is_leased(screen);
     if let Some(active_token) = state.agent.lease_token(screen) {
         let provided = headers.get("x-lease-token").and_then(|v| v.to_str().ok());
@@ -513,7 +621,7 @@ fn validate_tool_screen(
                     })),
                 ));
             }
-        } else if is_leased && tool.is_some_and(is_mutating_tool) {
+        } else if is_leased {
             return Err((
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
@@ -541,12 +649,97 @@ fn validate_tool_screen(
     Ok(())
 }
 
+async fn agent_force_release_handler(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<u32>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
+    let bearer = headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+    if state
+        .auth_token
+        .as_deref()
+        .is_none_or(|expected| bearer != Some(expected))
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "error": "configured supervisor bearer required"
+            })),
+        ));
+    }
+    state.agent.force_release_screen(id).map_err(|e| {
+        (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({"error": e.to_string()})),
+        )
+    })?;
+    Ok(Json(
+        serde_json::json!({"status": "ok", "id": id, "released": true}),
+    ))
+}
+
 async fn agent_lease_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u32>,
     Json(body): Json<LeaseRequest>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    match state.agent.lease_screen(id, &body.owner) {
+    let mut grant = if let Some(account) = body.account.as_deref() {
+        let policy = state
+            .accounts
+            .get(account)
+            .ok_or_else(|| super::security::reject(StatusCode::FORBIDDEN, "account_not_granted"))?;
+        reach_cli::lease::LeaseGrant::for_account(account, policy)
+            .map_err(|e| super::security::reject(StatusCode::BAD_REQUEST, e))?
+    } else {
+        reach_cli::lease::LeaseGrant::clean()
+    };
+    for (input, output) in [
+        (&body.task_id, &mut grant.task_id),
+        (&body.attempt_id, &mut grant.attempt_id),
+    ] {
+        if let Some(value) = input {
+            if !reach_cli::lease::valid_name(value) {
+                return Err(super::security::reject(
+                    StatusCode::BAD_REQUEST,
+                    "invalid task or attempt identifier",
+                ));
+            }
+            *output = value.clone();
+        }
+    }
+    let permit = state
+        .agent
+        .begin_tool(id, None, state.agent.handoff_gen(id))
+        .map_err(|e| super::security::reject(StatusCode::CONFLICT, e))?;
+    let target = state.default_sandbox.as_deref().ok_or_else(|| {
+        super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "no_bound_computer")
+    })?;
+    grant.incarnation = state.docker.incarnation(target).await.map_err(|_| {
+        super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "computer_unavailable")
+    })?;
+    let sandbox = state.docker.find(target).await.map_err(|_| {
+        super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "computer_unavailable")
+    })?;
+    if grant.account.is_some() && sandbox.allow_exec {
+        return Err(super::security::reject(
+            StatusCode::FORBIDDEN,
+            "account_requires_non_code_computer",
+        ));
+    }
+    if body.allow_exec && (!sandbox.allow_exec || grant.account.is_some()) {
+        return Err(super::security::reject(
+            StatusCode::FORBIDDEN,
+            "execution_not_granted",
+        ));
+    }
+    grant.allow_exec = body.allow_exec;
+    state.docker.reset_screen(target, id).await.map_err(|_| {
+        super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "screen_cleanup_failed")
+    })?;
+    match permit.allocate(&body.owner, grant) {
         Ok(lease) => Ok(Json(serde_json::json!({
             "status": "ok",
             "id": id,
@@ -587,6 +780,8 @@ async fn agent_release_handler(
                 reach_cli::agent::LeaseError::InvalidToken { .. } => StatusCode::FORBIDDEN,
                 reach_cli::agent::LeaseError::NotOwner { .. } => StatusCode::FORBIDDEN,
                 reach_cli::agent::LeaseError::NotFound(_) => StatusCode::NOT_FOUND,
+                reach_cli::agent::LeaseError::HumanActive { .. }
+                | reach_cli::agent::LeaseError::Busy { .. } => StatusCode::CONFLICT,
                 _ => StatusCode::BAD_REQUEST,
             };
             Err((status, Json(serde_json::json!({ "error": e.to_string() }))))
@@ -612,7 +807,7 @@ fn verify_caller_human_token(
     id: u32,
     headers: &HeaderMap,
     query: Option<&HumanTokenQuery>,
-) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
+) -> Result<String, (StatusCode, Json<serde_json::Value>)> {
     if let Some(expected_token) = &state.auth_token {
         let auth_header = headers.get(axum::http::header::AUTHORIZATION);
         let bearer = auth_header
@@ -620,14 +815,14 @@ fn verify_caller_human_token(
             .and_then(|h| h.strip_prefix("Bearer "))
             .map(|t| t.trim());
         if bearer == Some(expected_token.as_str()) {
-            return Ok(());
+            return Ok(state.agent.human_token(id).unwrap_or_default());
         }
     }
 
     let token = extract_human_token(headers, query);
     if let Some(expected) = state.agent.human_token(id) {
         if token.as_deref() == Some(expected.as_str()) {
-            return Ok(());
+            return Ok(expected);
         }
         return Err((
             StatusCode::FORBIDDEN,
@@ -664,7 +859,10 @@ async fn agent_takeover_handler(
     }
 
     if body.pending == Some(false) {
-        match state.agent.cancel_takeover(id) {
+        match state.agent.cancel_takeover(
+            id,
+            headers.get("x-lease-token").and_then(|v| v.to_str().ok()),
+        ) {
             Ok(screen) => Ok(Json(serde_json::json!({
                 "status": "ok",
                 "id": id,
@@ -706,13 +904,17 @@ async fn agent_takeover_handler(
             }
         }
 
-        match state.agent.request_takeover(id, body.reason, body.url) {
+        match state.agent.request_takeover(
+            id,
+            body.reason,
+            Some(format!("/viewer/{id}")),
+            headers.get("x-lease-token").and_then(|v| v.to_str().ok()),
+        ) {
             Ok(screen) => Ok(Json(serde_json::json!({
                 "status": "ok",
                 "id": id,
                 "phase": screen.phase,
                 "handoff_gen": screen.handoff_gen,
-                "human_token": screen.human_token,
                 "takeover_url": screen.takeover_url,
             }))),
             Err(e) => {
@@ -734,9 +936,9 @@ async fn agent_handback_handler(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<HumanTokenQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    verify_caller_human_token(&state, id, &headers, Some(&query))?;
+    let token = verify_caller_human_token(&state, id, &headers, Some(&query))?;
 
-    match state.agent.human_handback(id) {
+    match state.agent.human_handback(id, Some(&token)) {
         Ok(screen) => Ok(Json(serde_json::json!({
             "status": "ok",
             "id": id,
@@ -771,7 +973,10 @@ async fn agent_ack_handler(
         }
     }
 
-    match state.agent.agent_ack(id) {
+    match state.agent.agent_ack(
+        id,
+        headers.get("x-lease-token").and_then(|v| v.to_str().ok()),
+    ) {
         Ok(screen) => Ok(Json(serde_json::json!({
             "status": "ok",
             "id": id,
@@ -795,9 +1000,9 @@ async fn agent_connected_handler(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<HumanTokenQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
-    verify_caller_human_token(&state, id, &headers, Some(&query))?;
+    let token = verify_caller_human_token(&state, id, &headers, Some(&query))?;
 
-    match state.agent.human_connected(id) {
+    match state.agent.human_connected(id, Some(&token)) {
         Ok(screen) => Ok(Json(serde_json::json!({
             "status": "ok",
             "id": id,
@@ -819,6 +1024,7 @@ async fn agent_wait_handler(
     State(state): State<Arc<AppState>>,
     Path(id): Path<u32>,
     axum::extract::Query(query): axum::extract::Query<WaitQuery>,
+    headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let target_phase = match query.phase.as_deref() {
         Some(s) => match s.parse::<reach_cli::agent::ScreenPhase>() {
@@ -836,7 +1042,16 @@ async fn agent_wait_handler(
     let timeout_secs = query.timeout.unwrap_or(600);
     let timeout = std::time::Duration::from_secs(timeout_secs);
 
-    match state.agent.wait_for_phase(id, target_phase, timeout).await {
+    let outcome = state.agent.wait_for_phase(id, target_phase, timeout).await;
+    if let Some(token) = headers.get("x-lease-token").and_then(|v| v.to_str().ok()) {
+        if state.agent.screen_for_lease(token) != Some(id) {
+            return Err((
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({"error": "invalid_lease"})),
+            ));
+        }
+    }
+    match outcome {
         Ok(screen) => Ok(Json(serde_json::json!({
             "status": "ok",
             "id": id,
@@ -866,10 +1081,13 @@ async fn mcp_handler(
     Json(req): Json<JsonRpcRequest>,
 ) -> Result<Json<JsonRpcResponse>, (StatusCode, Json<serde_json::Value>)> {
     if req.method == "tools/call" {
-        let tool_name = req.params.get("name").and_then(|v| v.as_str());
-        let args = req.params.get("arguments").cloned().unwrap_or_default();
+        let args = req
+            .params
+            .get("arguments")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
         let screen = reach_cli::tools::screen_for(&args);
-        validate_tool_screen(&state, screen, &headers, tool_name)?;
+        validate_tool_screen(&state, screen, &headers)?;
     }
 
     Ok(Json(handle_mcp(&state, &headers, &req).await))
@@ -882,23 +1100,95 @@ async fn sse_handler() -> Sse<impl tokio_stream::Stream<Item = Result<Event, Inf
 
 async fn tools_list_handler() -> Json<serde_json::Value> {
     let tools = tool_definitions();
+
     Json(serde_json::json!({ "tools": tools }))
+}
+fn finish_handoff(
+    permit: &reach_cli::agent::BusyGuard<'_>,
+    headers: &HeaderMap,
+    tool: &str,
+    args: &serde_json::Value,
+    mut result: ToolResponse,
+) -> ToolResponse {
+    if tool != "auth_handoff" || result.is_error {
+        return result;
+    }
+    if let Some(reach_cli::mcp::ContentBlock::Text { text }) = result.content.first_mut() {
+        if let Ok(mut body) = serde_json::from_str::<serde_json::Value>(text) {
+            if body.get("status").and_then(|v| v.as_str()) == Some("auth_required") {
+                let url = body
+                    .get("vnc_url")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                let token = headers.get("x-lease-token").and_then(|v| v.to_str().ok());
+                let reason = args
+                    .get("reason")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                match permit.request_takeover(reason, url, token) {
+                    Ok(handoff) => {
+                        body["vnc_url"] = serde_json::json!(handoff.takeover_url);
+                        body["handoff_gen"] = serde_json::json!(handoff.handoff_gen);
+                        body["phase"] = serde_json::json!(handoff.phase);
+                        *text = body.to_string();
+                    }
+                    Err(error) => return ToolResponse::error(error.to_string()),
+                }
+            }
+        }
+    }
+    result
 }
 
 async fn tool_call_handler(
     State(state): State<Arc<AppState>>,
     Path(tool): Path<String>,
     headers: HeaderMap,
-    Json(args): Json<serde_json::Value>,
+    Json(mut args): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, Json<serde_json::Value>)> {
     let screen = reach_cli::tools::screen_for(&args);
-    validate_tool_screen(&state, screen, &headers, Some(&tool))?;
+    validate_tool_screen(&state, screen, &headers)?;
 
-    let initial_gen = state.agent.handoff_gen(screen);
+    let initial_gen = headers
+        .get("x-handoff-gen")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .or_else(|| state.agent.handoff_gen(screen));
+    let _permit = state
+        .agent
+        .begin_tool(
+            screen,
+            headers.get("x-lease-token").and_then(|v| v.to_str().ok()),
+            initial_gen,
+        )
+        .map_err(|error| {
+            (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({"error": error})),
+            )
+        })?;
 
     let sandbox_arg = args.get("sandbox").and_then(|v| v.as_str());
+    if headers.contains_key("x-lease-token")
+        && sandbox_arg.is_some()
+        && sandbox_arg != state.default_sandbox.as_deref()
+    {
+        return Err((
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({"error": "sandbox_out_of_scope"})),
+        ));
+    }
     let target_result = resolve_sandbox(&state, sandbox_arg).await;
     let target = target_result.as_deref().unwrap_or("");
+    if target.is_empty() {
+        return Err(super::security::reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "computer_unavailable",
+        ));
+    }
+    let grant =
+        super::security::prepare(&state, &headers, screen, target, &tool, &mut args).await?;
+    let scoped_cookies = super::security::cookies(grant.as_ref());
 
     let owner = headers
         .get("x-owner")
@@ -910,10 +1200,43 @@ async fn tool_call_handler(
         public_host: state.public_host.clone(),
         agent: Some(&state.agent),
         profile_broker: Some(&state.profile_broker),
-        cookie_jars: Some(&state.cookie_jars),
+        cookie_jars: if grant.is_some() {
+            scoped_cookies.as_ref()
+        } else {
+            Some(&state.cookie_jars)
+        },
         owner,
     };
-    let result = dispatch(&ctx, &tool, &args, target).await;
+    let result = if tool == "inject" {
+        let mut request_args = args.clone();
+        request_args.as_object_mut().map(|a| a.remove("screen"));
+        match serde_json::from_value::<reach_cli::injection::InjectionRequest>(request_args) {
+            Ok(request) => match reach_cli::injection::inject(
+                &state.docker,
+                target,
+                screen,
+                grant
+                    .as_ref()
+                    .expect("injection admission requires a grant"),
+                &request,
+            )
+            .await
+            {
+                Ok(receipt) => ToolResponse::text(serde_json::to_string(&receipt).unwrap()),
+                Err(_) => ToolResponse::error(
+                    "{\"status\":\"uncertain\",\"error\":\"injection_failed_requires_reconciliation\"}",
+                ),
+            },
+            Err(_) => {
+                return Err(super::security::reject(
+                    StatusCode::BAD_REQUEST,
+                    "invalid injection request",
+                ));
+            }
+        }
+    } else {
+        dispatch(&ctx, &tool, &args, target).await
+    };
 
     // Check if phase transitioned to HumanActive or handoff generation changed during execution (reach-pkm)
     if let Some(post_info) = state.agent.screen_info(screen) {
@@ -952,7 +1275,14 @@ async fn tool_call_handler(
         ));
     }
 
-    Ok(Json(serde_json::to_value(result).unwrap_or_default()))
+    let result = finish_handoff(&_permit, &headers, &tool, &args, result);
+    let mut value = serde_json::to_value(result).unwrap_or_default();
+    if let Some(snapshot) = state.agent.screen_info(screen) {
+        value["_meta"] = serde_json::json!({"observation_gen":snapshot.observation_gen,
+            "task_id":grant.as_ref().map(|g| &g.task_id), "attempt_id":grant.as_ref().map(|g| &g.attempt_id),
+            "incarnation":grant.as_ref().map(|g| &g.incarnation)});
+    }
+    Ok(Json(value))
 }
 
 async fn tools_post_handler(
@@ -976,7 +1306,7 @@ async fn tools_post_handler(
 }
 
 async fn handle_mcp(
-    state: &AppState,
+    state: &Arc<AppState>,
     headers: &HeaderMap,
     req: &JsonRpcRequest,
 ) -> JsonRpcResponse {
@@ -995,63 +1325,28 @@ async fn handle_mcp(
                 .get("name")
                 .and_then(|v| v.as_str())
                 .unwrap_or("");
-            let args = req.params.get("arguments").cloned().unwrap_or_default();
-            let screen = reach_cli::tools::screen_for(&args);
-            let initial_gen = state.agent.handoff_gen(screen);
-            let sandbox_arg = args.get("sandbox").and_then(|v| v.as_str());
-
-            let target_result = resolve_sandbox(state, sandbox_arg).await;
-            let target = target_result.as_deref().unwrap_or("");
-
-            let owner = headers
-                .get("x-owner")
-                .and_then(|v| v.to_str().ok())
-                .map(String::from);
-
-            let ctx = ToolContext {
-                docker: &state.docker,
-                public_host: state.public_host.clone(),
-                agent: Some(&state.agent),
-                profile_broker: Some(&state.profile_broker),
-                cookie_jars: Some(&state.cookie_jars),
-                owner,
-            };
-            let result = dispatch(&ctx, tool, &args, target).await;
-
-            // Check if phase transitioned to HumanActive or handoff generation changed during execution (reach-pkm)
-            if let Some(post_info) = state.agent.screen_info(screen) {
-                if post_info.phase == reach_cli::agent::ScreenPhase::HumanActive
-                    || (post_info.phase != reach_cli::agent::ScreenPhase::AgentActive
-                        && post_info.phase != reach_cli::agent::ScreenPhase::Idle)
-                    || (initial_gen.is_some() && Some(post_info.handoff_gen) != initial_gen)
-                {
-                    let err_val = serde_json::json!({
-                        "error": "executed_during_takeover",
-                        "phase": post_info.phase,
-                        "handoff_gen": post_info.handoff_gen,
-                    });
-                    return JsonRpcResponse::success(
+            let args = req
+                .params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            match tool_call_handler(
+                State(state.clone()),
+                Path(tool.to_owned()),
+                headers.clone(),
+                Json(args),
+            )
+            .await
+            {
+                Ok(Json(result)) => JsonRpcResponse::success(req.id.clone(), result),
+                Err((status, Json(mut error))) => {
+                    error["http_status"] = serde_json::json!(status.as_u16());
+                    JsonRpcResponse::success(
                         req.id.clone(),
-                        serde_json::to_value(ToolResponse::error(err_val.to_string())).unwrap(),
-                    );
+                        serde_json::to_value(ToolResponse::error(error.to_string())).unwrap(),
+                    )
                 }
             }
-
-            if parse_profile_lock_error(&result).is_some() {
-                return JsonRpcResponse::success(
-                    req.id.clone(),
-                    serde_json::to_value(result).unwrap(),
-                );
-            }
-
-            if let Err(e) = target_result {
-                return JsonRpcResponse::success(
-                    req.id.clone(),
-                    serde_json::to_value(ToolResponse::error(e.to_string())).unwrap(),
-                );
-            }
-
-            JsonRpcResponse::success(req.id.clone(), serde_json::to_value(result).unwrap())
         }
         "notifications/initialized" | "ping" => {
             JsonRpcResponse::success(req.id.clone(), serde_json::json!({}))
@@ -1065,928 +1360,5 @@ async fn handle_mcp(
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use axum::body::Body;
-    use axum::http::Request;
-    use tower::ServiceExt;
-
-    fn test_state(auth_token: Option<&str>) -> Arc<AppState> {
-        let docker = DockerClient::new(None).unwrap();
-        let agent = AgentState::new(2);
-        let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::new(
-            std::path::PathBuf::from("/tmp/reach-test-profiles"),
-        ));
-        let cookie_jars = Arc::new(reach_cli::profile::CookieJarService::new(
-            std::path::PathBuf::from("/tmp/reach-test-jars"),
-        ));
-        Arc::new(AppState {
-            docker,
-            default_sandbox: None,
-            public_host: "127.0.0.1".into(),
-            bind_host: "127.0.0.1".into(),
-            auth_token: auth_token.map(String::from),
-            agent,
-            profile_broker,
-            cookie_jars,
-        })
-    }
-
-    #[test]
-    fn test_extract_host_and_normalize() {
-        assert_eq!(extract_host("localhost:4200"), "localhost");
-        assert_eq!(extract_host("127.0.0.1:4200"), "127.0.0.1");
-        assert_eq!(extract_host("[::1]:4200"), "::1");
-        assert_eq!(extract_host("myhost.com"), "myhost.com");
-        assert_eq!(normalize_host_target("http://127.0.0.1:6080"), "127.0.0.1");
-        assert_eq!(
-            normalize_host_target("https://reach.local:4200"),
-            "reach.local"
-        );
-        assert_eq!(normalize_host_target("reach.internal"), "reach.internal");
-    }
-
-    #[test]
-    fn test_is_allowed_host() {
-        let state = test_state(None);
-        assert!(state.is_allowed_host("localhost:4200"));
-        assert!(state.is_allowed_host("127.0.0.1:4200"));
-        assert!(state.is_allowed_host("[::1]:4200"));
-        assert!(!state.is_allowed_host("evil.com:4200"));
-        assert!(!state.is_allowed_host("attacker.org"));
-        assert!(!state.is_allowed_host(""));
-    }
-
-    #[tokio::test]
-    async fn test_host_header_middleware() {
-        let state = test_state(None);
-        let app = build_app(state);
-
-        // Valid localhost
-        let req = Request::builder()
-            .uri("/health")
-            .header("Host", "localhost:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // Valid 127.0.0.1
-        let req = Request::builder()
-            .uri("/health")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // Missing host header -> 400 Bad Request
-        let req = Request::builder()
-            .uri("/health")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-
-        // Untrusted / DNS rebinding host header -> 400 Bad Request
-        let req = Request::builder()
-            .uri("/health")
-            .header("Host", "evil.com")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn test_bearer_auth_middleware() {
-        let state = test_state(Some("secret-pass"));
-        let app = build_app(state);
-
-        // Health endpoint is public and does not require auth
-        let req = Request::builder()
-            .uri("/health")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // /agent/screens requires auth: missing header -> 401
-        let req = Request::builder()
-            .uri("/agent/screens")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /agent/screens: wrong bearer token -> 401
-        let req = Request::builder()
-            .uri("/agent/screens")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer wrong-pass")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /agent/screens: valid bearer token -> 200
-        let req = Request::builder()
-            .uri("/agent/screens")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer secret-pass")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // /tools requires auth: missing header -> 401
-        let req = Request::builder()
-            .uri("/tools")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /tools: valid bearer token -> 200
-        let req = Request::builder()
-            .uri("/tools")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer secret-pass")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // /mcp requires auth: missing header -> 401
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /mcp: wrong bearer token -> 401
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer wrong-pass")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /mcp: valid bearer token -> 200
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer secret-pass")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"jsonrpc":"2.0","id":1,"method":"ping"}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // /sse requires auth: missing header/query -> 401
-        let req = Request::builder()
-            .uri("/sse")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /sse: wrong bearer token -> 401
-        let req = Request::builder()
-            .uri("/sse")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer wrong-pass")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /sse: valid bearer token -> 200
-        let req = Request::builder()
-            .uri("/sse")
-            .header("Host", "127.0.0.1:4200")
-            .header("Authorization", "Bearer secret-pass")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // /sse: wrong ?token= query param -> 401
-        let req = Request::builder()
-            .uri("/sse?token=wrong-pass")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
-
-        // /sse: valid ?token= query param -> 200
-        let req = Request::builder()
-            .uri("/sse?token=secret-pass")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_screen_takeover_lease_token_enforcement() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        // Screen 0 unleased: takeover succeeds without X-Lease-Token
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"pending": true}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // Lease screen 0
-        let lease = state.agent.lease_screen(0, "user-a").unwrap();
-
-        // Screen 0 leased: takeover without X-Lease-Token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"pending": true}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Takeover with wrong X-Lease-Token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", "wrong-token")
-            .body(Body::from(r#"{"pending": true}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Takeover with valid X-Lease-Token -> 200 OK
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"pending": true}"#))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_mcp_synthetic_tools_lease_token_enforcement() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        // Lease screen 0
-        let lease = state.agent.lease_screen(0, "worker").unwrap();
-
-        let tool_call_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "click",
-                "arguments": {
-                    "screen": 0,
-                    "x": 100,
-                    "y": 100
-                }
-            }
-        });
-
-        // Request without X-Lease-Token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(serde_json::to_vec(&tool_call_body).unwrap()))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Request with wrong X-Lease-Token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", "incorrect-token")
-            .body(Body::from(serde_json::to_vec(&tool_call_body).unwrap()))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Request with valid X-Lease-Token and X-Handoff-Gen -> passes lease validation (status 200)
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "1")
-            .body(Body::from(serde_json::to_vec(&tool_call_body).unwrap()))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // Request targeting unleased screen 1 without X-Lease-Token -> passes lease check (status 200)
-        let unleased_call_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 2,
-            "method": "tools/call",
-            "params": {
-                "name": "click",
-                "arguments": {
-                    "screen": 1,
-                    "x": 100,
-                    "y": 100
-                }
-            }
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(serde_json::to_vec(&unleased_call_body).unwrap()))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_http_tools_lease_token_enforcement() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        // Lease screen 0
-        let lease = state.agent.lease_screen(0, "worker").unwrap();
-
-        // Calling /tools/click for leased screen 0 without token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(r#"{"screen": 0, "x": 50, "y": 50}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Calling /tools/click with wrong token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", "wrong-lease-token")
-            .body(Body::from(r#"{"screen": 0, "x": 50, "y": 50}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Release screen 0 with wrong token -> 403 Forbidden
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/agent/screens/0/lease")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", "bad-token")
-            .body(Body::from(r#"{"owner": "worker"}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // Release screen 0 with correct token -> 200 OK
-        let req = Request::builder()
-            .method("DELETE")
-            .uri("/agent/screens/0/lease")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"owner": "worker"}"#))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-
-    #[tokio::test]
-    async fn test_takeover_state_machine_http_endpoints_and_gating() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        // 1. Lease screen 0 for an agent
-        let lease = state.agent.lease_screen(0, "agent-eva").unwrap();
-        assert_eq!(state.agent.handoff_gen(0), Some(1));
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::AgentActive)
-        );
-
-        // Tool execution with correct X-Handoff-Gen = 1 passes phase validation
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "1")
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        // Since docker client in test_state is a dummy, dispatch may fail with internal server error
-        // or 500 when resolving sandbox, but it MUST NOT be 409!
-        assert_ne!(res.status(), StatusCode::CONFLICT);
-
-        // Tool execution with stale X-Handoff-Gen = 99 -> 409 Conflict {"error": "stale_plan"}
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "99")
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "stale_plan");
-
-        // 2. POST /agent/screens/0/takeover with reason and url -> moves to HandoffPending, gen increments to 2
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(
-                r#"{"reason": "CAPTCHA challenge", "url": "http://127.0.0.1:6080/vnc.html"}"#,
-            ))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::HandoffPending)
-        );
-        assert_eq!(state.agent.handoff_gen(0), Some(2));
-
-        // 3. Tool execution while takeover is active -> 409 Conflict {"error": "takeover_active", ...}
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "2")
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "takeover_active");
-        assert_eq!(body_json.get("phase").unwrap(), "HandoffPending");
-        assert_eq!(body_json.get("handoff_gen").unwrap(), 2);
-
-        // Also test MCP endpoint tool call gets 409 Conflict
-        let mcp_call = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 10,
-            "method": "tools/call",
-            "params": {
-                "name": "click",
-                "arguments": { "screen": 0, "x": 10, "y": 10 }
-            }
-        });
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(serde_json::to_vec(&mcp_call).unwrap()))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-
-        // 4. POST /agent/screens/0/handback (e.g. human clicks banner) -> moves to HumanDone, gen increments to 3
-        let human_token = state.agent.human_token(0).unwrap();
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/handback")
-            .header("Host", "127.0.0.1:4200")
-            .header("X-Human-Token", &human_token)
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::HumanDone)
-        );
-        assert_eq!(state.agent.handoff_gen(0), Some(3));
-
-        // 5. GET /agent/screens/0/wait?phase=HumanDone returns immediately since already HumanDone
-        let req = Request::builder()
-            .method("GET")
-            .uri("/agent/screens/0/wait?phase=HumanDone&timeout=5")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("status").unwrap(), "ok");
-        assert_eq!(body_json.get("phase").unwrap(), "HumanDone");
-        assert_eq!(body_json.get("handoff_gen").unwrap(), 3);
-
-        // 6. POST /agent/screens/0/ack -> moves HumanDone to AgentActive, gen increments to 4
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/ack")
-            .header("Host", "127.0.0.1:4200")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::AgentActive)
-        );
-        assert_eq!(state.agent.handoff_gen(0), Some(4));
-
-        // 7. After ack, tool execution with gen 4 is no longer rejected with 409
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "4")
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_ne!(res.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn test_tool_call_locked_profile_returns_http_423() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        // Acquire lock on profile "test-work" via state.profile_broker
-        let _lease = state
-            .profile_broker
-            .acquire("test-work", 0)
-            .expect("should lock");
-
-        // Try calling /tools/browse with use_profile "test-work"
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/browse")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(
-                r#"{"url": "https://github.com", "use_profile": "test-work"}"#,
-            ))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::LOCKED);
-        assert_eq!(res.status().as_u16(), 423);
-
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "profile_locked");
-        assert_eq!(body_json.get("profile").unwrap(), "test-work");
-    }
-
-    #[tokio::test]
-    async fn test_mcp_tool_call_locked_profile_returns_error() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        // Acquire lock on profile "test-work-mcp" via state.profile_broker
-        let _lease = state
-            .profile_broker
-            .acquire("test-work-mcp", 0)
-            .expect("should lock");
-
-        let mcp_call = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "browse",
-                "arguments": {
-                    "url": "https://github.com",
-                    "use_profile": "test-work-mcp"
-                }
-            }
-        });
-
-        let req = Request::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .body(Body::from(serde_json::to_vec(&mcp_call).unwrap()))
-            .unwrap();
-
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        let result = body_json.get("result").expect("expected result field");
-        let is_err = result
-            .get("is_error")
-            .or_else(|| result.get("isError"))
-            .and_then(|v| v.as_bool());
-        assert_eq!(is_err, Some(true));
-
-        let content = result
-            .get("content")
-            .and_then(|v| v.as_array())
-            .expect("expected content array");
-        let text = content[0]
-            .get("text")
-            .and_then(|v| v.as_str())
-            .expect("expected text content");
-
-        let err_obj: serde_json::Value = serde_json::from_str(text).expect("text should be json");
-        assert_eq!(err_obj.get("error").unwrap(), "profile_locked");
-        assert_eq!(err_obj.get("profile").unwrap(), "test-work-mcp");
-    }
-
-    #[tokio::test]
-    async fn test_auth_bypass_with_human_token() {
-        // Setup server with REACH_AUTH_TOKEN
-        let state = test_state(Some("bearer-secret"));
-        let app = build_app(state.clone());
-
-        // Lease and request takeover directly on agent
-        let _ = state.agent.lease_screen(0, "bot").unwrap();
-        let takeover_state = state
-            .agent
-            .request_takeover(0, Some("captcha".into()), None)
-            .unwrap();
-        let token = takeover_state.human_token.expect("token should be minted");
-
-        // 1. /agent/screens/0/connected without token or bearer -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/connected")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // 2. /agent/screens/0/connected with invalid human token -> 403 Forbidden
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/connected?token=bogus-token")
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::FORBIDDEN);
-
-        // 3. /agent/screens/0/connected with valid human token in query param -> 200 OK
-        let req = Request::builder()
-            .method("POST")
-            .uri(format!("/agent/screens/0/connected?token={}", token))
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::HumanActive)
-        );
-
-        // 4. /agent/screens with valid token query param -> 200 OK without Bearer
-        let req = Request::builder()
-            .method("GET")
-            .uri(format!("/agent/screens?token={}", token))
-            .header("Host", "127.0.0.1:4200")
-            .body(Body::empty())
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-
-        // 5. /agent/screens/0/handback with valid X-Human-Token header -> 200 OK
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/handback")
-            .header("Host", "127.0.0.1:4200")
-            .header("X-Human-Token", &token)
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::HumanDone)
-        );
-    }
-
-    #[tokio::test]
-    async fn test_cannot_eject_human_via_takeover_pending_false() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        let lease = state.agent.lease_screen(0, "bot").unwrap();
-        state
-            .agent
-            .request_takeover(0, Some("captcha".into()), None)
-            .unwrap();
-        state.agent.human_connected(0).unwrap();
-        assert_eq!(
-            state.agent.phase(0),
-            Some(reach_cli::agent::ScreenPhase::HumanActive)
-        );
-
-        // Agent tries to eject human by setting pending=false -> 409 Conflict
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"pending": false}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "cannot_eject_human");
-
-        // Agent tries to ack while HumanActive -> 409 Conflict
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/ack")
-            .header("Host", "127.0.0.1:4200")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::empty())
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn test_mutating_tools_require_handoff_gen() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        let lease = state.agent.lease_screen(0, "bot").unwrap();
-
-        // Mutating tool /tools/click without X-Handoff-Gen on leased screen -> 409 missing_handoff_gen
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "missing_handoff_gen");
-
-        // Mutating tool with wrong generation -> 409 stale_plan
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "42")
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "stale_plan");
-
-        // Mutating tool with matching generation -> passes handoff check (status != 409)
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/click")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .header("X-Handoff-Gen", "1")
-            .body(Body::from(r#"{"screen": 0, "x": 10, "y": 10}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_ne!(res.status(), StatusCode::CONFLICT);
-
-        // Non-mutating tool /tools/screenshot without X-Handoff-Gen -> does not return 409
-        let req = Request::builder()
-            .method("POST")
-            .uri("/tools/screenshot")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"screen": 0}"#))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_ne!(res.status(), StatusCode::CONFLICT);
-    }
-
-    #[tokio::test]
-    async fn test_takeover_busy_drain_and_timeout() {
-        let state = test_state(None);
-        let app = build_app(state.clone());
-
-        let lease = state.agent.lease_screen(0, "bot").unwrap();
-
-        // Mark screen busy
-        state.agent.inc_busy(0);
-
-        // POST /agent/screens/0/takeover should timeout and return 409 screen_busy
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"reason": "auth"}"#))
-            .unwrap();
-        let res = app.clone().oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::CONFLICT);
-        let body_bytes = axum::body::to_bytes(res.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
-        assert_eq!(body_json.get("error").unwrap(), "screen_busy");
-
-        // Clean up busy
-        state.agent.dec_busy(0);
-
-        // Now takeover request succeeds
-        let req = Request::builder()
-            .method("POST")
-            .uri("/agent/screens/0/takeover")
-            .header("Host", "127.0.0.1:4200")
-            .header("Content-Type", "application/json")
-            .header("X-Lease-Token", &lease.token)
-            .body(Body::from(r#"{"reason": "auth"}"#))
-            .unwrap();
-        let res = app.oneshot(req).await.unwrap();
-        assert_eq!(res.status(), StatusCode::OK);
-    }
-}
+#[path = "serve_tests.rs"]
+mod tests;

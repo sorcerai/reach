@@ -2,7 +2,7 @@
 
 Multi-Bot Groupchat surface for Reach & Hermes agents.
 Integrates with self-hosted Buzz (ariaserver:3000) for permanent history,
-inter-agent @mentions, in-line visual diff audit reels, and human takeover cards.
+inter-agent @mentions, numeric visual-change metadata, and authenticated human takeover links.
 """
 
 from __future__ import annotations
@@ -12,12 +12,12 @@ import logging
 import os
 import shutil
 import subprocess
+import urllib.parse
 from typing import Any, Dict, List, Optional
 
 logger = logging.getLogger("hermes.plugins.buzz_groupchat")
 
 DEFAULT_RELAY_URL = "http://100.124.38.17:3000"
-DEFAULT_NOVNC_BASE = "http://100.124.38.17:6080/vnc.html?autoconnect=true"
 
 
 _ctx: Any = None
@@ -123,47 +123,43 @@ def buzz_send_message(
 def buzz_send_takeover_alert(
     channel: str,
     screen: int,
-    reason: str,
-    novnc_url: Optional[str] = None,
     reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Post an interactive Human Takeover alert to a Buzz channel or thread."""
-    url = novnc_url or os.environ.get("REACH_NOVNC_URL", DEFAULT_NOVNC_BASE)
+    """Post a non-secret authenticated viewer front door."""
+    if type(screen) is not int or screen < 0:
+        return {"ok": False, "error": "invalid screen"}
+    endpoint = urllib.parse.urlsplit(os.environ.get("REACH_AGENT_URL", "http://127.0.0.1:4200"))
+    host = endpoint.hostname
+    if endpoint.scheme not in {"http", "https"} or not host:
+        return {"ok": False, "error": "invalid Reach API origin"}
+    authority = f"[{host}]" if ":" in host else host
+    if endpoint.port is not None:
+        authority += f":{endpoint.port}"
+    url = urllib.parse.urlunsplit((endpoint.scheme, authority, f"/viewer/{screen}", "", ""))
     content = (
-        f"🚨 **Reach Human Takeover Required**\n\n"
-        f"- **Screen**: Display `{screen}`\n"
-        f"- **Reason**: {reason}\n"
-        f"- **Interactive noVNC Link**: [{url}]({url})\n\n"
-        f"👉 *Instructions*: Click the link above to interact with the screen. "
-        f"When finished with 2FA / CAPTCHA, click the floating **[ Hand Back to Agent ]** banner "
-        f"at the top of the display to resume autonomous execution."
+        f"Human action required on display {screen}.\n"
+        f"Authenticated viewer: {url}\n"
+        "Sign in as the supervisor, complete the handoff, then hand back to the agent."
     )
     return buzz_send_message(channel=channel, content=content, reply_to=reply_to, broadcast=True)
 
 
 def buzz_post_visual_diff(
     channel: str,
-    summary: str,
-    screenshot_path: Optional[str] = None,
     diff_percent: Optional[float] = None,
     tokens_saved: Optional[int] = None,
     reply_to: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Post a visual diff audit reel / screenshot summary to a Buzz channel."""
-    content_lines = [f"📊 **Reach Visual Diff Audit**", f"- **Summary**: {summary}"]
+    """Post numeric visual-change metadata without raw captures or model text."""
+    content_lines = ["Reach visual-change metadata"]
     if diff_percent is not None:
-        content_lines.append(f"- **pHash Change**: `{diff_percent:.2f}%`")
+        if not isinstance(diff_percent, (int, float)) or isinstance(diff_percent, bool):
+            return {"ok": False, "error": "invalid visual-change measurement"}
+        content_lines.append(f"Visual change: {diff_percent:.2f}%")
     if tokens_saved is not None:
-        content_lines.append(f"- **VLM Tokens Saved**: `{tokens_saved}` tokens (gated via pHash)")
-
-    # If screenshot is provided, try uploading it via buzz media upload
-    media_url = None
-    if screenshot_path and os.path.exists(screenshot_path):
-        upload_res = run_buzz_cli(["media", "upload", screenshot_path])
-        if upload_res.get("ok") and isinstance(upload_res.get("data"), dict):
-            media_url = upload_res["data"].get("url") or upload_res["data"].get("sha256")
-            if media_url:
-                content_lines.append(f"\n![Audit Screenshot]({media_url})")
+        if type(tokens_saved) is not int:
+            return {"ok": False, "error": "invalid token estimate"}
+        content_lines.append(f"Estimated tokens saved: {tokens_saved}")
 
     content = "\n".join(content_lines)
     return buzz_send_message(channel=channel, content=content, reply_to=reply_to)
@@ -215,28 +211,24 @@ PLUGIN_TOOLS: Dict[str, tuple] = {
         "Post an interactive Human Takeover alert to a Buzz channel or thread when 2FA, Captcha, or credentials require human intervention.",
         {
             "type": "object",
-            "required": ["channel", "screen", "reason"],
+            "required": ["channel", "screen"],
             "properties": {
                 "channel": {"type": "string", "description": "Target Buzz channel ID or name."},
                 "screen": {"type": "integer", "description": "Screen ID where human intervention is required."},
-                "reason": {"type": "string", "description": "Reason human intervention is needed (e.g., 2FA prompt, CAPTCHA, manual review)."},
-                "novnc_url": {"type": "string", "description": "Optional direct noVNC URL. If omitted, defaults to REACH_NOVNC_URL or http://100.124.38.17:6080/vnc.html."},
                 "reply_to": {"type": "string", "description": "Optional thread ID to post the takeover request under."},
             },
         },
     ),
     "buzz_post_visual_diff": (
         buzz_post_visual_diff,
-        "Post a visual diff audit reel / screenshot summary to a Buzz channel or thread.",
+        "Post numeric visual-change metadata without screenshots or model text.",
         {
             "type": "object",
-            "required": ["channel", "summary"],
+            "required": ["channel"],
             "properties": {
                 "channel": {"type": "string", "description": "Target Buzz channel ID or name."},
-                "summary": {"type": "string", "description": "Text summary of the action and visual diff results."},
-                "screenshot_path": {"type": "string", "description": "Path to the local screenshot or audit reel image."},
                 "diff_percent": {"type": "number", "description": "Optional perceptual hash or visual difference percentage (0.0 to 100.0)."},
-                "tokens_saved": {"type": "integer", "description": "Optional count of tokens saved by pHash change gating."},
+                "tokens_saved": {"type": "integer", "description": "Optional estimated tokens saved; not a provider measurement."},
                 "reply_to": {"type": "string", "description": "Optional thread ID to post under."},
             },
         },

@@ -1,6 +1,6 @@
 use reach_cli::docker::PageTextOutput;
 use reach_cli::mcp::{ClickParams, TypeParams};
-use reach_cli::refs::{ElementRef, global_ref_table, resolve_ref};
+use reach_cli::refs::{ElementRef, RefScope, global_ref_table, resolve_ref};
 use std::collections::HashMap;
 
 #[test]
@@ -31,6 +31,7 @@ fn test_element_ref_target_coords_from_box_bounds_when_point_absent() {
         name: "Login".into(),
         value: None,
         selector: None,
+        backend_node_id: None,
         point: None,
         box_bounds: Some([100.0, 200.0, 80.0, 30.0]),
         focused: false,
@@ -51,6 +52,7 @@ fn test_page_text_output_roundtrip_with_axtree_and_refs() {
             name: "Sign In".into(),
             value: None,
             selector: Some("[data-reach-ref=e1]".into()),
+            backend_node_id: None,
             point: Some([500.0, 300.0]),
             box_bounds: Some([450.0, 280.0, 100.0, 40.0]),
             focused: false,
@@ -59,6 +61,8 @@ fn test_page_text_output_roundtrip_with_axtree_and_refs() {
     );
     let output = PageTextOutput {
         status: "ok".into(),
+        page_target_id: None,
+        page_loader_id: None,
         text: Some("Sign In to Reach".into()),
         axtree: Some(
             "[heading \"Welcome\"]\n[@e1: button \"Sign In\" x=450 y=280 w=100 h=40]".into(),
@@ -107,9 +111,13 @@ fn test_type_params_accepts_ref_and_clear() {
 }
 
 #[test]
-fn test_global_ref_table_and_resolve_ref_fallback() {
-    let target = "test-sandbox-ref-actions";
-    let screen = 0;
+fn test_global_ref_table_is_scoped_and_stale_refs_reject() {
+    let scope = RefScope::new(
+        "test-ref-actions-container:started",
+        0,
+        Some("attempt-ref-actions".into()),
+        Some(1),
+    );
     let mut refs = HashMap::new();
     refs.insert(
         "e4".into(),
@@ -119,6 +127,7 @@ fn test_global_ref_table_and_resolve_ref_fallback() {
             name: "Search".into(),
             value: None,
             selector: None,
+            backend_node_id: None,
             point: Some([600.0, 150.0]),
             box_bounds: Some([500.0, 130.0, 200.0, 40.0]),
             focused: false,
@@ -126,16 +135,57 @@ fn test_global_ref_table_and_resolve_ref_fallback() {
         },
     );
 
-    global_ref_table().set_refs(target, screen, refs.clone());
-
-    // Look up with @e4 and e4
-    let found1 = resolve_ref(target, screen, "@e4").expect("must resolve @e4");
+    let first = global_ref_table().set_refs(scope.clone(), refs.clone());
+    let first_name = first.token_map["e4"].clone();
+    let found1 = resolve_ref(&scope, &format!("@{first_name}")).expect("must resolve current ref");
     assert_eq!(found1.name, "Search");
     assert_eq!(found1.target_coordinates(), Some((600, 150)));
 
-    let found2 = resolve_ref(target, screen, "e4").expect("must resolve e4");
-    assert_eq!(found2.name, "Search");
+    // A second observation gets a fresh number even when the browser helper reused e1/e4.
+    let second = global_ref_table().set_refs(scope.clone(), refs);
+    let second_name = second.token_map["e4"].clone();
+    assert_ne!(first_name, second_name);
+    assert!(resolve_ref(&scope, &format!("@{first_name}")).is_none());
+    assert!(resolve_ref(&scope, &format!("@{second_name}")).is_some());
 
-    // Unknown ref
-    assert!(resolve_ref(target, screen, "@e999").is_none());
+    // A new lease/handoff/computer cannot resolve the prior observation.
+    let new_lease = RefScope::new(
+        "different-container:started",
+        0,
+        Some("attempt-ref-actions-new".into()),
+        Some(2),
+    );
+    assert!(resolve_ref(&new_lease, &format!("@{second_name}")).is_none());
+}
+
+#[test]
+fn embedded_helpers_return_structured_errors_for_invalid_input() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    for (script, expected_status) in [
+        (reach_cli::docker::PAGE_TEXT_SCRIPT, "error"),
+        (reach_cli::docker::PAGE_ACTION_SCRIPT, "error"),
+        (
+            reach_cli::injection::INJECTION_HELPER_SOURCE,
+            "auth_required",
+        ),
+    ] {
+        let mut child = Command::new("python3")
+            .args(["-I", "-c", script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Python 3 is required to verify embedded browser helpers");
+        child.stdin.take().unwrap().write_all(b"{").unwrap();
+        let output = child.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "helper crashed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(response["status"], expected_status);
+    }
 }

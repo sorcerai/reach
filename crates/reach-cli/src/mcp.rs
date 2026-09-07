@@ -286,6 +286,7 @@ pub struct ExecParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PageTextParams {
+    #[serde(default)]
     pub url: String,
     #[serde(default)]
     pub wait_for: Option<String>,
@@ -586,15 +587,14 @@ pub fn tool_definitions() -> Vec<ToolDefinition> {
         ToolDefinition {
             name: "page_text".into(),
             description:
-                "Navigate to a URL using Playwright (real Chromium), wait for the page to render, \
-                 and return the accessibility tree (AXTree) with semantic element refs (@e1, @e2) \
-                 and visible text content. Handles JS-heavy SPAs that Scrapling can't."
+                "Observe the current live browser tab without navigating when URL is omitted. \
+                 Supply a URL to navigate first. Return AXTree semantic refs and visible text. \
+                 Current-tab observation fails if no live browser is available."
                     .into(),
             input_schema: serde_json::json!({
                 "type": "object",
-                "required": ["url"],
                 "properties": {
-                    "url": { "type": "string", "description": "URL to load" },
+                    "url": { "type": "string", "description": "Optional URL to load; omit to observe the current live tab without navigation" },
                     "wait_for": {
                         "type": "string",
                         "description": "CSS selector to wait for before extracting (default: networkidle)"
@@ -705,21 +705,6 @@ mod tests {
         let names: Vec<String> = tool_definitions().into_iter().map(|t| t.name).collect();
         assert!(names.contains(&"page_text".to_string()));
         assert!(names.contains(&"auth_handoff".to_string()));
-    }
-
-    #[test]
-    fn page_text_schema_marks_url_required() {
-        let tool = tool_definitions()
-            .into_iter()
-            .find(|t| t.name == "page_text")
-            .unwrap();
-        let required = tool
-            .input_schema
-            .get("required")
-            .unwrap()
-            .as_array()
-            .unwrap();
-        assert!(required.iter().any(|v| v == "url"));
     }
 
     #[test]

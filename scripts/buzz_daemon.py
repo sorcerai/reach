@@ -9,6 +9,7 @@ audit updates, and handles interactive 2FA/CAPTCHA takeover and handback.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import logging
 import os
@@ -37,15 +38,15 @@ from scripts.reach_drive import (  # noqa: E402
     ReachAction,
     ReachDriver,
     StepRecord,
+    _handoff_ack_generation,
+    _lease_receipt_fields,
 )
+from scripts.reach_sensitive import safe_url
 
 logger = logging.getLogger("reach_buzz_daemon")
 
 DEFAULT_RELAY_URL = os.environ.get("BUZZ_RELAY_URL", "http://100.124.38.17:3000")
 DEFAULT_WS_RELAY_URL = os.environ.get("BUZZ_WS_RELAY_URL", "ws://100.124.38.17:3000")
-DEFAULT_NOVNC_BASE = os.environ.get(
-    "REACH_NOVNC_URL", "http://100.124.38.17:6080/vnc.html?autoconnect=true"
-)
 DEFAULT_BOT_TRIGGER = "@ReachBot"
 DEFAULT_SCREEN = 0
 DEFAULT_TAKEOVER_TIMEOUT_SEC = 600
@@ -59,12 +60,33 @@ DEFAULT_POLL_INTERVAL_SEC = 2.0
 
 @dataclass
 class ParsedTask:
-    """Parsed task request from a Buzz mention."""
+    """Parsed Buzz task contract.
+
+    A task is executable only when it is explicitly observation-only or carries
+    a non-empty completion criterion.  ``completion_text`` is intentionally
+    kept separate from the goal: it is a postcondition, not a conversational
+    promise.
+    """
 
     screen: int
     goal: str
     initial_url: Optional[str] = None
     raw_text: str = ""
+    completion_text: Optional[str] = None
+    observation_only: bool = False
+    task_id: Optional[str] = None
+    attempt_id: Optional[str] = None
+
+    @property
+    def success_criterion(self) -> Optional[str]:
+        """Alias used by callers that describe the contract semantically."""
+        return self.completion_text
+
+    @property
+    def contract_status(self) -> str:
+        if self.observation_only or (self.completion_text and self.completion_text.strip()):
+            return "ready"
+        return "clarification_required"
 
 
 # Screen indicators:
@@ -80,39 +102,43 @@ URL_PARAM_PATTERN = re.compile(
 )
 STANDALONE_URL_PATTERN = re.compile(r"(https?://[^\s>]+)", re.IGNORECASE)
 
+OBSERVATION_ONLY_PATTERN = re.compile(
+    r"(?:\[\s*)?(?:observation[-_ ]only|observe[-_ ]only|read[-_ ]only|"
+    r"mode\s*[:=]\s*observe)(?:\s*\])?",
+    re.IGNORECASE,
+)
+COMPLETION_PATTERN = re.compile(
+    r"(?:\b(?:success(?:_criterion)?|completion(?:_text)?|complete|done|"
+    r"criterion|criteria|verify)\s*(?:criterion|text|when|is)?\s*[:=]\s*)"
+    r"(?P<quote>[\"']?)(?P<value>[^\"';|\n]+?)(?P=quote)(?=\s*(?:[;|]|$))",
+    re.IGNORECASE,
+)
+
 
 def parse_task_message(content: str, trigger: str = DEFAULT_BOT_TRIGGER) -> Optional[ParsedTask]:
-    """Parse task goal, screen index, and optional initial URL from a Buzz mention.
+    """Parse a Buzz mention into an explicit task contract.
 
-    Returns None if content does not contain the bot trigger mention.
+    Free-form mentions remain parseable for routing, but are marked
+    ``clarification_required`` unless they opt into observation-only mode or
+    provide a quoted/delimited completion criterion.  In particular, words
+    such as ``approve`` are ordinary goal text and never grant consent.
     """
     if not content:
         return None
 
-    # Case-insensitive check for trigger
-    lower_content = content.lower()
-    lower_trigger = trigger.lower()
-    if lower_trigger not in lower_content:
+    if trigger.lower() not in content.lower():
         return None
 
-    # Strip the trigger mention
     clean_text = re.sub(re.escape(trigger), "", content, flags=re.IGNORECASE)
-
-    # Extract target screen (default 0)
     screen = DEFAULT_SCREEN
     screen_match = SCREEN_PATTERN.search(clean_text)
     if screen_match:
         for group in screen_match.groups():
             if group is not None:
-                try:
-                    screen = int(group)
-                    break
-                except ValueError:
-                    pass
-        # Remove screen specifier from prompt
+                screen = int(group)
+                break
         clean_text = SCREEN_PATTERN.sub("", clean_text)
 
-    # Extract initial URL
     initial_url: Optional[str] = None
     url_param_match = URL_PARAM_PATTERN.search(clean_text)
     if url_param_match:
@@ -123,22 +149,33 @@ def parse_task_message(content: str, trigger: str = DEFAULT_BOT_TRIGGER) -> Opti
         if url_match:
             initial_url = url_match.group(1)
 
-    # Clean leftover whitespace and punctuation
-    goal = clean_text.strip(" \t\r\n:,-")
-    # Collapse multiple spaces
-    goal = re.sub(r"\s+", " ", goal).strip()
+    observation_only = bool(OBSERVATION_ONLY_PATTERN.search(clean_text))
+    clean_text = OBSERVATION_ONLY_PATTERN.sub("", clean_text)
 
+    completion_text: Optional[str] = None
+    completion_match = COMPLETION_PATTERN.search(clean_text)
+    if completion_match:
+        completion_text = completion_match.group("value").strip()
+        clean_text = (
+            clean_text[: completion_match.start()]
+            + " "
+            + clean_text[completion_match.end() :]
+        )
+        if not completion_text:
+            completion_text = None
+
+    goal = clean_text.strip(" \t\r\n:,-;|")
+    goal = re.sub(r"\s+", " ", goal).strip()
     if not goal and initial_url:
         goal = f"Open {initial_url} and inspect contents"
-
-    if not goal:
-        goal = "Explore screen and await instructions"
 
     return ParsedTask(
         screen=screen,
         goal=goal,
         initial_url=initial_url,
         raw_text=content,
+        completion_text=completion_text,
+        observation_only=observation_only,
     )
 
 
@@ -234,21 +271,24 @@ def buzz_send_takeover_alert(
     channel: str,
     screen: int,
     reason: str,
-    novnc_url: Optional[str] = None,
+    api_url: Optional[str] = None,
     reply_to: Optional[str] = None,
     relay_url: Optional[str] = None,
     private_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Post an interactive Human Takeover alert to a Buzz channel or thread."""
-    url = novnc_url or DEFAULT_NOVNC_BASE
+    """Post a fixed Human Takeover alert with the authenticated viewer URL."""
+    viewer_origin = safe_url(api_url or DEFAULT_API_URL)
+    if not viewer_origin.startswith(("http://", "https://")):
+        raise ValueError("invalid Reach API origin")
+    url = f"{viewer_origin}/viewer/{screen}"
     content = (
-        f"🚨 **Reach Human Takeover Required**\n\n"
+        "🚨 **Reach Human Takeover Required**\n\n"
         f"- **Screen**: Display `{screen}`\n"
-        f"- **Reason**: {reason}\n"
+        "- **Reason**: Authentication or human verification required\n"
         f"- **Interactive noVNC Link**: [{url}]({url})\n\n"
-        f"👉 *Instructions*: Click the link above to interact with the screen. "
-        f"When finished with 2FA / CAPTCHA, click the floating **[ Hand Back to Agent ]** banner "
-        f"at the top of the display to resume autonomous execution."
+        "👉 *Instructions*: Use the authenticated viewer to complete the required "
+        "human verification, then click the floating **[ Hand Back to Agent ]** "
+        "banner at the top of the display to resume."
     )
     return buzz_send_message(
         channel=channel,
@@ -262,32 +302,40 @@ def buzz_send_takeover_alert(
 
 def buzz_post_visual_diff(
     channel: str,
-    summary: str,
-    screenshot_path: Optional[str] = None,
+    *,
+    step_index: int,
+    action_kind: str,
+    outcome: str,
     diff_percent: Optional[float] = None,
     tokens_saved: Optional[int] = None,
     reply_to: Optional[str] = None,
     relay_url: Optional[str] = None,
     private_key: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Post a visual diff audit update to a Buzz channel or thread."""
-    content_lines = ["📊 **Reach Visual Diff Audit**", f"- **Summary**: {summary}"]
+    """Post fixed structured step metadata; never upload or link raw media."""
+    allowed_actions = {
+        "click", "type", "key", "navigate", "inject", "wait", "scroll",
+        "auth_required", "terminate",
+    }
+    allowed_outcomes = {
+        "completed", "blocked", "failed", "uncertain", "vlm_cached",
+        "approval_required", "auth_required", "postcondition_failed",
+    }
+    action = action_kind if action_kind in allowed_actions else "unknown"
+    status = outcome if outcome in allowed_outcomes else "unknown"
+    content_lines = [
+        "📊 **Reach Step Audit**",
+        f"- **Step**: `{int(step_index)}`",
+        f"- **Action**: `{action}`",
+        f"- **Outcome**: `{status}`",
+    ]
     if diff_percent is not None:
         content_lines.append(f"- **pHash Change**: `{diff_percent:.2f}%`")
     if tokens_saved is not None:
-        content_lines.append(f"- **VLM Tokens Saved**: `{tokens_saved}` tokens (gated via pHash)")
-
-    if screenshot_path and os.path.exists(screenshot_path):
-        upload_res = run_buzz_cli(["media", "upload", screenshot_path], relay_url=relay_url, private_key=private_key)
-        if upload_res.get("ok") and isinstance(upload_res.get("data"), dict):
-            media_url = upload_res["data"].get("url") or upload_res["data"].get("sha256")
-            if media_url:
-                content_lines.append(f"\n![Audit Screenshot]({media_url})")
-
-    content = "\n".join(content_lines)
+        content_lines.append(f"- **VLM Tokens Saved**: `{int(tokens_saved)}`")
     return buzz_send_message(
         channel=channel,
-        content=content,
+        content="\n".join(content_lines),
         reply_to=reply_to,
         relay_url=relay_url,
         private_key=private_key,
@@ -321,39 +369,124 @@ def buzz_list_channels(
 # ---------------------------------------------------------------------------
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Refuse every redirect so lease credentials never leave the origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        raise urllib.error.HTTPError(
+            req.full_url,
+            code,
+            f"{msg} (refusing redirect of lease-capability-bearing request)",
+            headers,
+            fp,
+        )
+
+
+_OPENER = urllib.request.build_opener(_NoRedirectHandler())
+
+
+def _supervisor_token(auth_token: Optional[str]) -> Optional[str]:
+    """Resolve the supervisor allocation credential from constructor or env.
+
+    Trusted operator metadata only; never logged, never forwarded to any
+    endpoint other than lease allocation.
+    """
+    token = auth_token or os.environ.get("REACH_AUTH_TOKEN")
+    return token if token and token.strip() else None
+
+
 class ReachApiClient:
     """HTTP Client for Reach Screen Leasing and Handoff State Machine."""
 
     handoff_gen: Optional[int] = None
 
-    def __init__(self, api_url: str = DEFAULT_API_URL, lease_token: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        api_url: str = DEFAULT_API_URL,
+        lease_token: Optional[str] = None,
+        auth_token: Optional[str] = None,
+    ) -> None:
         self.api_url = api_url.rstrip("/")
         self.lease_token = lease_token
+        # Supervisor credential: allocation only; ordinary requests carry
+        # the retained lease capability (X-Lease-Token) instead.
+        self.auth_token = _supervisor_token(auth_token)
         self.handoff_gen = None
+        self._reconciliation_token: Optional[str] = None
+        self.last_lease_cleanup: Optional[Dict[str, str]] = None
 
     def lease_screen(self, screen: int, owner: str = "ReachBot") -> Dict[str, Any]:
-        """POST /agent/screens/{screen}/lease."""
+        """POST /agent/screens/{screen}/lease (creation-only allocation).
+
+        The optional supervisor bearer authorizes this allocation call only.
+        An occupied screen — including one held under the same owner label —
+        is refused by the server; there is no same-owner recovery path and a
+        failed lease installs no capability or generation.
+        """
+        self.last_lease_cleanup = None
         url = f"{self.api_url}/agent/screens/{screen}/lease"
         payload = json.dumps({"owner": owner}).encode("utf-8")
+        headers = {"Content-Type": "application/json"}
+        if self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
         req = urllib.request.Request(
             url,
             data=payload,
-            headers={"Content-Type": "application/json"},
+            headers=headers,
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8") or "{}")
-                if isinstance(data, dict):
-                    if data.get("token"):
-                        self.lease_token = data["token"]
-                    if "handoff_gen" in data:
-                        self.handoff_gen = int(data["handoff_gen"])
+            with _OPENER.open(req, timeout=10) as resp:
+                try:
+                    data = json.loads(resp.read().decode("utf-8") or "{}")
+                except (TypeError, UnicodeError, ValueError):
+                    self.last_lease_cleanup = {"status": "uncertain"}
+                    raise RuntimeError(
+                        "Lease outcome uncertain; reconciliation required"
+                    ) from None
+                candidate_token = data.get("token") if isinstance(data, dict) else None
+                try:
+                    token, generation = _lease_receipt_fields(data)
+                except ValueError:
+                    cleanup_status = "uncertain"
+                    if isinstance(candidate_token, str) and candidate_token.strip():
+                        self._reconciliation_token = candidate_token
+                        cleanup = self.release_screen(
+                            screen, owner=owner, token=candidate_token
+                        )
+                        cleanup_status = (
+                            "confirmed"
+                            if isinstance(cleanup, dict)
+                            and cleanup.get("released") is True
+                            else "uncertain"
+                        )
+                    self.last_lease_cleanup = {"status": cleanup_status}
+                    raise RuntimeError(
+                        f"Invalid lease receipt; cleanup={cleanup_status}"
+                    ) from None
+                self.lease_token = token
+                self.handoff_gen = generation
+                self._reconciliation_token = None
+                self.last_lease_cleanup = None
                 return data
         except urllib.error.HTTPError as err:
-            body = err.read().decode("utf-8", errors="replace")
-            logger.error("Lease screen %s failed (HTTP %s): %s", screen, err.code, body)
-            raise RuntimeError(f"HTTP {err.code}: {body}") from err
+            if err.code == 408 or err.code >= 500:
+                self.last_lease_cleanup = {"status": "uncertain"}
+                logger.error("Lease screen outcome uncertain; reconciliation required")
+                raise RuntimeError(
+                    "Lease outcome uncertain; reconciliation required"
+                ) from None
+            self.last_lease_cleanup = {"status": "not_required"}
+            logger.error("Lease screen %s failed (HTTP %s)", screen, err.code)
+            raise RuntimeError(f"HTTP {err.code}") from err
+        except RuntimeError:
+            raise
+        except Exception:
+            self.last_lease_cleanup = {"status": "uncertain"}
+            logger.error("Lease screen outcome uncertain; reconciliation required")
+            raise RuntimeError(
+                "Lease outcome uncertain; reconciliation required"
+            ) from None
 
     def release_screen(
         self,
@@ -361,26 +494,26 @@ class ReachApiClient:
         owner: str = "ReachBot",
         token: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """DELETE /agent/screens/{screen}/lease."""
-        active_token = token or self.lease_token
+        """Release using the retained capability; clear only on confirmation."""
+        active_token = token or self.lease_token or self._reconciliation_token
         url = f"{self.api_url}/agent/screens/{screen}/lease"
         headers = {"Content-Type": "application/json"}
         if active_token:
             headers["X-Lease-Token"] = active_token
-
-        payload = {"owner": owner}
-        if active_token:
-            payload["token"] = active_token
-
         req = urllib.request.Request(
             url,
-            data=json.dumps(payload).encode("utf-8"),
+            data=json.dumps({"owner": owner}).encode("utf-8"),
             headers=headers,
             method="DELETE",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                return json.loads(resp.read().decode("utf-8") or "{}")
+            with _OPENER.open(req, timeout=10) as resp:
+                result = json.loads(resp.read().decode("utf-8") or "{}")
+                if isinstance(result, dict) and result.get("released") is True:
+                    self.lease_token = None
+                    self.handoff_gen = None
+                    self._reconciliation_token = None
+                return result
         except Exception as exc:
             logger.warning("Release screen %s failed: %s", screen, exc)
             return {"error": str(exc)}
@@ -389,10 +522,9 @@ class ReachApiClient:
         self,
         screen: int,
         reason: str,
-        novnc_url: Optional[str] = None,
         token: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """POST /agent/screens/{screen}/takeover."""
+        """POST /agent/screens/{screen}/takeover with the lease capability."""
         active_token = token or self.lease_token
         url = f"{self.api_url}/agent/screens/{screen}/takeover"
         headers = {"Content-Type": "application/json"}
@@ -400,9 +532,6 @@ class ReachApiClient:
             headers["X-Lease-Token"] = active_token
 
         payload: Dict[str, Any] = {"pending": True, "reason": reason}
-        if novnc_url:
-            payload["url"] = novnc_url
-
         req = urllib.request.Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
@@ -410,11 +539,8 @@ class ReachApiClient:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode("utf-8") or "{}")
-                if isinstance(data, dict) and "handoff_gen" in data:
-                    self.handoff_gen = int(data["handoff_gen"])
-                return data
+            with _OPENER.open(req, timeout=10) as resp:
+                return json.loads(resp.read().decode("utf-8") or "{}")
         except Exception as exc:
             logger.warning("Request takeover for screen %s failed: %s", screen, exc)
             return {"error": str(exc)}
@@ -425,18 +551,23 @@ class ReachApiClient:
         phase: str = "HumanDone",
         timeout: int = DEFAULT_TAKEOVER_TIMEOUT_SEC,
     ) -> Dict[str, Any]:
-        """GET /agent/screens/{screen}/wait?phase={phase}&timeout={timeout}."""
+        """Observe the authorized phase without adopting its handoff generation."""
         url = f"{self.api_url}/agent/screens/{screen}/wait?phase={urllib.parse.quote(phase)}&timeout={timeout}"
-        req = urllib.request.Request(url, method="GET")
+        headers = {}
+        if self.lease_token:
+            headers["X-Lease-Token"] = self.lease_token
+        elif self.auth_token:
+            headers["Authorization"] = f"Bearer {self.auth_token}"
+        req = urllib.request.Request(url, headers=headers, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=timeout + 5) as resp:
+            with _OPENER.open(req, timeout=timeout + 5) as resp:
                 return json.loads(resp.read().decode("utf-8") or "{}")
         except Exception as exc:
             logger.error("Wait for screen %s phase %s failed: %s", screen, phase, exc)
             return {"status": "error", "error": str(exc)}
 
     def ack_handback(self, screen: int, token: Optional[str] = None) -> Dict[str, Any]:
-        """POST /agent/screens/{screen}/ack."""
+        """POST /agent/screens/{screen}/ack with the lease capability."""
         active_token = token or self.lease_token
         url = f"{self.api_url}/agent/screens/{screen}/ack"
         headers = {"Content-Type": "application/json"}
@@ -449,24 +580,17 @@ class ReachApiClient:
             headers=headers,
             method="POST",
         )
+        previous_generation = self.handoff_gen
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with _OPENER.open(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode("utf-8") or "{}")
-                if isinstance(data, dict) and "handoff_gen" in data:
-                    self.handoff_gen = int(data["handoff_gen"])
-                return data
-        except Exception as exc:
-            logger.error("Ack handback for screen %s failed: %s", screen, exc)
-            return {"status": "error", "error": str(exc)}
+                generation = _handoff_ack_generation(data, previous_generation)
+        except Exception:
+            logger.error("Ack handback for screen %s failed", screen)
+            return {"status": "error", "error": "acknowledgement failed"}
+        self.handoff_gen = generation
+        return data
 
-    def get_novnc_url(self, screen: int) -> str:
-        """Construct or resolve noVNC URL for target screen."""
-        if os.environ.get("REACH_NOVNC_URL"):
-            return os.environ["REACH_NOVNC_URL"]
-        parsed = urllib.parse.urlparse(self.api_url)
-        host = parsed.hostname or "100.124.38.17"
-        port = 6080 + screen
-        return f"http://{host}:{port}/vnc.html?autoconnect=true"
 
 
 # ---------------------------------------------------------------------------
@@ -487,7 +611,6 @@ class BuzzDaemon:
         channels: Optional[List[str]] = None,
         poll_interval: float = DEFAULT_POLL_INTERVAL_SEC,
         takeover_timeout: int = DEFAULT_TAKEOVER_TIMEOUT_SEC,
-        novnc_base: str = DEFAULT_NOVNC_BASE,
         enable_visual_diff: bool = True,
         max_steps: int = 20,
         model: str = DEFAULT_MODEL,
@@ -495,6 +618,7 @@ class BuzzDaemon:
         driver_factory: Optional[Callable[..., Any]] = None,
         private_key: Optional[str] = None,
         allowed_senders: Optional[List[str]] = None,
+        reach_auth_token: Optional[str] = None,
     ) -> None:
         self.relay_url = relay_url.rstrip("/")
         self.ws_relay_url = ws_relay_url.rstrip("/")
@@ -504,12 +628,13 @@ class BuzzDaemon:
         self.channels = channels or ["general"]
         self.poll_interval = poll_interval
         self.takeover_timeout = takeover_timeout
-        self.novnc_base = novnc_base
         self.enable_visual_diff = enable_visual_diff
         self.max_steps = max_steps
         self.model = model
         self.private_key = private_key or os.environ.get("BUZZ_PRIVATE_KEY")
-        self.reach_client = reach_client or ReachApiClient(api_url=self.api_url)
+        self.reach_client = reach_client or ReachApiClient(
+            api_url=self.api_url, auth_token=reach_auth_token
+        )
         self.driver_factory = driver_factory or self._default_driver_factory
 
         if allowed_senders is not None:
@@ -531,9 +656,12 @@ class BuzzDaemon:
     def _default_driver_factory(
         self,
         screen: int,
-        lease_token: Optional[str] = None,
-        handoff_gen: Optional[int] = None,
-        step_callback: Optional[Callable[[StepRecord], None]] = None,
+        lease_token: Optional[str],
+        handoff_gen: Optional[int],
+        step_callback: Optional[Callable[[StepRecord], None]],
+        task_id: str,
+        attempt_id: str,
+        completion_text: Optional[str],
     ) -> ReachDriver:
         return ReachDriver(
             api_url=self.api_url,
@@ -543,15 +671,13 @@ class BuzzDaemon:
             lease_token=lease_token,
             handoff_gen=handoff_gen,
             step_callback=step_callback,
+            completion_text=completion_text,
+            task_id=task_id,
+            attempt_id=attempt_id,
             enable_audit=True,
-            interactive=False,
+
         )
 
-    def resolve_novnc_url(self, screen: int) -> str:
-        """Return noVNC interactive link for screen."""
-        if self.reach_client:
-            return self.reach_client.get_novnc_url(screen)
-        return f"http://100.124.38.17:{6080 + screen}/vnc.html?autoconnect=true"
 
     def handle_takeover(
         self,
@@ -561,40 +687,37 @@ class BuzzDaemon:
         reply_to: Optional[str] = None,
         token: Optional[str] = None,
     ) -> bool:
-        """Handle 2FA/CAPTCHA human takeover alert, wait, and handback loop.
-
-        Returns True if human handed back control and was acknowledged, False otherwise.
-        """
-        novnc_url = self.resolve_novnc_url(screen)
+        """Handle human takeover and resume only after a validated handback."""
         logger.warning(
-            "Takeover required on screen %s (%s). Sending alert with %s",
+            "Takeover required on screen %s (%s); viewer origin is configured API",
             screen,
             reason,
-            novnc_url,
         )
 
-        # 1. Inform Reach agent state machine and retrieve takeover URL (with human_token if minted)
         takeover_res = self.reach_client.request_takeover(
             screen=screen,
             reason=reason,
-            novnc_url=novnc_url,
             token=token,
         )
-        if isinstance(takeover_res, dict) and takeover_res.get("takeover_url"):
-            novnc_url = takeover_res["takeover_url"]
+        if not (
+            isinstance(takeover_res, dict)
+            and takeover_res.get("status") == "ok"
+        ):
+            logger.error("Takeover request failed on screen %s", screen)
+            return False
 
-        # 2. Post takeover alert to Buzz thread with direct noVNC link
+        # 2. Post a fixed safe alert; the URL is derived from our API origin.
         buzz_send_takeover_alert(
             channel=channel,
             screen=screen,
             reason=reason,
-            novnc_url=novnc_url,
+            api_url=self.api_url,
             reply_to=reply_to,
             relay_url=self.relay_url,
             private_key=self.private_key,
         )
 
-        # 3. Poll / wait for HumanDone phase
+        # 3. Poll / wait for the exact HumanDone phase.
         logger.info(
             "Waiting for human handback on screen %s (timeout: %ss)...",
             screen,
@@ -605,36 +728,146 @@ class BuzzDaemon:
             phase="HumanDone",
             timeout=self.takeover_timeout,
         )
-
-        if wait_res.get("phase") == "HumanDone" or wait_res.get("status") == "ok":
-            logger.info("Human handed back screen %s! Sending ack...", screen)
-            # 4. Send ack to transition from HumanDone -> AgentActive
-            self.reach_client.ack_handback(screen=screen, token=token)
-
-            # 5. Post resuming notification to Buzz thread
-            buzz_send_message(
-                channel=channel,
-                content="Resuming automated execution...",
-                reply_to=reply_to,
-                relay_url=self.relay_url,
-                private_key=self.private_key,
+        if not (
+            isinstance(wait_res, dict)
+            and wait_res.get("status") == "ok"
+            and wait_res.get("phase") == "HumanDone"
+        ):
+            logger.error(
+                "Takeover wait did not confirm HumanDone on screen %s (status=%s, phase=%s)",
+                screen,
+                wait_res.get("status") if isinstance(wait_res, dict) else "invalid",
+                wait_res.get("phase") if isinstance(wait_res, dict) else "invalid",
             )
-            return True
+            return False
 
-        logger.error(
-            "Takeover wait timed out or failed for screen %s: %s", screen, wait_res
+        logger.info("Human handed back screen %s; sending ack", screen)
+        previous_generation = getattr(self.reach_client, "handoff_gen", None)
+        ack_res = self.reach_client.ack_handback(screen=screen, token=token)
+        try:
+            ack_generation = _handoff_ack_generation(
+                ack_res, previous_generation
+            )
+        except ValueError:
+            logger.error("Ack did not confirm AgentActive on screen %s", screen)
+            return False
+        if getattr(self.reach_client, "handoff_gen", None) != ack_generation:
+            logger.error("Ack generation was not installed on screen %s", screen)
+            return False
+
+        # 5. Post resuming notification only after validated handback.
+        buzz_send_message(
+            channel=channel,
+            content="Resuming automated execution...",
+            reply_to=reply_to,
+            relay_url=self.relay_url,
+            private_key=self.private_key,
         )
-        return False
+        return True
+    def _task_identity(
+        self, message: Dict[str, Any], channel: str, content: str
+    ) -> Tuple[str, str]:
+        """Bind driver identity to the source message and its attempt."""
+        raw_message_id = message.get("id") or message.get("event_id")
+        if raw_message_id:
+            task_id = str(message.get("task_id") or raw_message_id)
+        else:
+            digest = hashlib.sha256(
+                f"{channel}\0{content}".encode("utf-8")
+            ).hexdigest()[:20]
+            task_id = str(message.get("task_id") or f"buzz-{digest}")
+        attempt_id = str(
+            message.get("attempt_id")
+            or message.get("task_attempt_id")
+            or message.get("attempt")
+            or "1"
+        )
+        return task_id, attempt_id
+
+    def _clarification_result(
+        self, task: ParsedTask, task_id: str, attempt_id: str
+    ) -> DriveResult:
+        return DriveResult(
+            success=False,
+            status="clarification_required",
+            steps=[],
+            task_id=task_id,
+            final_description=(
+                "Provide a success criterion, or explicitly mark the request "
+                "observation-only."
+            ),
+            metrics={
+                "task_id": task_id,
+                "attempt_id": attempt_id,
+                "model_requested": "unknown",
+                "model_reported": "unknown",
+                "model_version": "unknown",
+            },
+        )
+
+    @staticmethod
+    def _metric_receipts(result: Optional[DriveResult]) -> Tuple[str, str, str]:
+        metrics = result.metrics if result and isinstance(result.metrics, dict) else {}
+        model_metrics = metrics.get("model")
+        if not isinstance(model_metrics, dict):
+            model_metrics = metrics.get("model_receipt")
+        nested = model_metrics if isinstance(model_metrics, dict) else {}
+
+        def value(*keys: str) -> str:
+            for key in keys:
+                candidate = metrics.get(key, nested.get(key))
+                if candidate is not None and str(candidate).strip():
+                    return str(candidate)
+            return "unknown"
+
+        return (
+            value("model_requested", "requested_model", "requested"),
+            value("model_reported", "reported_model", "reported"),
+            value("model_version", "version", "provider_version"),
+        )
+
+    def _result_projection(
+        self,
+        task: ParsedTask,
+        result: Optional[DriveResult],
+        cleanup: Optional[Dict[str, str]] = None,
+    ) -> List[str]:
+        requested, reported, version = self._metric_receipts(result)
+        if result is None:
+            status_text = "unknown"
+            success = False
+            steps = 0
+        else:
+            status_text = result.status or "unknown"
+            if not result.success and status_text == "completed":
+                status_text = "unverified"
+            success = bool(result.success and status_text == "completed")
+            steps = len(result.steps)
+
+        status_symbol = "✅" if success else "⚠️"
+        lines = [
+            f"{status_symbol} **Reach Task {status_text.replace('_', ' ').title()}**",
+            f"- **Status**: `{status_text}`",
+            f"- **Steps Executed**: {steps}",
+            f"- **Model Requested**: `{requested}`",
+            f"- **Model Reported**: `{reported}`",
+            f"- **Model Version**: `{version}`",
+        ]
+        if cleanup:
+            cleanup_status = cleanup.get("status", "unknown")
+            if cleanup_status not in {"confirmed", "uncertain", "not_required"}:
+                cleanup_status = "unknown"
+            lines.append(f"- **Lease Cleanup**: `{cleanup_status}`")
+            if cleanup_status == "uncertain":
+                lines.append("- **Reconciliation**: `required`")
+        return lines
+
+
 
     def handle_message(self, message: Dict[str, Any]) -> Optional[DriveResult]:
-        """Process an incoming Buzz message.
-
-        Parses mention, posts ack reply, leases screen, executes driving loop,
-        posts periodic visual diff audit updates, handles takeover if needed,
-        releases screen, and posts final audit summary.
-        """
+        """Project one Buzz message into a bounded, explicit task attempt."""
         content = message.get("content") or ""
-        msg_id = message.get("id") or message.get("event_id") or ""
+        msg_id = str(message.get("id") or message.get("event_id") or "")
         channel = (
             message.get("channel")
             or message.get("channel_id")
@@ -642,11 +875,14 @@ class BuzzDaemon:
         )
 
         if msg_id:
-            self.seen_message_ids.add(str(msg_id))
+            self.seen_message_ids.add(msg_id)
 
         task = parse_task_message(content, trigger=self.trigger)
         if not task:
             return None
+        task_id, attempt_id = self._task_identity(message, channel, content)
+        task.task_id = task_id
+        task.attempt_id = attempt_id
 
         sender = (
             message.get("sender")
@@ -657,7 +893,7 @@ class BuzzDaemon:
             or ""
         ).strip()
 
-        # Sender allowlist verification
+        # Sender authorization is independent of task-contract parsing.
         if self.allowed_senders is not None:
             if not sender or sender.lower() not in self.allowed_senders:
                 logger.warning(
@@ -675,7 +911,23 @@ class BuzzDaemon:
                 )
                 return None
 
-        # Forbid chat-initiated goals from requesting mutating capabilities (exec, card, vault)
+        # Buzz is an attention/result projection, never a consent authority.
+        # In particular, the word "approve" in chat is not an execution grant.
+        if task.contract_status == "clarification_required":
+            result = self._clarification_result(task, task_id, attempt_id)
+            buzz_send_message(
+                channel=channel,
+                content=(
+                    "**Reach Task Clarification Required**\n"
+                    "- Provide `success: \"...\"` for a completion contract, "
+                    "or mark the request `observation-only`.\n"
+                    "- No screen was leased and no driver was launched."
+                ),
+                private_key=self.private_key,
+            )
+            return result
+
+        # Chat text cannot request privileged mutation capabilities.
         mutating_patterns = [
             r"\bexec\b",
             r"\bcard\b",
@@ -687,14 +939,14 @@ class BuzzDaemon:
             r"\bpayment\b",
             r"\bcheckout\b",
         ]
-        lower_goal = task.goal.lower()
-        if any(re.search(pat, lower_goal) for pat in mutating_patterns):
-            logger.warning(
-                "Rejected chat-initiated goal requesting mutating tool: %s", task.goal
-            )
+        if any(re.search(pat, task.goal.lower()) for pat in mutating_patterns):
+            logger.warning("Rejected chat-initiated mutating goal: %s", task.goal)
             buzz_send_message(
                 channel=channel,
-                content="⛔ Security restriction: Mutating tools (exec, card, vault) cannot be invoked from chat-initiated goals. Please run these operations directly from the Reach CLI or authorized supervisor.",
+                content=(
+                    "⛔ Security restriction: Mutating tools (exec, card, vault) "
+                    "cannot be invoked from chat-initiated goals."
+                ),
                 reply_to=msg_id,
                 relay_url=self.relay_url,
                 private_key=self.private_key,
@@ -702,18 +954,18 @@ class BuzzDaemon:
             return None
 
         logger.info(
-            "Mentions detected in message %s (channel %s): screen=%s, goal=%s",
+            "Accepted task contract %s attempt %s from message %s (screen=%s)",
+            task_id,
+            attempt_id,
             msg_id,
-            channel,
             task.screen,
-            task.goal,
         )
-
-        # 1. Post immediate acknowledgment reply in the Buzz message thread
-        ack_reply = f"🐝 On it! Leased screen {task.screen} and beginning execution..."
         buzz_send_message(
             channel=channel,
-            content=ack_reply,
+            content=(
+                f"🐝 Task contract received for screen {task.screen}; "
+                "execution will report observed results only."
+            ),
             reply_to=msg_id,
             relay_url=self.relay_url,
             private_key=self.private_key,
@@ -723,12 +975,10 @@ class BuzzDaemon:
         driver_result: Optional[DriveResult] = None
 
         try:
-            # 2. Lease target screen from Reach API
             lease_data = self.reach_client.lease_screen(task.screen, owner="ReachBot")
             lease_token = lease_data.get("token")
-            logger.info("Screen %s leased successfully (token: %s)", task.screen, lease_token)
+            logger.info("Screen %s leased successfully", task.screen)
 
-            # 3. Setup step callback for periodic visual diff audit updates
             def on_step_callback(step: StepRecord) -> None:
                 if not self.enable_visual_diff:
                     return
@@ -736,13 +986,14 @@ class BuzzDaemon:
                     step.visual_change * 100.0 if step.visual_change is not None else None
                 )
                 tokens_saved = 1600 if getattr(step, "vlm_cached", False) else None
-                desc = step.action.description or step.action.kind
-                step_summary = f"Step {step.step_index}: {desc}"
+                step_result = step.result if isinstance(step.result, dict) else {}
+                outcome = "failed" if step.error else str(step_result.get("status", "completed"))
                 try:
                     buzz_post_visual_diff(
                         channel=channel,
-                        summary=step_summary,
-                        screenshot_path=step.screenshot_path,
+                        step_index=step.step_index,
+                        action_kind=step.action.kind,
+                        outcome=outcome,
                         diff_percent=diff_pct,
                         tokens_saved=tokens_saved,
                         reply_to=msg_id,
@@ -752,97 +1003,92 @@ class BuzzDaemon:
                 except Exception as post_err:
                     logger.warning("Failed to post visual diff update: %s", post_err)
 
-            # 4. Invoke driving loop
             handoff_gen = getattr(self.reach_client, "handoff_gen", None)
-            try:
-                driver = self.driver_factory(
-                    screen=task.screen,
-                    lease_token=lease_token,
-                    handoff_gen=handoff_gen,
-                    step_callback=on_step_callback,
-                )
-            except TypeError:
-                driver = self.driver_factory(
-                    screen=task.screen,
-                    lease_token=lease_token,
-                    step_callback=on_step_callback,
-                )
+            driver = self.driver_factory(
+                screen=task.screen,
+                lease_token=lease_token,
+                handoff_gen=handoff_gen,
+                step_callback=on_step_callback,
+                task_id=task_id,
+                attempt_id=attempt_id,
+                completion_text=task.completion_text,
+            )
             driver_result = driver.drive(goal=task.goal, initial_url=task.initial_url)
 
-            # 5. Interactive takeover integration
+            # Only an explicit auth handoff may resume this same task attempt.
+            # Uncertain or other nonterminal outcomes are never replayed.
             if driver_result and driver_result.status == "auth_required":
                 handback_success = self.handle_takeover(
                     channel=channel,
                     screen=task.screen,
-                    reason=driver_result.final_description or "Human login / 2FA required",
+                    reason="Authentication or human verification required",
                     reply_to=msg_id,
                     token=lease_token,
                 )
                 if handback_success:
-                    # Resume execution after handback
-                    logger.info("Resuming CUA execution post-handback for goal: %s", task.goal)
                     resumed_gen = getattr(self.reach_client, "handoff_gen", None)
-                    try:
-                        resume_driver = self.driver_factory(
-                            screen=task.screen,
-                            lease_token=lease_token,
-                            handoff_gen=resumed_gen,
-                            step_callback=on_step_callback,
-                        )
-                    except TypeError:
-                        resume_driver = self.driver_factory(
-                            screen=task.screen,
-                            lease_token=lease_token,
-                            step_callback=on_step_callback,
-                        )
+                    resume_driver = self.driver_factory(
+                        screen=task.screen,
+                        lease_token=lease_token,
+                        handoff_gen=resumed_gen,
+                        step_callback=on_step_callback,
+                        task_id=task_id,
+                        attempt_id=attempt_id,
+                        completion_text=task.completion_text,
+                    )
                     driver_result = resume_driver.drive(
-                        goal=f"Complete remaining tasks for: {task.goal}"
+                        goal=f"Complete remaining tasks for: {task.goal}",
+                        initial_url=None,
                     )
 
         except Exception as loop_err:
-            logger.error("Error executing task for message %s: %s", msg_id, loop_err, exc_info=True)
+            logger.error(
+                "Error executing task for message %s: %s", msg_id, loop_err, exc_info=True
+            )
             if not driver_result:
+                lease_uncertain = (
+                    isinstance(getattr(self.reach_client, "last_lease_cleanup", None), dict)
+                    and getattr(self.reach_client, "last_lease_cleanup", {}).get("status")
+                    == "uncertain"
+                )
                 driver_result = DriveResult(
                     success=False,
-                    status="failed",
+                    status="uncertain" if lease_uncertain else "failed",
                     steps=[],
                     error=str(loop_err),
                     final_description="Execution error occurred",
+                    task_id=task_id,
+                    metrics={
+                        "model_requested": "unknown",
+                        "model_reported": "unknown",
+                        "model_version": "unknown",
+                    },
                 )
         finally:
-            # 6. Release leased screen
+            cleanup = getattr(self.reach_client, "last_lease_cleanup", None)
+            if not isinstance(cleanup, dict):
+                cleanup = None
             if lease_token:
-                logger.info("Releasing lease for screen %s", task.screen)
-                self.reach_client.release_screen(
-                    screen=task.screen,
-                    owner="ReachBot",
-                    token=lease_token,
-                )
+                try:
+                    release_result = self.reach_client.release_screen(
+                        screen=task.screen,
+                        owner="ReachBot",
+                        token=lease_token,
+                    )
+                    cleanup = {
+                        "status": (
+                            "confirmed"
+                            if isinstance(release_result, dict)
+                            and release_result.get("released") is True
+                            else "uncertain"
+                        )
+                    }
+                except Exception:
+                    cleanup = {"status": "uncertain"}
 
-            # 7. Post final summary and link to visual audit report
-            status_symbol = "✅" if (driver_result and driver_result.success) else "⚠️"
-            status_text = driver_result.status if driver_result else "unknown"
-            step_count = len(driver_result.steps) if driver_result else 0
-            report_url = (
-                driver_result.audit_report_path
-                if (driver_result and driver_result.audit_report_path)
-                else None
+            final_message = "\n".join(
+                self._result_projection(task, driver_result, cleanup)
             )
-
-            summary_lines = [
-                f"{status_symbol} **Reach Task {status_text.replace('_', ' ').title()}**",
-                f"- **Goal**: {task.goal}",
-                f"- **Status**: `{status_text}`",
-                f"- **Steps Executed**: {step_count}",
-            ]
-            if report_url:
-                summary_lines.append(f"- **Visual Audit Report**: [{report_url}]({report_url})")
-            if driver_result and driver_result.final_description:
-                summary_lines.append(f"- **Outcome**: {driver_result.final_description}")
-            if driver_result and driver_result.error:
-                summary_lines.append(f"- **Error**: {driver_result.error}")
-
-            final_message = "\n".join(summary_lines)
             buzz_send_message(
                 channel=channel,
                 content=final_message,

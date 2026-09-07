@@ -5,7 +5,10 @@
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use serde_json::{Map, Value, json};
+use std::collections::{HashMap, HashSet};
+use std::fs::OpenOptions;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 
 /// Default location for routines (~/.reach/routines).
@@ -56,6 +59,282 @@ pub fn render_template(template: &str, params: &HashMap<String, String>) -> Stri
     }
     result
 }
+/// Canonicalize a retained navigation origin without persisting userinfo or
+/// path/query/fragment data.
+fn safe_origin(value: &str) -> Option<String> {
+    let parsed = url::Url::parse(value).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https" | "ws" | "wss") {
+        return None;
+    }
+    let mut host = parsed.host_str()?.to_string();
+    if host.contains(':') && !host.starts_with('[') {
+        host = format!("[{host}]");
+    }
+    let mut origin = format!("{}://{host}", parsed.scheme().to_ascii_lowercase());
+    if let Some(port) = parsed.port() {
+        origin.push_str(&format!(":{port}"));
+    }
+    Some(origin)
+}
+
+fn navigation_needs_runtime_url(value: &str) -> bool {
+    let Ok(parsed) = url::Url::parse(value) else {
+        return false;
+    };
+    !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || (parsed.path() != "" && parsed.path() != "/")
+        || parsed.query().is_some()
+        || parsed.fragment().is_some()
+}
+
+fn safe_input_name(value: &str) -> Option<String> {
+    (!value.is_empty() && value.len() <= 128).then(|| value.to_string())
+}
+
+const SAFE_DOM_KEYWORDS: &[&str] = &[
+    "success",
+    "dashboard",
+    "results",
+    "welcome",
+    "account",
+    "profile",
+];
+
+fn safe_dom_keyword(value: &Value) -> Option<String> {
+    let keyword = value.as_str()?.to_ascii_lowercase();
+    SAFE_DOM_KEYWORDS
+        .contains(&keyword.as_str())
+        .then_some(keyword)
+}
+
+fn safe_phash(value: &Value) -> Option<String> {
+    let hash = value.as_str()?;
+    (hash.len() == 16
+        && hash
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    .then(|| hash.to_string())
+}
+
+fn assigned_input_names(
+    trace: &RoutineTrace,
+    param_keys: Option<&HashMap<String, String>>,
+) -> Vec<Option<String>> {
+    let mut used = trace
+        .steps
+        .iter()
+        .filter_map(|step| step.input_name.as_deref().and_then(safe_input_name))
+        .collect::<HashSet<_>>();
+    if let Some(keys) = param_keys {
+        used.extend(keys.values().filter_map(|name| safe_input_name(name)));
+    }
+    let mut by_text: HashMap<String, String> = HashMap::new();
+    let mut by_url: HashMap<String, String> = HashMap::new();
+    let mut next_url = 1usize;
+    let mut assigned = Vec::with_capacity(trace.steps.len());
+
+    for step in &trace.steps {
+        let explicit = step
+            .input_name
+            .as_deref()
+            .and_then(safe_input_name)
+            .or_else(|| {
+                let value = match step.action_type.as_str() {
+                    "type" => step.text.as_ref(),
+                    "navigate" => step.url.as_ref(),
+                    _ => None,
+                }?;
+                param_keys?
+                    .get(value)
+                    .and_then(|name| safe_input_name(name))
+            });
+        let name = explicit.or_else(|| {
+            if step.action_type == "type" && step.text.is_some() {
+                if let Some(existing) = step.text.as_ref().and_then(|text| by_text.get(text)) {
+                    return Some(existing.clone());
+                }
+                let mut candidate = infer_param_name(step, assigned.len());
+                let mut suffix = 2usize;
+                while used.contains(&candidate) {
+                    candidate = format!("{}_{}", infer_param_name(step, assigned.len()), suffix);
+                    suffix += 1;
+                }
+                used.insert(candidate.clone());
+                if let Some(text) = &step.text {
+                    by_text.insert(text.clone(), candidate.clone());
+                }
+                return Some(candidate);
+            }
+            if step.action_type == "navigate"
+                && step
+                    .url
+                    .as_deref()
+                    .is_some_and(navigation_needs_runtime_url)
+            {
+                let url = step.url.as_ref()?;
+                if let Some(existing) = by_url.get(url) {
+                    return Some(existing.clone());
+                }
+                let candidate = loop {
+                    let candidate = format!("url_{next_url}");
+                    next_url += 1;
+                    if !used.contains(&candidate) {
+                        break candidate;
+                    }
+                };
+                used.insert(candidate.clone());
+                by_url.insert(url.clone(), candidate.clone());
+                return Some(candidate);
+            }
+            None
+        });
+        if let Some(name) = &name {
+            if step.action_type == "type" {
+                if let Some(text) = &step.text {
+                    by_text.insert(text.clone(), name.clone());
+                }
+            } else if step.action_type == "navigate"
+                && let Some(url) = &step.url
+            {
+                by_url.insert(url.clone(), name.clone());
+            }
+        }
+        assigned.push(name);
+    }
+    assigned
+}
+
+fn safe_metadata(value: &serde_json::Value) -> Option<serde_json::Value> {
+    const SAFE_KEYS: &[&str] = &[
+        "source",
+        "dom_keywords",
+        "before_frame_hash",
+        "after_frame_hash",
+        "credential_field",
+    ];
+    match value {
+        Value::Object(items) => {
+            let mut output = Map::new();
+            for (key, item) in items {
+                let lowered = key.to_ascii_lowercase();
+                if !SAFE_KEYS.contains(&lowered.as_str()) {
+                    continue;
+                }
+                if lowered == "dom_keywords" {
+                    let Some(values) = item.as_array() else {
+                        continue;
+                    };
+                    let keywords = values
+                        .iter()
+                        .filter_map(safe_dom_keyword)
+                        .take(4)
+                        .map(Value::String)
+                        .collect::<Vec<_>>();
+                    if !keywords.is_empty() {
+                        output.insert(key.clone(), Value::Array(keywords));
+                    }
+                } else if lowered == "before_frame_hash" || lowered == "after_frame_hash" {
+                    if let Some(hash) = safe_phash(item) {
+                        output.insert(key.clone(), Value::String(hash));
+                    }
+                } else if matches!(item, Value::String(_) | Value::Bool(_) | Value::Number(_)) {
+                    output.insert(key.clone(), item.clone());
+                }
+            }
+            (!output.is_empty()).then_some(Value::Object(output))
+        }
+        _ => None,
+    }
+}
+fn routine_lock(path: &Path) -> Result<std::fs::File> {
+    let parent = path
+        .parent()
+        .context("routine persistence path has no parent directory")?;
+    let mut directories = std::fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directories.mode(0o700);
+    }
+    directories
+        .create(parent)
+        .with_context(|| format!("failed to create routine directory {}", parent.display()))?;
+
+    let lock_path = parent.join(".routine.lock");
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options
+        .open(&lock_path)
+        .with_context(|| format!("failed to open routine lock {}", lock_path.display()))?;
+    fs4::FileExt::lock(&file)
+        .with_context(|| format!("failed to lock routine {}", lock_path.display()))?;
+    Ok(file)
+}
+
+fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
+    let parent = path
+        .parent()
+        .context("routine persistence path has no parent directory")?;
+    let mut directories = std::fs::DirBuilder::new();
+    directories.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        directories.mode(0o700);
+    }
+    directories
+        .create(parent)
+        .with_context(|| format!("failed to create routine directory {}", parent.display()))?;
+
+    let temporary = parent.join(format!(
+        ".{}.tmp-{}-{}",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("routine"),
+        std::process::id(),
+        uuid::Uuid::new_v4().simple()
+    ));
+    let result = (|| -> Result<()> {
+        let mut options = std::fs::OpenOptions::new();
+        options.create_new(true).write(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut file = options.open(&temporary).with_context(|| {
+            format!(
+                "failed to create private routine file {}",
+                temporary.display()
+            )
+        })?;
+        file.write_all(bytes)
+            .context("failed to write private routine file")?;
+        file.sync_all()
+            .context("failed to sync private routine file")?;
+        drop(file);
+        std::fs::rename(&temporary, path)
+            .with_context(|| format!("failed to atomically install routine {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("failed to protect routine file {}", path.display()))?;
+        }
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
 
 // -----------------------------------------------------------------------------
 // Trace Models
@@ -72,13 +351,15 @@ pub struct TraceStep {
     pub y: Option<i32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "parameter")]
+    pub input_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub aria_tag: Option<String>,
     #[serde(rename = "ref", skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
@@ -145,10 +426,12 @@ pub struct CompiledAction {
     pub url: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub selector: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip)]
     pub aria: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", alias = "parameter")]
+    pub input_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub key: Option<String>,
     #[serde(default = "default_button")]
@@ -180,7 +463,7 @@ pub struct CompiledRoutine {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub healed_at: Option<String>,
     #[serde(default)]
-    pub parameters: HashMap<String, String>,
+    pub parameters: HashMap<String, Option<String>>,
     #[serde(default)]
     pub steps: Vec<CompiledStep>,
 }
@@ -189,38 +472,164 @@ pub struct CompiledRoutine {
 // Serialization and Compilation Helpers
 // -----------------------------------------------------------------------------
 
+fn persisted_trace(trace: &RoutineTrace) -> Value {
+    let input_names = assigned_input_names(trace, None);
+    let steps = trace
+        .steps
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let mut output = Map::new();
+            output.insert("step_index".into(), json!(step.step_index));
+            output.insert("timestamp".into(), json!(step.timestamp));
+            output.insert("action_type".into(), json!(step.action_type));
+            if let Some(x) = step.x {
+                output.insert("x".into(), json!(x));
+            }
+            if let Some(y) = step.y {
+                output.insert("y".into(), json!(y));
+            }
+            if let Some(key) = &step.key {
+                output.insert("key".into(), json!(key));
+            }
+            if let Some(origin) = step.url.as_deref().and_then(safe_origin) {
+                output.insert("url".into(), json!(origin));
+            }
+            if let Some(selector) = &step.selector {
+                output.insert("selector".into(), json!(selector));
+            }
+            if let Some(reference) = &step.reference {
+                output.insert("ref".into(), json!(reference));
+            }
+            if let Some(input_name) = input_names[index].clone() {
+                output.insert("input_name".into(), json!(input_name));
+            }
+            let metadata = Value::Object(step.metadata.clone().into_iter().collect());
+            if let Some(metadata) = safe_metadata(&metadata) {
+                output.insert("metadata".into(), metadata);
+            }
+            Value::Object(output)
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "version": trace.version,
+        "name": trace.name,
+        "screen": trace.screen,
+        "created_at": trace.created_at,
+        "steps": steps,
+    })
+}
+
+fn persisted_checkpoint(checkpoint: &Checkpoint) -> Value {
+    let mut output = Map::new();
+    output.insert("type".into(), json!(checkpoint.checkpoint_type));
+    if checkpoint.checkpoint_type == "url_origin_equals" {
+        if let Some(origin) = checkpoint.value.as_deref().and_then(safe_origin) {
+            output.insert("value".into(), json!(origin));
+        }
+    } else if checkpoint.checkpoint_type == "text_contains"
+        && let Some(value) = checkpoint.value.as_deref()
+        && let Some(keyword) = safe_dom_keyword(&Value::String(value.to_string()))
+    {
+        output.insert("value".into(), json!(keyword));
+    }
+    if checkpoint.checkpoint_type == "visual_phash"
+        && let Some(hash) = checkpoint
+            .expected_hash
+            .as_ref()
+            .and_then(|hash| safe_phash(&Value::String(hash.clone())))
+    {
+        output.insert("expected_hash".into(), json!(hash));
+    }
+    output.insert("threshold".into(), json!(checkpoint.threshold));
+    output.insert("description".into(), json!("Verify checkpoint"));
+    Value::Object(output)
+}
+
+fn persisted_action(action: &CompiledAction) -> Value {
+    let mut output = Map::new();
+    output.insert("kind".into(), json!(action.kind));
+    if let Some(point) = action.point {
+        output.insert("point".into(), json!([point.0, point.1]));
+    }
+    if let Some(point) = action.normalized_point {
+        output.insert("normalized_point".into(), json!([point.0, point.1]));
+    }
+    if let Some(reference) = &action.reference {
+        output.insert("ref".into(), json!(reference));
+    }
+    if let Some(origin) = action.url.as_deref().and_then(safe_origin) {
+        output.insert("url".into(), json!(origin));
+    }
+    if let Some(selector) = &action.selector {
+        output.insert("selector".into(), json!(selector));
+    }
+    if let Some(input_name) = action.input_name.as_deref().and_then(safe_input_name) {
+        output.insert("input_name".into(), json!(input_name.clone()));
+        if action.kind == "type" {
+            output.insert("value".into(), json!(format!("{{{{{input_name}}}}}")));
+        }
+    }
+    if let Some(key) = &action.key {
+        output.insert("key".into(), json!(key));
+    }
+    output.insert("button".into(), json!(action.button));
+    Value::Object(output)
+}
+
+fn persisted_routine(routine: &CompiledRoutine) -> Value {
+    let parameters = routine
+        .parameters
+        .keys()
+        .filter_map(|name| safe_input_name(name).map(|name| (name, Value::Null)))
+        .collect::<Map<String, Value>>();
+    let steps = routine
+        .steps
+        .iter()
+        .map(|step| {
+            json!({
+                "step_index": step.step_index,
+                "action": persisted_action(&step.action),
+                "checkpoints": step.checkpoints.iter().map(persisted_checkpoint).collect::<Vec<_>>(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut output = Map::new();
+    output.insert("version".into(), json!(routine.version));
+    output.insert("name".into(), json!(routine.name));
+    output.insert("screen".into(), json!(routine.screen));
+    output.insert("compiled_at".into(), json!(routine.compiled_at));
+    if let Some(healed_at) = &routine.healed_at {
+        output.insert("healed_at".into(), json!(healed_at));
+    }
+    output.insert("parameters".into(), Value::Object(parameters));
+    output.insert("steps".into(), Value::Array(steps));
+    Value::Object(output)
+}
+
 pub fn load_trace(path: &Path) -> Result<RoutineTrace> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read trace file at {}", path.display()))?;
-    let trace: RoutineTrace = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse trace JSON at {}", path.display()))?;
-    Ok(trace)
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse trace JSON at {}", path.display()))
 }
 
 pub fn save_trace(path: &Path, trace: &RoutineTrace) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(trace)?;
-    std::fs::write(path, json)?;
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(&persisted_trace(trace))?;
+    let _lock = routine_lock(path)?;
+    write_private_atomic(path, &bytes)
 }
 
 pub fn load_routine(path: &Path) -> Result<CompiledRoutine> {
     let content = std::fs::read_to_string(path)
         .with_context(|| format!("Failed to read routine file at {}", path.display()))?;
-    let routine: CompiledRoutine = serde_json::from_str(&content)
-        .with_context(|| format!("Failed to parse routine JSON at {}", path.display()))?;
-    Ok(routine)
+    serde_json::from_str(&content)
+        .with_context(|| format!("Failed to parse routine JSON at {}", path.display()))
 }
-
 pub fn save_routine(path: &Path, routine: &CompiledRoutine) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let json = serde_json::to_string_pretty(routine)?;
-    std::fs::write(path, json)?;
-    Ok(())
+    let bytes = serde_json::to_vec_pretty(&persisted_routine(routine))?;
+    let _lock = routine_lock(path)?;
+    write_private_atomic(path, &bytes)
 }
 
 /// Compile a raw demonstration trace into a normalized, parameterizable routine.
@@ -228,108 +637,91 @@ pub fn compile_trace(
     trace: &RoutineTrace,
     param_keys: Option<&HashMap<String, String>>,
 ) -> Result<CompiledRoutine> {
-    let mut parameters = HashMap::new();
+    let input_names = assigned_input_names(trace, param_keys);
+    let parameters = trace
+        .steps
+        .iter()
+        .zip(&input_names)
+        .filter(|(step, _)| matches!(step.action_type.as_str(), "type" | "navigate"))
+        .filter_map(|(_, name)| name.clone().map(|name| (name, None)))
+        .collect();
+
     let mut compiled_steps = Vec::new();
-
-    // Map of text value to variable name
-    let mut val_to_var: HashMap<String, String> = HashMap::new();
-    if let Some(keys) = param_keys {
-        for (k, v) in keys {
-            val_to_var.insert(k.clone(), v.clone());
-        }
-    }
-
-    // Step 1: Detect parameters
-    for step in &trace.steps {
-        if step.action_type == "type"
-            && let Some(txt) = &step.text
-        {
-            if !val_to_var.contains_key(txt) {
-                let var_name = infer_param_name(step, parameters.len());
-                val_to_var.insert(txt.clone(), var_name.clone());
-            }
-            let var_name = &val_to_var[txt];
-            parameters.insert(var_name.clone(), txt.clone());
-        }
-    }
-
-    // Step 2: Compile steps
-    for step in &trace.steps {
-        let mut value = step.text.clone();
-        if step.action_type == "type"
-            && let Some(txt) = &step.text
-            && let Some(var_name) = val_to_var.get(txt)
-        {
-            value = Some(format!("{{{{{var_name}}}}}"));
-        }
-
+    for (index, step) in trace.steps.iter().enumerate() {
+        let input_name = input_names[index].clone();
         let point = match (step.x, step.y) {
             (Some(x), Some(y)) => Some((x, y)),
             _ => None,
         };
-
         let normalized_point = point.map(|(x, y)| {
             (
                 (x as f64 / 1280.0 * 10000.0).round() / 10000.0,
                 (y as f64 / 720.0 * 10000.0).round() / 10000.0,
             )
         });
-
-        let mut desc = format!("{} action", step.action_type);
-        if let Some(r) = &step.reference {
-            desc = format!("{} on ref '{}'", step.action_type, r);
-        } else if let Some(sel) = &step.selector {
-            desc = format!("{} on '{}'", step.action_type, sel);
+        let mut description = format!("{} action", step.action_type);
+        if let Some(reference) = &step.reference {
+            description = format!("{} on ref '{}'", step.action_type, reference);
+        } else if let Some(selector) = &step.selector {
+            description = format!("{} on '{}'", step.action_type, selector);
         } else if let Some((x, y)) = point {
-            desc = format!("{} at ({}, {})", step.action_type, x, y);
+            description = format!("{} at ({}, {})", step.action_type, x, y);
         }
-
         let action = CompiledAction {
             kind: step.action_type.clone(),
             point,
             normalized_point,
             reference: step.reference.clone(),
-            url: step.url.clone(),
+            url: step.url.as_deref().and_then(safe_origin),
             selector: step.selector.clone(),
             aria: step.aria_tag.clone(),
-            value,
+            value: (step.action_type == "type")
+                .then(|| input_name.as_ref().map(|name| format!("{{{{{name}}}}}")))
+                .flatten(),
+            input_name,
             key: step.key.clone(),
             button: "left".to_string(),
-            description: desc,
+            description,
         };
 
         let mut checkpoints = Vec::new();
         if step.action_type == "navigate"
-            && let Some(url) = &step.url
+            && let Some(origin) = step.url.as_deref().and_then(safe_origin)
         {
-            let domain = url
-                .split("://")
-                .last()
-                .unwrap_or(url)
-                .split('/')
-                .next()
-                .unwrap_or(url);
             checkpoints.push(Checkpoint {
-                checkpoint_type: "url_contains".to_string(),
-                value: Some(domain.to_string()),
+                checkpoint_type: "url_origin_equals".to_string(),
+                value: Some(origin),
                 expected_hash: None,
                 threshold: 0.20,
                 frame_path: None,
-                description: format!("Verify URL contains '{}'", domain),
+                description: "Verify origin".to_string(),
             });
         }
-
-        if let Some(frame) = &step.after_frame {
+        if let Some(keyword) = step
+            .metadata
+            .get("dom_keywords")
+            .and_then(Value::as_array)
+            .and_then(|keywords| keywords.iter().find_map(safe_dom_keyword))
+        {
+            checkpoints.push(Checkpoint {
+                checkpoint_type: "text_contains".to_string(),
+                value: Some(keyword),
+                expected_hash: None,
+                threshold: 0.20,
+                frame_path: None,
+                description: "Verify operational page keyword".to_string(),
+            });
+        }
+        if let Some(hash) = step.metadata.get("after_frame_hash").and_then(safe_phash) {
             checkpoints.push(Checkpoint {
                 checkpoint_type: "visual_phash".to_string(),
                 value: None,
-                expected_hash: None,
+                expected_hash: Some(hash),
                 threshold: 0.20,
-                frame_path: Some(frame.clone()),
-                description: format!("Visual anchor verification for step {}", step.step_index),
+                frame_path: None,
+                description: "Verify live visual anchor".to_string(),
             });
         }
-
         compiled_steps.push(CompiledStep {
             step_index: step.step_index,
             action,
@@ -397,6 +789,7 @@ mod tests {
             x: None,
             y: None,
             text: None,
+            input_name: None,
             key: None,
             url: Some("https://www.google.com".to_string()),
             selector: None,
@@ -415,6 +808,7 @@ mod tests {
             x: Some(640),
             y: Some(360),
             text: Some("Tesla".to_string()),
+            input_name: None,
             key: None,
             url: Some("https://www.google.com".to_string()),
             selector: Some("input[name='q']".to_string()),
@@ -434,8 +828,12 @@ mod tests {
             steps: vec![step1, step2],
         };
 
-        let compiled = compile_trace(&trace, None).unwrap();
-        assert_eq!(compiled.parameters.get("query"), Some(&"Tesla".to_string()));
+        let compiled = compile_trace(
+            &trace,
+            Some(&HashMap::from([("Tesla".to_string(), "query".to_string())])),
+        )
+        .unwrap();
+        assert_eq!(compiled.parameters.get("query"), Some(&None));
         assert_eq!(
             compiled.steps[1].action.value,
             Some("{{query}}".to_string())

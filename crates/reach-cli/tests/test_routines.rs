@@ -45,6 +45,7 @@ fn test_trace_and_routine_serde_roundtrip() {
         x: Some(500),
         y: Some(300),
         text: None,
+        input_name: None,
         key: None,
         url: Some("https://example.com".to_string()),
         selector: Some("button#submit".to_string()),
@@ -110,4 +111,115 @@ fn test_checkpoint_types_and_defaults() {
     let deserialized: Checkpoint = serde_json::from_str(&json).unwrap();
     assert_eq!(deserialized.checkpoint_type, "visual_phash");
     assert_eq!(deserialized.threshold, 0.20);
+}
+
+#[test]
+fn test_native_persistence_redacts_values_and_keeps_required_inputs() {
+    let tmp = std::env::temp_dir().join(format!("reach-routine-privacy-{}", uuid::Uuid::new_v4()));
+    let _ = std::fs::create_dir_all(&tmp);
+    let canary = "typed-secret-canary";
+    let navigation = "https://user:password@example.com/private/path?token=url-secret#fragment";
+    let trace = RoutineTrace {
+        version: 1,
+        name: "privacy".to_string(),
+        screen: 2,
+        created_at: "2026-09-05T00:00:00Z".to_string(),
+        steps: vec![
+            TraceStep {
+                step_index: 1,
+                timestamp: "2026-09-05T00:00:00Z".to_string(),
+                action_type: "navigate".to_string(),
+                x: None,
+                y: None,
+                text: None,
+                input_name: None,
+                key: None,
+                url: Some(navigation.to_string()),
+                selector: None,
+                aria_tag: None,
+                reference: None,
+                before_frame: Some(canary.to_string()),
+                after_frame: Some(canary.to_string()),
+                dom_snapshot: Some(canary.to_string()),
+                metadata: HashMap::from([
+                    ("arbitrary_text".to_string(), serde_json::json!(canary)),
+                    ("dom_keywords".to_string(), serde_json::json!([canary])),
+                    ("after_frame_hash".to_string(), serde_json::json!(canary)),
+                ]),
+            },
+            TraceStep {
+                step_index: 2,
+                timestamp: "2026-09-05T00:00:01Z".to_string(),
+                action_type: "type".to_string(),
+                x: Some(10),
+                y: Some(20),
+                text: Some(canary.to_string()),
+                input_name: Some("query".to_string()),
+                key: None,
+                url: Some(navigation.to_string()),
+                selector: Some("input[name=q]".to_string()),
+                aria_tag: Some("Search".to_string()),
+                reference: Some("@query".to_string()),
+                before_frame: None,
+                after_frame: None,
+                dom_snapshot: None,
+                metadata: HashMap::new(),
+            },
+        ],
+    };
+
+    let direct = compile_trace(&trace, None).expect("compile in-memory trace");
+    assert_eq!(direct.steps[0].checkpoints.len(), 1);
+    let direct_json = serde_json::to_string(&direct).expect("serialize in-memory routine");
+    assert!(!direct_json.contains(canary));
+    assert!(!direct_json.contains("url-secret"));
+    assert!(!direct_json.contains("/private/path"));
+    let trace_file = tmp.join("trace.json");
+    save_trace(&trace_file, &trace).expect("save private trace");
+    let trace_json = std::fs::read_to_string(&trace_file).expect("read trace");
+    let trace_doc: serde_json::Value = serde_json::from_str(&trace_json).expect("parse trace");
+    assert!(!trace_json.contains(canary));
+    assert!(!trace_json.contains("url-secret"));
+    assert!(!trace_json.contains("/private/path"));
+    assert_eq!(
+        trace_doc["steps"][0]["input_name"],
+        serde_json::json!("url_1")
+    );
+    assert_eq!(
+        trace_doc["steps"][0]["url"],
+        serde_json::json!("https://example.com")
+    );
+
+    let loaded = load_trace(&trace_file).expect("load redacted trace");
+    let compiled = compile_trace(&loaded, None).expect("compile redacted trace");
+    assert_eq!(
+        compiled.steps[0].checkpoints[0].checkpoint_type,
+        "url_origin_equals"
+    );
+    assert_eq!(
+        compiled.steps[0].checkpoints[0].value.as_deref(),
+        Some("https://example.com")
+    );
+    assert_eq!(
+        compiled.steps[0].action.input_name.as_deref(),
+        Some("url_1")
+    );
+    assert_eq!(compiled.steps[1].action.value.as_deref(), Some("{{query}}"));
+
+    let routine_file = tmp.join("routine.json");
+    save_routine(&routine_file, &compiled).expect("save private routine");
+    let routine_json = std::fs::read_to_string(&routine_file).expect("read routine");
+    let routine_doc: serde_json::Value =
+        serde_json::from_str(&routine_json).expect("parse routine");
+    assert!(!routine_json.contains(canary));
+    assert!(!routine_json.contains("url-secret"));
+    assert!(!routine_json.contains("/private/path"));
+    assert!(routine_doc["parameters"]["url_1"].is_null());
+    assert!(routine_doc["parameters"]["query"].is_null());
+    assert_eq!(
+        routine_doc["steps"][0]["checkpoints"][0]["type"],
+        serde_json::json!("url_origin_equals")
+    );
+
+    let _ = std::fs::remove_dir_all(&tmp);
 }

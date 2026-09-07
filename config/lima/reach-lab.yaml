@@ -25,8 +25,17 @@ provision:
       set -eux
       command -v cargo >/dev/null || curl -sSf https://sh.rustup.rs | sh -s -- -y
 portForwards:
+  # Raw VNC, noVNC, and supervisor health stay on the host loopback.
+  # Remote operators must use an authenticated SSH/Lima tunnel; never bind
+  # these forwards to a LAN or Tailscale address.
+  - guestPort: 5900
+    hostIP: "127.0.0.1"
+    hostPort: 5900
   - guestPort: 6080
-    hostIP: "100.124.38.17"     # Tailscale only
+    hostIP: "127.0.0.1"
     hostPort: 6080
+  - guestPort: 8400
+    hostIP: "127.0.0.1"
+    hostPort: 8400
   - guestPortRange: [1, 65535]
     ignore: true                # nothing else leaves the VM

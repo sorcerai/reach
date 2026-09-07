@@ -13,6 +13,7 @@ pub struct ReachConfig {
     pub server: ServerConfig,
     pub docker: DockerConfig,
     pub vault: VaultConfig,
+    pub accounts: std::collections::BTreeMap<String, crate::lease::AccountPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

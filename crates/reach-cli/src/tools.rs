@@ -3,7 +3,8 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::docker::{
-    AuthHandoffOptions, DockerClient, PageTextOptions, ProfileMount, Sandbox, novnc_url,
+    AuthHandoffOptions, DockerClient, PageActionOptions, PageTextOptions, ProfileMount, Sandbox,
+    novnc_url,
 };
 use crate::mcp::ToolResponse;
 
@@ -83,7 +84,10 @@ pub fn acquire_tool_profile_lease(
     }
 
     if let Some(broker) = ctx.profile_broker {
-        let (profile_name, _) = resolve_profile_name(args, screen);
+        let (profile_name, _) = match profile_for_tool(ctx, args, screen) {
+            Ok(profile) => profile,
+            Err(error) => return Err(ToolResponse::error(error)),
+        };
         let timeout_ms = args.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(0);
         let owner = resolve_owner(ctx, args, screen);
         let holder =
@@ -124,6 +128,95 @@ pub fn display_for(screen: u32) -> String {
 pub fn requested_screen(args: &serde_json::Value) -> Result<u32, String> {
     Ok(screen_for(args))
 }
+/// Build the identity used for ref lookup. The Docker incarnation is authoritative; target
+/// names are intentionally not part of the key.
+async fn current_ref_scope(
+    ctx: &ToolContext<'_>,
+    target: &str,
+    screen: u32,
+) -> Result<crate::refs::RefScope, ToolResponse> {
+    let incarnation = ctx
+        .docker
+        .incarnation(target)
+        .await
+        .map_err(|_| ToolResponse::error("computer_unavailable"))?;
+    let (attempt_id, handoff_gen, observation_gen) = ctx
+        .agent
+        .and_then(|agent| agent.screen_info(screen))
+        .map(|info| {
+            (
+                info.grant.as_ref().map(|grant| grant.attempt_id.clone()),
+                Some(info.handoff_gen),
+                Some(info.observation_gen),
+            )
+        })
+        .unwrap_or((None, None, None));
+    Ok(
+        crate::refs::RefScope::new(incarnation, screen, attempt_id, handoff_gen)
+            .with_observation_gen(observation_gen),
+    )
+}
+
+/// Leased screens always observe through their granted profile, including current-page
+/// observations (where no URL is supplied). This prevents an implicit screen profile from
+/// crossing account leases.
+fn profile_for_tool(
+    ctx: &ToolContext<'_>,
+    args: &serde_json::Value,
+    screen: u32,
+) -> Result<(String, bool), String> {
+    if let Some(agent) = ctx.agent {
+        if let Some(info) = agent.screen_info(screen) {
+            if let Some(grant) = info.grant {
+                for key in ["use_profile", "profile"] {
+                    if let Some(requested) = args.get(key).and_then(|value| value.as_str()) {
+                        if requested != grant.profile {
+                            return Err("profile is outside this lease grant".into());
+                        }
+                    }
+                }
+                let ephemeral = grant.profile.starts_with("/tmp/ctx-");
+                return Ok((grant.profile, ephemeral));
+            }
+        }
+    }
+
+    Ok(resolve_profile_name(args, screen))
+}
+fn allowed_origins_for(ctx: &ToolContext<'_>, screen: u32) -> Option<Vec<String>> {
+    ctx.agent
+        .and_then(|agent| agent.screen_info(screen))
+        .and_then(|info| info.grant)
+        .filter(|grant| grant.account.is_some())
+        .map(|grant| grant.origins.into_iter().collect())
+}
+
+fn validate_page_text_origin(
+    ctx: &ToolContext<'_>,
+    screen: u32,
+    output: &crate::docker::PageTextOutput,
+) -> Result<(), ToolResponse> {
+    let Some(agent) = ctx.agent else {
+        return Ok(());
+    };
+    let Some(info) = agent.screen_info(screen) else {
+        return Ok(());
+    };
+    let Some(grant) = info.grant else {
+        return Ok(());
+    };
+    if grant.account.is_some()
+        && !output
+            .url
+            .as_deref()
+            .is_some_and(|url| grant.permits_origin(url))
+    {
+        return Err(ToolResponse::error(
+            "browser origin is outside this lease's allowed origins",
+        ));
+    }
+    Ok(())
+}
 
 pub fn parse_jars(args: &serde_json::Value) -> Vec<String> {
     if let Some(arr) = args.get("jars").and_then(|v| v.as_array()) {
@@ -138,6 +231,35 @@ pub fn parse_jars(args: &serde_json::Value) -> Vec<String> {
             .collect()
     } else {
         vec![]
+    }
+}
+
+struct MutationGuard<'a> {
+    agent: Option<&'a crate::agent::AgentState>,
+    incarnation: Option<String>,
+    screen: u32,
+}
+
+impl Drop for MutationGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(incarnation) = &self.incarnation {
+            crate::refs::global_ref_table().clear_screen(incarnation, self.screen);
+        }
+        if let Some(agent) = self.agent {
+            agent.invalidate_observation(self.screen);
+        }
+    }
+}
+
+async fn begin_mutation<'a>(
+    ctx: &'a ToolContext<'a>,
+    target: &str,
+    screen: u32,
+) -> MutationGuard<'a> {
+    MutationGuard {
+        agent: ctx.agent,
+        incarnation: ctx.docker.incarnation(target).await.ok(),
+        screen,
     }
 }
 
@@ -165,72 +287,91 @@ pub fn resolve_profile_name(args: &serde_json::Value, screen: u32) -> (String, b
     }
 }
 
-pub fn browse_command(url: &str, profile_dir: &str) -> String {
-    browse_command_full(url, profile_dir, None, None)
-}
+const BROWSE_SCRIPT: &str = concat!(
+    include_str!("../assets/browser_page.py"),
+    r#"
+import json, os, subprocess, sys, time, urllib.request
 
-pub fn browse_command_with_hydration(
-    url: &str,
-    profile_dir: &str,
-    hydrated_json: Option<&str>,
-) -> String {
-    browse_command_full(url, profile_dir, hydrated_json, None)
-}
+def navigate():
+    payload = json.load(sys.stdin)
+    profile = payload['profile']
+    port = payload.get('port') or 9222
+    url = payload.get('url', 'about:blank')
+    display = payload.get('display', ':99')
+    os.environ['DISPLAY'] = display
+    endpoint = 'http://127.0.0.1:%d' % port
+    try:
+        with urllib.request.urlopen(endpoint + '/json/version', timeout=1) as response:
+            json.load(response)
+    except (OSError, ValueError):
+        args = ['reach-chrome', '--no-sandbox', '--disable-gpu', '--no-first-run',
+                '--enable-automation', '--user-data-dir=' + profile,
+                '--remote-debugging-port=' + str(port), '--', 'about:blank']
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
-pub fn browse_command_full(
+    from playwright.sync_api import sync_playwright, Error
+    with sync_playwright() as playwright:
+        deadline = time.monotonic() + 5
+        while True:
+            try:
+                browser = playwright.chromium.connect_over_cdp(endpoint, timeout=500)
+                break
+            except Error:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.1)
+        verify_cdp_profile(browser, profile)
+        contexts = list(browser.contexts)
+        if len(contexts) != 1:
+            raise RuntimeError('expected exactly one browser context')
+        # A browse request owns a new target rather than guessing among restored tabs.
+        page = contexts[0].new_page()
+        hydration = json.loads(payload.get('hydration_json') or '{}')
+        cookies = hydration.get('cookies', [])
+        if cookies:
+            page.context.add_cookies(cookies)
+        navigation_guard = NavigationGuard(page, payload.get('allowed_origins'))
+        try:
+            # Only this call navigates: launching Chrome must not submit the URL twice.
+            page.goto(url, timeout=30000, wait_until='domcontentloaded')
+            navigation_guard.check()
+            page.bring_to_front()
+            if not _isolated_document_has_focus(page):
+                raise RuntimeError('navigation target is not focused')
+        finally:
+            navigation_guard.close()
+        print('ok')
+
+try:
+    navigate()
+except Exception:
+    print('browser navigation outcome requires reconciliation', file=sys.stderr)
+    sys.exit(1)
+"#
+);
+
+/// Return a fixed Python command plus a JSON stdin payload. Cookie data is never present in
+/// argv/environment; only the fixed helper source appears in argv.
+pub fn browse_command_input(
     url: &str,
     profile_dir: &str,
     hydrated_json: Option<&str>,
     cdp_port: Option<u16>,
-) -> String {
-    let escaped_json = hydrated_json
-        .map(|j| format!("'''{}'''", j.replace('\\', "\\\\").replace('\'', "\\'")))
-        .unwrap_or_else(|| "None".to_string());
-
-    let cdp_flag = match cdp_port {
-        Some(port) => format!("--remote-debugging-port={port} "),
-        None => String::new(),
-    };
-
-    format!(
-        "mkdir -p '{p}' && \
-         python3 -c \"import os, json, time; \
-           p = '{p}'; \
-           sf = '/workspace/.reach/state.json'; \
-           hydrated_str = {escaped_json}; \
-           hydrated = json.loads(hydrated_str) if hydrated_str else None; \
-           if hydrated and hydrated.get('cookies'): \
-               try: \
-                   from playwright.sync_api import sync_playwright; \
-                   now = time.time(); \
-                   cookies = hydrated.get('cookies', []); \
-                   for c in cookies: \
-                       if c.get('expires', -1) <= 0: c['expires'] = int(now + 86400 * 30); \
-                   with sync_playwright() as pw: \
-                       ctx = pw.chromium.launch_persistent_context(p, headless=True, args=['--no-sandbox']); \
-                       ctx.add_cookies(cookies); \
-                       ctx.close(); \
-               except Exception: pass; \
-           else: \
-               has_c = any(os.path.exists(os.path.join(p, sub)) for sub in ['Default/Network/Cookies', 'Default/Cookies', 'Cookies']); \
-               if not has_c and os.path.exists(sf): \
-                   try: \
-                       with open(sf) as f: state = json.load(f); \
-                       cookies = state.get('cookies', []); \
-                       if cookies: \
-                           from playwright.sync_api import sync_playwright; \
-                           now = time.time(); \
-                           for c in cookies: \
-                               if c.get('expires', -1) <= 0: c['expires'] = int(now + 86400 * 30); \
-                           with sync_playwright() as pw: \
-                               ctx = pw.chromium.launch_persistent_context(p, headless=True, args=['--no-sandbox']); \
-                               ctx.add_cookies(cookies); \
-                               ctx.close(); \
-                   except Exception: pass\" 2>/dev/null || true; \
-         reach-chrome --no-sandbox --disable-gpu --no-first-run {cdp_flag}\
-         --user-data-dir='{p}' '{u}' >/dev/null 2>&1 &",
-        p = profile_dir,
-        u = url.replace('\'', "%27")
+    display: &str,
+    allowed_origins: Option<&[String]>,
+) -> (Vec<String>, Vec<u8>) {
+    let payload = serde_json::json!({
+        "profile": profile_dir,
+        "port": cdp_port,
+        "url": url,
+        "hydration_json": hydrated_json.unwrap_or(""),
+        "display": display,
+        "allowed_origins": allowed_origins,
+    });
+    (
+        vec!["python3".into(), "-c".into(), BROWSE_SCRIPT.into()],
+        serde_json::to_vec(&payload).expect("browse payload serializes"),
     )
 }
 
@@ -316,10 +457,8 @@ pub fn format_page_text_response(
             if let Some(tree) = out.axtree {
                 let lines: Vec<&str> = tree.lines().collect();
                 let (filtered_lines, match_count) = if let Some(q) = query_clean {
-                    let terms: Vec<String> = q
-                        .split_whitespace()
-                        .map(|t| t.to_lowercase())
-                        .collect();
+                    let terms: Vec<String> =
+                        q.split_whitespace().map(|t| t.to_lowercase()).collect();
                     let matches: Vec<&str> = lines
                         .iter()
                         .copied()
@@ -369,10 +508,8 @@ pub fn format_page_text_response(
             if let Some(txt) = out.text {
                 let lines: Vec<&str> = txt.lines().collect();
                 let filtered_lines: Vec<&str> = if let Some(q) = query_clean {
-                    let terms: Vec<String> = q
-                        .split_whitespace()
-                        .map(|t| t.to_lowercase())
-                        .collect();
+                    let terms: Vec<String> =
+                        q.split_whitespace().map(|t| t.to_lowercase()).collect();
                     lines
                         .into_iter()
                         .filter(|line| {
@@ -474,6 +611,21 @@ pub async fn dispatch(
 ) -> ToolResponse {
     let screen = screen_for(args);
     let display = display_for(screen);
+    if matches!(tool, "exec" | "playwright_eval") {
+        match ctx.docker.find(target).await {
+            Ok(sandbox) if sandbox.allow_exec => {}
+            Ok(_) => {
+                return ToolResponse::error(format!(
+                    "{tool} capability denied: sandbox '{target}' was created without --allow-exec"
+                ));
+            }
+            Err(e) => {
+                return ToolResponse::error(format!(
+                    "{tool}: failed to inspect sandbox '{target}': {e}"
+                ));
+            }
+        }
+    }
 
     if let Some(agent) = ctx.agent {
         if let Some(info) = agent.screen_info(screen) {
@@ -502,6 +654,12 @@ pub async fn dispatch(
     let resp = match tool {
         "screenshot" => match ctx.docker.screenshot(target, &display).await {
             Ok(bytes) => {
+                if let Ok(incarnation) = ctx.docker.incarnation(target).await {
+                    crate::refs::global_ref_table().clear_screen(&incarnation, screen);
+                }
+                if let Some(agent) = ctx.agent {
+                    agent.record_observation(screen);
+                }
                 use base64::Engine;
                 ToolResponse::image(
                     base64::engine::general_purpose::STANDARD.encode(&bytes),
@@ -511,38 +669,85 @@ pub async fn dispatch(
             Err(e) => ToolResponse::error(e.to_string()),
         },
         "click" => {
-            let btn = match args.get("button").and_then(|v| v.as_str()) {
-                Some("right") => "3",
-                Some("middle") => "2",
-                _ => "1",
+            let button = match args.get("button").and_then(|v| v.as_str()) {
+                Some("right") => "right",
+                Some("middle") => "middle",
+                _ => "left",
             };
-            let reference = args.get("ref").and_then(|v| v.as_str());
-            let (x, y) = if let Some(ref_str) = reference {
-                match crate::refs::resolve_ref(target, screen, ref_str) {
-                    Some(el) => match el.target_coordinates() {
-                        Some(coords) => coords,
-                        None => {
-                            return ToolResponse::error(format!(
-                                "ref '{ref_str}' has no valid coordinates"
-                            ));
-                        }
-                    },
+            if let Some(ref_str) = args.get("ref").and_then(|v| v.as_str()) {
+                let scope = match current_ref_scope(ctx, target, screen).await {
+                    Ok(scope) => scope,
+                    Err(error) => return error,
+                };
+                let element = match crate::refs::resolve_ref(&scope, ref_str) {
+                    Some(element) => element,
                     None => {
                         return ToolResponse::error(format!(
                             "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
                         ));
                     }
-                }
-            } else {
-                let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
-                let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
-                (x, y)
+                };
+                let selector = match element.selector {
+                    Some(selector) if !selector.is_empty() => selector,
+                    _ => return ToolResponse::error("ref has no live DOM selector"),
+                };
+                let identity = match crate::refs::global_ref_table().page_identity(&scope) {
+                    Some(identity) if identity.loader_id.is_some() => identity,
+                    _ => {
+                        return ToolResponse::error("ref snapshot has no native document identity");
+                    }
+                };
+                let backend_node_id = match element.backend_node_id {
+                    Some(id) if id > 0 => id,
+                    _ => return ToolResponse::error("ref has no native node identity"),
+                };
+                let _mutation_guard = begin_mutation(ctx, target, screen).await;
+                let (profile_name, is_ephemeral) = match profile_for_tool(ctx, args, screen) {
+                    Ok(profile) => profile,
+                    Err(error) => return ToolResponse::error(error),
+                };
+                let user_data_dir = if is_ephemeral {
+                    profile_name
+                } else {
+                    ProfileMount::container_path_for(&profile_name)
+                };
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15_000);
+                let opts = PageActionOptions {
+                    target_id: identity.target_id,
+                    loader_id: identity.loader_id.expect("checked above"),
+                    selector,
+                    backend_node_id,
+                    action: "click".into(),
+                    button: button.into(),
+                    text: String::new(),
+                    clear: false,
+                    submit: false,
+                    timeout_ms,
+                    user_data_dir,
+                    display: display.clone(),
+                    screen,
+                };
+                return match ctx.docker.page_action(target, &opts).await {
+                    Ok(result) => ToolResponse::text(result),
+                    Err(error) => ToolResponse::error(error.to_string()),
+                };
+            }
+            let _mutation_guard = begin_mutation(ctx, target, screen).await;
+            let button_num = match button {
+                "right" => "3",
+                "middle" => "2",
+                _ => "1",
             };
+            let x = args.get("x").and_then(|v| v.as_i64()).unwrap_or(0);
+            let y = args.get("y").and_then(|v| v.as_i64()).unwrap_or(0);
             sh(
                 ctx,
                 target,
                 screen,
-                &format!("xdotool mousemove {x} {y} click {btn}"),
+                &format!("xdotool mousemove {x} {y} click {button_num}"),
             )
             .await
         }
@@ -550,36 +755,70 @@ pub async fn dispatch(
             let text = args.get("text").and_then(|v| v.as_str()).unwrap_or("");
             let reference = args.get("ref").and_then(|v| v.as_str());
             let clear = args.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
-            let submit = args.get("submit").and_then(|v| v.as_bool()).unwrap_or(false);
-
+            let submit = args
+                .get("submit")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             if let Some(ref_str) = reference {
-                match crate::refs::resolve_ref(target, screen, ref_str) {
-                    Some(el) => {
-                        let (cx, cy) = match el.target_coordinates() {
-                            Some(coords) => coords,
-                            None => {
-                                return ToolResponse::error(format!(
-                                    "ref '{ref_str}' has no valid coordinates"
-                                ));
-                            }
-                        };
-                        let mut script = format!("xdotool mousemove {cx} {cy} click 1");
-                        if clear {
-                            script.push_str(" && xdotool key ctrl+a BackSpace");
-                        }
-                        script.push_str(&format!(
-                            " && xdotool type -- '{}'",
-                            text.replace('\'', "'\\''")
+                let scope = match current_ref_scope(ctx, target, screen).await {
+                    Ok(scope) => scope,
+                    Err(error) => return error,
+                };
+                let element = match crate::refs::resolve_ref(&scope, ref_str) {
+                    Some(element) => element,
+                    None => {
+                        return ToolResponse::error(format!(
+                            "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
                         ));
-                        if submit {
-                            script.push_str(" && xdotool key Return");
-                        }
-                        sh(ctx, target, screen, &script).await
                     }
-                    None => ToolResponse::error(format!(
-                        "ref '{ref_str}' not found on screen {screen}. Call page_text first to refresh refs."
-                    )),
-                }
+                };
+                let selector = match element.selector {
+                    Some(selector) if !selector.is_empty() => selector,
+                    _ => return ToolResponse::error("ref has no live DOM selector"),
+                };
+                let identity = match crate::refs::global_ref_table().page_identity(&scope) {
+                    Some(identity) if identity.loader_id.is_some() => identity,
+                    _ => {
+                        return ToolResponse::error("ref snapshot has no native document identity");
+                    }
+                };
+                let backend_node_id = match element.backend_node_id {
+                    Some(id) if id > 0 => id,
+                    _ => return ToolResponse::error("ref has no native node identity"),
+                };
+                let _mutation_guard = begin_mutation(ctx, target, screen).await;
+                let (profile_name, is_ephemeral) = match profile_for_tool(ctx, args, screen) {
+                    Ok(profile) => profile,
+                    Err(error) => return ToolResponse::error(error),
+                };
+                let user_data_dir = if is_ephemeral {
+                    profile_name
+                } else {
+                    ProfileMount::container_path_for(&profile_name)
+                };
+                let timeout_ms = args
+                    .get("timeout_ms")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(15_000);
+                let opts = PageActionOptions {
+                    target_id: identity.target_id,
+                    loader_id: identity.loader_id.expect("checked above"),
+                    selector,
+                    backend_node_id,
+                    action: "type".into(),
+                    button: "left".into(),
+                    text: text.to_string(),
+                    clear,
+                    submit,
+                    timeout_ms,
+                    user_data_dir,
+                    display: display.clone(),
+                    screen,
+                };
+                return match ctx.docker.page_action(target, &opts).await {
+                    Ok(result) => ToolResponse::text(result),
+                    Err(error) => ToolResponse::error(error.to_string()),
+                };
             } else {
                 let mut script = String::new();
                 if clear {
@@ -592,6 +831,7 @@ pub async fn dispatch(
                 if submit {
                     script.push_str(" && xdotool key Return");
                 }
+                let _mutation_guard = begin_mutation(ctx, target, screen).await;
                 sh(ctx, target, screen, &script).await
             }
         }
@@ -609,6 +849,7 @@ pub async fn dispatch(
                     "invalid or unsafe key combo: '{combo}'. Must only contain alphanumeric characters, '+', '_', '-', ':', and brackets"
                 ));
             }
+            let _mutation_guard = begin_mutation(ctx, target, screen).await;
             sh(ctx, target, screen, &format!("xdotool key {combo}")).await
         }
         "browse" => {
@@ -620,7 +861,10 @@ pub async fn dispatch(
                 .get("snapshot")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
-            let (profile_name, is_ephemeral) = resolve_profile_name(args, screen);
+            let (profile_name, is_ephemeral) = match profile_for_tool(ctx, args, screen) {
+                Ok(profile) => profile,
+                Err(error) => return ToolResponse::error(error),
+            };
             let profile_dir = if is_ephemeral {
                 profile_name.clone()
             } else {
@@ -629,20 +873,32 @@ pub async fn dispatch(
 
             let declared_jars = parse_jars(args);
             let hydrated_json = if !declared_jars.is_empty() {
-                if let Some(jars_svc) = ctx.cookie_jars {
-                    let st = jars_svc.hydrate_jars(&declared_jars);
-                    serde_json::to_string(&st).ok()
-                } else {
-                    None
-                }
+                ctx.cookie_jars.and_then(|jars_svc| {
+                    serde_json::to_string(&jars_svc.hydrate_jars(&declared_jars)).ok()
+                })
             } else {
                 None
             };
 
             let cdp_port = 9222 + screen as u16;
-            let launch_cmd =
-                browse_command_full(url, &profile_dir, hydrated_json.as_deref(), Some(cdp_port));
-            let sh_resp = sh(ctx, target, screen, &launch_cmd).await;
+            let allowed_origins = allowed_origins_for(ctx, screen);
+            let (command, payload) = browse_command_input(
+                url,
+                &profile_dir,
+                hydrated_json.as_deref(),
+                Some(cdp_port),
+                &display,
+                allowed_origins.as_deref(),
+            );
+            let sh_resp = match ctx.docker.exec_input(target, &command, &payload).await {
+                Ok(out) if out.exit_code == 0 => ToolResponse::text(if out.stdout.is_empty() {
+                    "ok".into()
+                } else {
+                    out.stdout
+                }),
+                Ok(out) => ToolResponse::error(format!("exit {}: {}", out.exit_code, out.stderr)),
+                Err(error) => ToolResponse::error(error.to_string()),
+            };
             if sh_resp.is_error || !snapshot {
                 return sh_resp;
             }
@@ -680,13 +936,34 @@ pub async fn dispatch(
                 user_data_dir: Some(profile_dir),
                 display: Some(display.clone()),
                 hydrated_cookies: None,
+                allowed_origins,
             };
             match ctx.docker.page_text(target, &opts).await {
-                Ok(out) => {
-                    if let Some(map) = &out.refs {
-                        crate::refs::global_ref_table().set_refs(target, screen, map.clone());
-                        crate::refs::save_refs_to_disk(target, screen, map);
+                Ok(mut out) => {
+                    if let Err(error) = validate_page_text_origin(ctx, screen, &out) {
+                        return error;
                     }
+                    if let Some(agent) = ctx.agent {
+                        agent.record_observation(screen);
+                    }
+                    let ref_scope = match current_ref_scope(ctx, target, screen).await {
+                        Ok(scope) => scope,
+                        Err(error) => return error,
+                    };
+                    let raw_refs = out.refs.take().unwrap_or_default();
+                    let snapshot =
+                        crate::refs::global_ref_table().set_refs(ref_scope.clone(), raw_refs);
+                    crate::refs::global_ref_table().set_page_identity(
+                        ref_scope.clone(),
+                        out.page_target_id.clone(),
+                        out.page_loader_id.clone(),
+                    );
+                    crate::refs::save_refs_to_disk(&ref_scope, &snapshot.refs);
+                    out.refs = Some(snapshot.refs);
+                    out.axtree = out
+                        .axtree
+                        .take()
+                        .map(|tree| crate::refs::rewrite_axtree(&tree, &snapshot.token_map));
                     let resp = format_page_text_response(
                         out,
                         requested_format,
@@ -699,7 +976,7 @@ pub async fn dispatch(
                         Err(_) => sh_resp,
                     }
                 }
-                Err(_) => sh_resp,
+                Err(error) => ToolResponse::error(error.to_string()),
             }
         }
         "scrape" => {
@@ -741,35 +1018,29 @@ pub async fn dispatch(
                 .get("command")
                 .and_then(|v| v.as_str())
                 .unwrap_or("echo");
-            match ctx.docker.find(target).await {
-                Ok(sandbox) => {
-                    if !sandbox.allow_exec {
-                        return ToolResponse::error(format!(
-                            "exec capability denied: sandbox '{target}' was created without --allow-exec"
-                        ));
-                    }
-                }
-                Err(e) => {
-                    return ToolResponse::error(format!(
-                        "exec: failed to inspect sandbox '{target}': {e}"
-                    ));
-                }
-            }
             sh(ctx, target, screen, cmd).await
         }
         "page_text" => {
-            let url = match args.get("url").and_then(|v| v.as_str()) {
-                Some(u) if !u.is_empty() => u.to_string(),
-                _ => return ToolResponse::error("page_text: missing required `url`"),
+            let url = args
+                .get("url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let (profile_name, is_ephemeral) = match profile_for_tool(ctx, args, screen) {
+                Ok(profile) => profile,
+                Err(error) => return ToolResponse::error(error),
             };
-            let (profile_name, is_ephemeral) = resolve_profile_name(args, screen);
             let user_data_dir = if is_ephemeral {
                 profile_name.clone()
             } else {
                 ProfileMount::container_path_for(&profile_name)
             };
 
-            let declared_jars = parse_jars(args);
+            let declared_jars = if url.is_empty() {
+                Vec::new()
+            } else {
+                parse_jars(args)
+            };
             let hydrated_cookies = if !declared_jars.is_empty() {
                 ctx.cookie_jars
                     .map(|svc| svc.hydrate_jars(&declared_jars).cookies)
@@ -813,13 +1084,34 @@ pub async fn dispatch(
                 user_data_dir: Some(user_data_dir),
                 display: Some(display.clone()),
                 hydrated_cookies,
+                allowed_origins: allowed_origins_for(ctx, screen),
             };
             match ctx.docker.page_text(target, &opts).await {
-                Ok(out) => {
-                    if let Some(map) = &out.refs {
-                        crate::refs::global_ref_table().set_refs(target, screen, map.clone());
-                        crate::refs::save_refs_to_disk(target, screen, map);
+                Ok(mut out) => {
+                    if let Err(error) = validate_page_text_origin(ctx, screen, &out) {
+                        return error;
                     }
+                    if let Some(agent) = ctx.agent {
+                        agent.record_observation(screen);
+                    }
+                    let ref_scope = match current_ref_scope(ctx, target, screen).await {
+                        Ok(scope) => scope,
+                        Err(error) => return error,
+                    };
+                    let raw_refs = out.refs.take().unwrap_or_default();
+                    let snapshot =
+                        crate::refs::global_ref_table().set_refs(ref_scope.clone(), raw_refs);
+                    crate::refs::global_ref_table().set_page_identity(
+                        ref_scope.clone(),
+                        out.page_target_id.clone(),
+                        out.page_loader_id.clone(),
+                    );
+                    crate::refs::save_refs_to_disk(&ref_scope, &snapshot.refs);
+                    out.refs = Some(snapshot.refs);
+                    out.axtree = out
+                        .axtree
+                        .take()
+                        .map(|tree| crate::refs::rewrite_axtree(&tree, &snapshot.token_map));
                     if !declared_jars.is_empty() && !out.cookies.is_empty() {
                         if let Some(jars_svc) = ctx.cookie_jars {
                             let _ = jars_svc.dump_cookies_to_jars(&out.cookies, &declared_jars);
@@ -845,9 +1137,10 @@ pub async fn dispatch(
                 Some(u) if !u.is_empty() => u.to_string(),
                 _ => return ToolResponse::error("auth_handoff: missing required `url`"),
             };
-
-            let (profile_name, _) = resolve_profile_name(args, screen);
-
+            let (profile_name, is_ephemeral) = match profile_for_tool(ctx, args, screen) {
+                Ok(profile) => profile,
+                Err(error) => return ToolResponse::error(error),
+            };
             let opts = AuthHandoffOptions {
                 url: url.clone(),
                 wait_for_selector: args
@@ -862,7 +1155,11 @@ pub async fn dispatch(
                     .get("timeout_seconds")
                     .and_then(|v| v.as_u64())
                     .unwrap_or(300),
-                user_data_dir: Some(ProfileMount::container_path_for(&profile_name)),
+                user_data_dir: Some(if is_ephemeral {
+                    profile_name.clone()
+                } else {
+                    ProfileMount::container_path_for(&profile_name)
+                }),
                 display: Some(display.clone()),
                 storage_state: args.get("storage_state").and_then(|v| {
                     if let Some(s) = v.as_str() {
@@ -879,35 +1176,22 @@ pub async fn dispatch(
                     .map(str::to_string),
             };
 
-            // Resolve the noVNC URL up-front so we can include it in the
-            // response no matter which branch the helper takes.
-            let vnc = match ctx.docker.find(target).await {
-                Ok(sandbox) => novnc_url_for_screen(ctx, &sandbox, screen),
-                Err(_) => novnc_url(&ctx.public_host, 6080 + screen as u16),
-            };
+            // The server upgrades this relative path into an authenticated viewer session. Never
+            // expose a raw noVNC port, query token, or destination URL to the model.
+            let viewer_path = format!("/viewer/{screen}");
 
             match ctx.docker.auth_handoff(target, &opts).await {
                 Ok(out) => {
-                    if let Some(agent) = ctx.agent {
-                        if out.status == "auth_required" {
-                            let reason = opts
-                                .reason
-                                .clone()
-                                .or_else(|| Some("takeover requested".to_string()));
-                            let _ = agent.request_takeover(screen, reason, Some(vnc.clone()));
-                        } else if out.status == "authenticated" {
-                            let _ = agent.set_takeover(screen, false, None);
-                        }
-                    }
+                    let failed = !matches!(out.status.as_str(), "authenticated" | "auth_required");
                     let body = serde_json::json!({
                         "status": out.status,
-                        "vnc_url": vnc,
-                        "url": out.url,
+                        "vnc_url": viewer_path.clone(),
                         "message": out.message,
-                        "instructions": "Open the vnc_url in your browser to log in. Re-call \
+                        "instructions": "Open the authenticated viewer path in your browser to log in. Re-call \
                                           `auth_handoff` (with wait_for_*) or `page_text` once done.",
                     });
                     match serde_json::to_string_pretty(&body) {
+                        Ok(s) if failed => ToolResponse::error(s),
                         Ok(s) => ToolResponse::text(s),
                         Err(e) => ToolResponse::error(e.to_string()),
                     }
@@ -915,7 +1199,7 @@ pub async fn dispatch(
                 Err(e) => {
                     let body = serde_json::json!({
                         "status": "error",
-                        "vnc_url": vnc,
+                        "vnc_url": viewer_path,
                         "message": e.to_string(),
                     });
                     ToolResponse::error(
@@ -925,7 +1209,7 @@ pub async fn dispatch(
             }
         }
         "live_view" => match ctx.docker.find(target).await {
-            Ok(sb) => {
+            Ok(_sb) => {
                 let busy = if let Some(agent) = ctx.agent {
                     agent.is_busy(screen)
                 } else {
@@ -944,7 +1228,7 @@ pub async fn dispatch(
                 };
                 ToolResponse::text(
                     serde_json::json!({
-                        "novnc_url": novnc_url_for_screen(ctx, &sb, screen),
+                        "vnc_url": format!("/viewer/{screen}"),
                         "screen": screen,
                         "display": display,
                         "busy": busy,
@@ -1036,21 +1320,6 @@ mod tests {
         assert_eq!(requested_screen(&serde_json::json!({})), Ok(0));
         assert_eq!(requested_screen(&serde_json::json!({"screen": 0})), Ok(0));
         assert_eq!(requested_screen(&serde_json::json!({"screen": 1})), Ok(1));
-    }
-
-    #[test]
-    fn browse_command_uses_wrapper_and_profile() {
-        let cmd = browse_command(
-            "https://ex.com/a?b='c'",
-            "/home/sandbox/.config/google-chrome-profiles/default",
-        );
-        assert!(cmd.starts_with("mkdir -p"));
-        assert!(cmd.contains("reach-chrome "));
-        assert!(
-            cmd.contains("--user-data-dir='/home/sandbox/.config/google-chrome-profiles/default'")
-        );
-        assert!(cmd.contains("%27c%27"));
-        assert!(cmd.ends_with(" &"));
     }
 
     #[test]
@@ -1217,6 +1486,7 @@ mod tests {
                 name: "Submit".into(),
                 value: None,
                 selector: None,
+                backend_node_id: None,
                 point: Some([10.0, 20.0]),
                 box_bounds: Some([0.0, 0.0, 50.0, 20.0]),
                 focused: false,
@@ -1226,6 +1496,8 @@ mod tests {
 
         let out = crate::docker::PageTextOutput {
             status: "ok".into(),
+            page_target_id: None,
+            page_loader_id: None,
             text: Some("Page body text".into()),
             axtree: Some("[@e1: button \"Submit\" x=0 y=0 w=50 h=20]".into()),
             refs: Some(refs),
@@ -1262,6 +1534,8 @@ mod tests {
     fn test_format_page_text_formats() {
         let make_out = || crate::docker::PageTextOutput {
             status: "ok".into(),
+            page_target_id: None,
+            page_loader_id: None,
             text: Some("Visible text".into()),
             axtree: Some("[heading \"Title\"]".into()),
             refs: None,
@@ -1293,6 +1567,8 @@ mod tests {
 
         let out1 = crate::docker::PageTextOutput {
             status: "ok".into(),
+            page_target_id: None,
+            page_loader_id: None,
             text: None,
             axtree: Some(long_tree.clone()),
             refs: None,
@@ -1310,6 +1586,8 @@ mod tests {
 
         let out2 = crate::docker::PageTextOutput {
             status: "ok".into(),
+            page_target_id: None,
+            page_loader_id: None,
             text: None,
             axtree: Some(long_tree),
             refs: None,
@@ -1335,6 +1613,8 @@ mod tests {
 
         let out = crate::docker::PageTextOutput {
             status: "ok".into(),
+            page_target_id: None,
+            page_loader_id: None,
             text: Some("Sign in\nHelp & FAQs\nSearch items\nAdd Ground Beef to cart".into()),
             axtree: Some(tree.into()),
             refs: None,
@@ -1345,7 +1625,8 @@ mod tests {
         };
 
         // Query matching "beef ground"
-        let filtered = format_page_text_response(out.clone(), "axtree", "compact", 50, Some("beef ground"));
+        let filtered =
+            format_page_text_response(out.clone(), "axtree", "compact", 50, Some("beef ground"));
         assert_eq!(filtered.query.as_deref(), Some("beef ground"));
         assert_eq!(filtered.matches_count, Some(1));
         let axtree_content = filtered.axtree.unwrap();
@@ -1358,8 +1639,14 @@ mod tests {
         assert_eq!(help[0], "Run click(ref=\"@e4\")");
 
         // Query with no match
-        let nomatch = format_page_text_response(out, "axtree", "compact", 50, Some("nonexistent_item"));
+        let nomatch =
+            format_page_text_response(out, "axtree", "compact", 50, Some("nonexistent_item"));
         assert_eq!(nomatch.matches_count, Some(0));
-        assert!(nomatch.axtree.unwrap().contains("0 matching elements found"));
+        assert!(
+            nomatch
+                .axtree
+                .unwrap()
+                .contains("0 matching elements found")
+        );
     }
 }

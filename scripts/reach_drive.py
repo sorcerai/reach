@@ -15,6 +15,7 @@ import html
 import json
 import logging
 import os
+import hashlib
 import re
 import secrets
 import shutil
@@ -32,6 +33,26 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
+from scripts.reach_sensitive import redact_step, safe_url, write_json_private
+
+class ReachToolError(RuntimeError):
+    """Base error for an HTTP tool result that must stop the driver."""
+
+    status = "failed"
+
+class ApprovalRequiredError(ReachToolError):
+    status = "approval_required"
+
+    def __init__(self, digest: str) -> None:
+        super().__init__("approval required")
+        self.digest = digest
+
+class StaleObservationError(ReachToolError):
+    status = "stale_observation"
+
+class UncertainMutationError(ReachToolError):
+    status = "uncertain"
+
 logger = logging.getLogger("reach_drive")
 
 DEFAULT_API_URL = os.environ.get("REACH_AGENT_URL", "http://127.0.0.1:4200")
@@ -41,14 +62,6 @@ DEFAULT_TIMEOUT_SEC = 120
 
 ESTIMATED_TOKENS_PER_VLM_CALL = 1600
 ESTIMATED_COST_PER_VLM_CALL_USD = 0.00024
-
-DEFAULT_MUTATION_PATTERNS = [
-    r"\b(delete|destroy|remove|drop\s+table|wipe|purge|truncate)\b",
-    r"\b(pay|purchase|order|checkout|buy\s+now|confirm\s+payment|authorize\s+charge)\b",
-    r"\b(transfer|wire|send\s+money)\b",
-    r"\b(terminate\s+account|delete\s+account|close\s+account|cancel\s+subscription|deactivate\s+account)\b",
-    r"\b(rm\s+-rf|format\s+disk|drop\s+database)\b",
-]
 
 # Gauntlet-style control instruction delimiters
 AGY_CONTROL_PREFIX = [
@@ -69,16 +82,17 @@ Given the screenshot observation, page text snapshot, the goal, and recent histo
 Output ONLY the JSON object, no prose. Do NOT call external tools or execute commands.
 
 Schema:
-{"action":{"actionClass":"read_only|reversible_mutation","kind":"click|type|key|navigate|auth_required|terminate","ref":"@e1 (preferred)","point":[x,y],"target":"accessible name, element, or URL","value":"text to type if kind=type","key":"key combo if kind=key","button":"left|right|middle","description":"one short sentence"}}
+{"action":{"actionClass":"read_only|reversible_mutation","kind":"click|type|key|navigate|inject|auth_required|terminate","ref":"@e1 (preferred)","point":[x,y],"target":"accessible name, element, or URL","value":"text to type if kind=type","key":"key combo if kind=key","button":"left|right|middle","record_kind":"vault|card","id":"host record id (card only)","domain":"bound host domain","submit":true,"description":"one short sentence"}}
 
 Rules:
 - PREFER using "ref": "@eN" (e.g. "@e1", "@e4") from the Accessibility Tree snapshot instead of guessing coordinates! When "ref" is provided, "point" is not required.
 - For kind=click: provide "ref": "@eN" OR "point": [x, y]. "button" defaults to "left".
-- For kind=type: provide "ref": "@eN" to focus the element, and "value": "text to type".
+- For kind=type: provide "ref": "@eN" and a non-sensitive value. Never put passwords, PANs, CVVs, TOTP seeds, or generated codes in a proposal.
 - For kind=key: specify "key" as the key or combination to press (e.g. "Return", "Tab", "Escape", "BackSpace", "Up", "Down", "ctrl+a").
 - For kind=navigate: specify "target" or "value" as the URL to open.
+- For kind=inject: use only the authenticated server injection tool with record_kind, id (card only), domain, and submit. Never provide secret values or scripts.
 - For kind=auth_required: use when a login wall, 2FA prompt, CAPTCHA, or human verification is visible on the screen.
-- For kind=terminate: use when the goal has been achieved or no useful action remains. Describe the result in "description".
+- For kind=terminate: set "outcome" to "completed", "blocked", or "failed" and describe the result. Termination alone does not verify task success.
 """
 
 AUTH_SIGNALS_RE = re.compile(
@@ -87,7 +101,6 @@ AUTH_SIGNALS_RE = re.compile(
     r"verify it's you|confirm your identity|enter your password|log in to your account)\b",
     re.IGNORECASE,
 )
-
 
 @dataclass
 class Roi:
@@ -120,10 +133,9 @@ class Roi:
             )
         return None
 
-
 @dataclass
 class ReachAction:
-    kind: str  # click | type | key | navigate | wait | scroll | auth_required | terminate
+    kind: str  # click | type | key | navigate | inject | wait | scroll | auth_required | terminate
     action_class: str = "read_only"
     point: Optional[Tuple[int, int]] = None
     ref: Optional[str] = None
@@ -134,6 +146,11 @@ class ReachAction:
     description: str = ""
     requires_approval: bool = False
     roi: Optional[List[int]] = None
+    outcome: Optional[str] = None
+    record_kind: Optional[str] = None
+    record_id: Optional[str] = None
+    domain: Optional[str] = None
+    submit: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -141,6 +158,8 @@ class ReachAction:
             "action_class": self.action_class,
             "description": self.description,
         }
+        if self.outcome is not None:
+            d["outcome"] = self.outcome
         if self.ref is not None:
             d["ref"] = self.ref
         if self.point is not None:
@@ -157,8 +176,15 @@ class ReachAction:
             d["requires_approval"] = True
         if self.roi is not None:
             d["roi"] = self.roi
+        if self.record_kind is not None:
+            d["record_kind"] = self.record_kind
+        if self.record_id is not None:
+            d["id"] = self.record_id
+        if self.domain is not None:
+            d["domain"] = self.domain
+        if self.kind == "inject":
+            d["submit"] = self.submit
         return d
-
 
 @dataclass
 class StepRecord:
@@ -198,7 +224,6 @@ class StepRecord:
             d["roi_crop_path"] = self.roi_crop_path
         return d
 
-
 @dataclass
 class DriveResult:
     success: bool
@@ -213,6 +238,13 @@ class DriveResult:
     tokens_saved: int = 0
     cost_saved: float = 0.0
     metrics: Dict[str, Any] = field(default_factory=dict)
+    def __post_init__(self) -> None:
+        if self.status in {
+            "approval_required", "uncertain", "stale_observation",
+            "auth_required", "blocked", "failed", "unverified",
+            "postcondition_failed", "max_steps_exceeded",
+        }:
+            self.success = False
 
     def to_dict(self) -> Dict[str, Any]:
         d: Dict[str, Any] = {
@@ -234,7 +266,6 @@ class DriveResult:
             d["metrics"] = self.metrics
         return d
 
-
 def _read_image_bytes(img_input: Union[bytes, str, Path]) -> bytes:
     if isinstance(img_input, bytes):
         return img_input
@@ -251,7 +282,6 @@ def _read_image_bytes(img_input: Union[bytes, str, Path]) -> bytes:
                 "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
             )
     return b""
-
 
 def _decode_png(png_bytes: bytes) -> Tuple[int, int, int, int, bytearray]:
     """Decode PNG bytes into (width, height, color_type, bpp, raw_pixels)."""
@@ -321,7 +351,6 @@ def _decode_png(png_bytes: bytes) -> Tuple[int, int, int, int, bytearray]:
 
     return width, height, color_type, bpp, raw_pixels
 
-
 def _encode_png(width: int, height: int, color_type: int, raw_pixels: bytes) -> bytes:
     """Encode raw pixels into a standard valid PNG byte sequence."""
     bpp_map = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
@@ -350,7 +379,6 @@ def _encode_png(width: int, height: int, color_type: int, raw_pixels: bytes) -> 
         + _chunk(b"IDAT", compressed)
         + _chunk(b"IEND", b"")
     )
-
 
 def downsample_to_grayscale(
     img_input: Union[bytes, str, Path],
@@ -394,7 +422,6 @@ def downsample_to_grayscale(
             out.append(sum_lum // max(1, count))
     return out
 
-
 def compute_dhash(img_input: Union[bytes, str, Path], size: int = 8) -> int:
     """Compute difference hash (dHash) as an integer bitmask."""
     gray = downsample_to_grayscale(img_input, target_w=size + 1, target_h=size)
@@ -408,7 +435,6 @@ def compute_dhash(img_input: Union[bytes, str, Path], size: int = 8) -> int:
             dhash = (dhash << 1) | bit
     return dhash
 
-
 def compute_phash(img_input: Union[bytes, str, Path], size: int = 8) -> int:
     """Compute average perceptual hash (pHash / aHash) as an integer bitmask."""
     gray = downsample_to_grayscale(img_input, target_w=size, target_h=size)
@@ -418,7 +444,6 @@ def compute_phash(img_input: Union[bytes, str, Path], size: int = 8) -> int:
         bit = 1 if val >= mean else 0
         phash = (phash << 1) | bit
     return phash
-
 
 def calculate_visual_change(
     prev_img: Union[bytes, str, Path],
@@ -435,7 +460,6 @@ def calculate_visual_change(
     g2 = downsample_to_grayscale(b2, target_w=size, target_h=size)
     diff = sum(abs(p1 - p2) for p1, p2 in zip(g1, g2)) / (255.0 * len(g1))
     return max(0.0, min(1.0, diff))
-
 
 def crop_image(
     img_input: Union[bytes, str, Path],
@@ -487,7 +511,6 @@ def crop_image(
             f.write(out_png)
     return out_png
 
-
 def is_wait_or_scroll_action(action: Optional[ReachAction]) -> bool:
     """Check whether an action is a wait, scroll, or settle operation."""
     if action is None:
@@ -502,7 +525,6 @@ def is_wait_or_scroll_action(action: Optional[ReachAction]) -> bool:
     desc = (action.description or "").lower()
     return any(w in desc for w in ("wait", "scroll", "settle", "loading", "sleep"))
 
-
 @dataclass
 class GateDecision:
     should_skip_vlm: bool
@@ -510,7 +532,6 @@ class GateDecision:
     unchanged_ticks: int
     reason: str
     backoff_sec: float = 0.75
-
 
 class PerceptualChangeGate:
     """Perceptual hash change-detection gate preventing VLM token burn on static screens."""
@@ -622,98 +643,60 @@ class PerceptualChangeGate:
         self.previous_frame_bytes = None
         self.unchanged_ticks = 0
 
-
-class ApprovalGate:
-    """Policy interceptor for dangerous mutations requiring explicit approval."""
-
-    def __init__(
-        self,
-        patterns: Optional[List[str]] = None,
-        allow_mutations: bool = False,
-        require_approval: bool = False,
-        interactive: Optional[bool] = None,
-        approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
-    ) -> None:
-        raw_patterns = patterns if patterns is not None else DEFAULT_MUTATION_PATTERNS
-        self.regexes = [re.compile(p, re.IGNORECASE) for p in raw_patterns]
-        self.allow_mutations = allow_mutations
-        self.require_approval = require_approval
-        self.interactive = interactive if interactive is not None else sys.stdin.isatty()
-        self.approval_callback = approval_callback
-
-    def check_action(self, action: ReachAction) -> Tuple[bool, Optional[str]]:
-        """Check whether an action matches dangerous mutation policies."""
-        if str(action.action_class).lower() in (
-            "dangerous",
-            "irreversible_mutation",
-            "requires_approval",
-        ):
-            return True, f"Action class '{action.action_class}' is marked dangerous"
-
-        parts = [
-            action.target or "",
-            action.value or "",
-            action.description or "",
-            action.key or "",
-        ]
-        text_to_scan = " ".join(parts)
-        for rx in self.regexes:
-            m = rx.search(text_to_scan)
-            if m:
-                return True, f"Matches dangerous pattern '{m.group(0)}'"
-
-        return False, None
-
-    def evaluate(self, action: ReachAction) -> Tuple[bool, Optional[str], bool]:
-        """Evaluate action. Returns (is_dangerous, reason, approved)."""
-        is_dangerous, reason = self.check_action(action)
-        if not is_dangerous:
-            return False, None, True
-
-        action.action_class = "REQUIRES_APPROVAL"
-        action.requires_approval = True
-
-        if self.allow_mutations:
-            logger.info("Dangerous action approved via allow_mutations: %s", reason)
-            return True, reason, True
-
-        if self.approval_callback is not None:
-            approved = bool(self.approval_callback(action, reason or ""))
-            return True, reason, approved
-
-        if not self.interactive or self.require_approval:
-            return True, reason, False
-
-        return True, reason, self._prompt_user(action, reason or "")
-
-    def _prompt_user(self, action: ReachAction, reason: str) -> bool:
-        sys.stderr.write(
-            f"\n[APPROVAL GATE] Dangerous action detected: {reason}\n"
-            f"Action: {json.dumps(action.to_dict())}\n"
-            f"Approve and proceed? [y/N]: "
-        )
-        sys.stderr.flush()
-        try:
-            ans = sys.stdin.readline().strip().lower()
-            return ans in ("y", "yes")
-        except Exception:
-            return False
-
-
 def _generate_task_id() -> str:
     ts = time.strftime("%Y%m%d_%H%M%S")
     rand_suffix = secrets.token_hex(3)
     return f"task_{ts}_{rand_suffix}"
 
+def _identity_digest(value: Optional[Any]) -> str:
+    """Return a stable opaque filesystem key for an external identity."""
+    identity = "default" if value is None else str(value)
+    return hashlib.sha256(identity.encode("utf-8")).hexdigest()
 
-def _resolve_audit_dir(custom_dir: Optional[Union[str, Path]], task_id: str) -> Path:
+def _lease_receipt_fields(data: Any) -> Tuple[str, int]:
+    """Validate a complete lease receipt before installing capability state."""
+    if not isinstance(data, dict):
+        raise ValueError("lease receipt must be an object")
+    token = data.get("token")
+    generation = data.get("handoff_gen")
+    if not isinstance(token, str) or not token.strip():
+        raise ValueError("lease receipt token is invalid")
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise ValueError("lease receipt generation is invalid")
+    return token, generation
+
+def _handoff_ack_generation(data: Any, previous_generation: Optional[int]) -> int:
+    """Validate a successful HumanDone -> AgentActive handback receipt."""
+    if not isinstance(data, dict):
+        raise ValueError("handback receipt must be an object")
+    if data.get("status") != "ok" or data.get("phase") != "AgentActive":
+        raise ValueError("handback receipt does not confirm AgentActive")
+    generation = data.get("handoff_gen")
+    if isinstance(generation, bool) or not isinstance(generation, int):
+        raise ValueError("handback receipt generation is invalid")
+    if previous_generation is not None and generation <= previous_generation:
+        raise ValueError("handback receipt generation was not updated")
+    return generation
+
+def _resolve_audit_dir(
+    custom_dir: Optional[Union[str, Path]],
+    task_id: str,
+    attempt_id: Optional[str] = None,
+) -> Path:
     if custom_dir:
-        return Path(custom_dir)
-    workspace = Path("/workspace")
-    if workspace.exists() and os.access(workspace, os.W_OK):
-        return workspace / "reports" / task_id
-    return Path.home() / ".reach" / "audit" / task_id
-
+        audit_root = Path(custom_dir).expanduser().resolve()
+    else:
+        workspace = Path("/workspace")
+        if workspace.exists() and os.access(workspace, os.W_OK):
+            audit_root = (workspace / "reports").resolve()
+        else:
+            audit_root = (Path.home() / ".reach" / "audit").resolve()
+    candidate = audit_root / _identity_digest(task_id) / _identity_digest(attempt_id)
+    try:
+        candidate.relative_to(audit_root)
+    except ValueError as exc:
+        raise ValueError("audit identity escaped configured root") from exc
+    return candidate
 
 def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> str:
     """Generate an HTML visual audit report showing step-by-step diffs and reel."""
@@ -1100,6 +1083,9 @@ def generate_html_report(audit_dir: Union[str, Path], meta: Dict[str, Any]) -> s
 
     return str(report_file.resolve())
 
+class _NoReachRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
 
 class ReachDriver:
     """CUA Driver coordinating Reach sandbox execution and Gemini 3.8 Flash via agy."""
@@ -1115,13 +1101,8 @@ class ReachDriver:
         max_steps: int = 20,
         timeout_sec: int = DEFAULT_TIMEOUT_SEC,
         workdir: Optional[str] = None,
-        task_id: Optional[str] = None,
         audit_dir: Optional[Union[str, Path]] = None,
         enable_audit: bool = True,
-        allow_mutations: bool = False,
-        require_approval: bool = False,
-        approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
-        interactive: Optional[bool] = None,
         min_change_threshold: float = 0.01,
         max_unchanged_ticks: int = 3,
         backoff_sec: float = 0.75,
@@ -1129,10 +1110,15 @@ class ReachDriver:
         lease_token: Optional[str] = None,
         handoff_gen: Optional[int] = None,
         step_callback: Optional[Callable[[StepRecord], None]] = None,
+        task_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+        completion_text: Optional[str] = None,
+        auth_token: Optional[str] = None,
     ) -> None:
         self.api_url = api_url.rstrip("/")
         self.screen = screen
         self.model = model
+        self.model_receipts: List[Dict[str, Any]] = []
         self.agy_bin = self._resolve_agy(agy_bin)
         self.reach_bin = reach_bin or shutil.which("reach") or "reach"
         self.sandbox = sandbox
@@ -1140,7 +1126,8 @@ class ReachDriver:
         self.timeout_sec = timeout_sec
         self.workdir = workdir
         self.task_id = task_id or _generate_task_id()
-        self.audit_dir = _resolve_audit_dir(audit_dir, self.task_id)
+        self.attempt_id = attempt_id
+        self.audit_dir = _resolve_audit_dir(audit_dir, self.task_id, self.attempt_id)
         self.enable_audit = enable_audit
         self.min_change_threshold = min_change_threshold
         self.max_unchanged_ticks = max_unchanged_ticks
@@ -1148,17 +1135,20 @@ class ReachDriver:
         self.roi = Roi.from_value(roi) if roi is not None else None
         self.lease_token = lease_token
         self.handoff_gen = handoff_gen
+        self.observation_gen: Optional[int] = None
+        self._reconciliation_token: Optional[str] = None
+        self.last_lease_cleanup: Optional[Dict[str, str]] = None
+        self._last_observation_meta: Dict[str, Any] = {}
         self.step_callback = step_callback
+        if completion_text is not None and not completion_text.strip():
+            raise ValueError("completion_text must be nonempty")
+        self.completion_text = completion_text
+        self._supervisor_token = None if lease_token else (auth_token or os.environ.get("REACH_AUTH_TOKEN"))
+        self._api_opener = urllib.request.build_opener(_NoReachRedirect())
         self.change_gate = PerceptualChangeGate(
             min_change_threshold=min_change_threshold,
             max_unchanged_ticks=max_unchanged_ticks,
             backoff_sec=backoff_sec,
-        )
-        self.approval_gate = ApprovalGate(
-            allow_mutations=allow_mutations,
-            require_approval=require_approval,
-            interactive=interactive,
-            approval_callback=approval_callback,
         )
         self._temp_dir_obj: Optional[tempfile.TemporaryDirectory[str]] = None
 
@@ -1172,67 +1162,82 @@ class ReachDriver:
                 logger.warning("Step callback failed: %s", cb_err)
 
     def _archive_screenshot(self, src_path: str, filename: str) -> Optional[str]:
-        """Save a screenshot into the visual audit directory."""
-        if not self.enable_audit:
-            return None
-        try:
-            self.audit_dir.mkdir(parents=True, exist_ok=True)
-            dst_path = self.audit_dir / filename
-            if os.path.isfile(src_path):
-                shutil.copyfile(src_path, dst_path)
-            else:
-                dst_path.touch()
-            return str(dst_path.resolve())
-        except Exception as e:
-            logger.debug("Failed to archive screenshot %s: %s", filename, e)
-            return None
+        """Do not persist raw screen captures in the durable audit record."""
+        return None
+
+    def _model_metrics(self) -> Dict[str, Any]:
+        """Return measured receipts, with estimates clearly separated."""
+        measured: Dict[str, Any] = {}
+        if self.model_receipts:
+            measured["receipts"] = list(self.model_receipts)
+            latest = self.model_receipts[-1]
+            for key in ("model_reported", "model_version"):
+                if latest.get(key) is not None:
+                    measured[key] = latest[key]
+        measured["model_requested"] = self.model
+        measured["estimated_tokens_per_call"] = ESTIMATED_TOKENS_PER_VLM_CALL
+        measured["estimated_cost_per_call_usd"] = ESTIMATED_COST_PER_VLM_CALL_USD
+        return measured
 
     def _finalize_audit(
         self, result: DriveResult, goal: str, start_time: float, end_time: float
     ) -> Optional[str]:
-        """Write audit_meta.json and generate HTML visual audit report."""
-        if not self.enable_audit:
-            return None
+        """Write a private, metadata-only audit report."""
         try:
-            self.audit_dir.mkdir(parents=True, exist_ok=True)
-            meta = {
-                "task_id": self.task_id,
-                "goal": goal,
-                "screen": self.screen,
-                "model": self.model,
-                "status": result.status,
-                "success": result.success,
-                "final_description": result.final_description,
-                "start_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(start_time)),
-                "end_time": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(end_time)),
-                "duration_sec": round(max(0.0, end_time - start_time), 2),
-                "takeover_url": result.takeover_url,
-                "error": result.error,
+            duration_sec = round(max(0.0, end_time - start_time), 2)
+            metrics = {
+                "total_frames_evaluated": self.change_gate.total_frames_evaluated,
+                "total_vlm_calls": self.change_gate.total_vlm_calls,
                 "skipped_vlm_ticks": self.change_gate.skipped_vlm_ticks,
-                "tokens_saved": self.change_gate.tokens_saved,
-                "cost_saved": round(self.change_gate.cost_saved, 5),
-                "metrics": {
-                    "total_frames_evaluated": self.change_gate.total_frames_evaluated,
-                    "total_vlm_calls": self.change_gate.total_vlm_calls,
-                    "skipped_vlm_ticks": self.change_gate.skipped_vlm_ticks,
-                    "tokens_saved": self.change_gate.tokens_saved,
-                    "cost_saved": round(self.change_gate.cost_saved, 5),
-                    "min_change_threshold": self.min_change_threshold,
-                    "max_unchanged_ticks": self.max_unchanged_ticks,
-                    "cache_hit_rate": round(self.change_gate.cache_hit_rate, 4),
-                },
-                "steps": [s.to_dict() for s in result.steps],
+                "tokens_saved_estimate": self.change_gate.tokens_saved,
+                "cost_saved_estimate_usd": round(self.change_gate.cost_saved, 5),
+                "min_change_threshold": self.min_change_threshold,
+                "max_unchanged_ticks": self.max_unchanged_ticks,
+                "cache_hit_rate": round(self.change_gate.cache_hit_rate, 4),
+                **self._model_metrics(),
             }
-            result.skipped_vlm_ticks = self.change_gate.skipped_vlm_ticks
             result.tokens_saved = self.change_gate.tokens_saved
             result.cost_saved = self.change_gate.cost_saved
-            result.metrics = meta["metrics"]
+            result.metrics = metrics
+            result.skipped_vlm_ticks = self.change_gate.skipped_vlm_ticks
+            if not self.enable_audit:
+                return None
+            def redacted_step(step: StepRecord) -> Dict[str, Any]:
+                raw = step.to_dict()
+                cleaned: Dict[str, Any] = {
+                    "step_index": step.step_index,
+                    "action": redact_step(raw.get("action", {})),
+                }
+                if step.timestamp is not None:
+                    cleaned["timestamp"] = step.timestamp
+                if step.visual_change is not None:
+                    cleaned["visual_change"] = round(step.visual_change, 4)
+                if step.vlm_cached:
+                    cleaned["vlm_cached"] = True
+                return cleaned
 
+            meta = {
+                "task_id": _identity_digest(self.task_id),
+                "attempt_id": _identity_digest(self.attempt_id),
+                "model_requested": self.model,
+                "status": result.status,
+                "success": result.success,
+                "duration_sec": duration_sec,
+                "takeover_url": safe_url(result.takeover_url) if result.takeover_url else None,
+                "steps": [redacted_step(s) for s in result.steps],
+                "metrics": metrics,
+                "error_present": result.error is not None,
+            }
+            self.audit_dir.mkdir(parents=True, exist_ok=True)
             meta_file = self.audit_dir / "audit_meta.json"
-            with open(meta_file, "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
-
-            report_file = generate_html_report(self.audit_dir, meta)
+            write_json_private(meta_file, meta)
+            report_file = generate_html_report(self.audit_dir, {
+                **meta,
+                "goal": "[REDACTED]",
+                "final_description": "[REDACTED]",
+                "error": None,
+            })
+            os.chmod(report_file, 0o600)
             result.audit_report_path = report_file
             result.task_id = self.task_id
             return report_file
@@ -1274,51 +1279,120 @@ class ReachDriver:
     # Reach API interactions
     # --------------------------------------------------------------------------
 
+    def _api_headers(self, *, supervisor: bool = False) -> Dict[str, str]:
+        headers = {"content-type": "application/json"}
+        if supervisor:
+            if self._supervisor_token:
+                headers["Authorization"] = "Bearer " + self._supervisor_token
+        elif self.lease_token:
+            headers["X-Lease-Token"] = self.lease_token
+            if self.handoff_gen is not None:
+                headers["X-Handoff-Gen"] = str(self.handoff_gen)
+            if self.observation_gen is not None:
+                headers["X-Observation-Gen"] = str(self.observation_gen)
+        return headers
+
     def get_screens(self) -> List[Dict[str, Any]]:
         """Fetch all screen states from Reach server."""
-        req = urllib.request.Request(f"{self.api_url}/agent/screens", method="GET")
+        req = urllib.request.Request(f"{self.api_url}/agent/screens",
+                                     headers=self._api_headers(supervisor=self.lease_token is None), method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with self._api_opener.open(req, timeout=10) as r:
                 screens = json.loads(r.read().decode("utf-8") or "[]")
-                if isinstance(screens, list):
-                    for s in screens:
-                        if isinstance(s, dict) and s.get("id") == self.screen and "handoff_gen" in s:
-                            self.handoff_gen = int(s["handoff_gen"])
                 return screens
         except Exception as e:
             logger.warning("Failed to query screens from %s: %s", self.api_url, e)
             return []
 
-    def lease_screen(self, owner: str) -> Dict[str, Any]:
-        """Lease current screen for owner."""
+    def lease_screen(
+        self,
+        owner: str,
+        task_id: Optional[str] = None,
+        attempt_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Lease the current screen and bind optional task/attempt identity."""
+        self.last_lease_cleanup = None
+        payload: Dict[str, Any] = {"owner": owner}
+        lease_task_id = self.task_id if task_id is None else task_id
+        lease_attempt_id = self.attempt_id if attempt_id is None else attempt_id
+        if lease_task_id is not None:
+            payload["task_id"] = str(lease_task_id)
+        if lease_attempt_id is not None:
+            payload["attempt_id"] = str(lease_attempt_id)
+        if task_id is not None:
+            self.task_id = str(task_id)
+        if attempt_id is not None:
+            self.attempt_id = str(attempt_id)
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/lease",
-            data=json.dumps({"owner": owner}).encode("utf-8"),
-            headers={"content-type": "application/json"},
+            data=json.dumps(payload).encode("utf-8"),
+            headers=self._api_headers(supervisor=True),
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                data = json.loads(r.read().decode("utf-8") or "{}")
-                if isinstance(data, dict):
-                    if data.get("token"):
-                        self.lease_token = data["token"]
-                    if "handoff_gen" in data:
-                        self.handoff_gen = int(data["handoff_gen"])
+            with self._api_opener.open(req, timeout=10) as r:
+                try:
+                    data = json.loads(r.read().decode("utf-8") or "{}")
+                except (TypeError, UnicodeError, ValueError) as exc:
+                    self.last_lease_cleanup = {"status": "uncertain"}
+                    raise RuntimeError(
+                        "Lease outcome uncertain; reconciliation required"
+                    ) from None
+                candidate_token = data.get("token") if isinstance(data, dict) else None
+                try:
+                    token, generation = _lease_receipt_fields(data)
+                except ValueError as exc:
+                    cleanup_status = "uncertain"
+                    if isinstance(candidate_token, str) and candidate_token.strip():
+                        self._reconciliation_token = candidate_token
+                        cleanup = self.release_screen(owner, token=candidate_token)
+                        cleanup_status = (
+                            "confirmed"
+                            if isinstance(cleanup, dict)
+                            and cleanup.get("released") is True
+                            else "uncertain"
+                        )
+                    self.last_lease_cleanup = {"status": cleanup_status}
+                    raise RuntimeError(
+                        f"Invalid lease receipt; cleanup={cleanup_status}"
+                    ) from None
+                self.lease_token = token
+                self.handoff_gen = generation
+                self.observation_gen = None
+                self._last_observation_meta = {}
+                self._reconciliation_token = None
+                self.last_lease_cleanup = None
                 return data
         except urllib.error.HTTPError as e:
-            body = e.read().decode("utf-8", errors="replace")
-            logger.error("Lease screen failed (%s): %s", e.code, body)
-            raise RuntimeError(f"HTTP {e.code}: {body}") from e
+            if e.code == 408 or e.code >= 500:
+                self.last_lease_cleanup = {"status": "uncertain"}
+                logger.error("Lease screen outcome uncertain; reconciliation required")
+                raise RuntimeError(
+                    "Lease outcome uncertain; reconciliation required"
+                ) from None
+            self.last_lease_cleanup = {"status": "not_required"}
+            logger.error("Lease screen failed (HTTP %s)", e.code)
+            raise RuntimeError(f"HTTP {e.code}") from e
+        except RuntimeError:
+            raise
+        except Exception:
+            self.last_lease_cleanup = {"status": "uncertain"}
+            logger.error("Lease screen outcome uncertain; reconciliation required")
+            raise RuntimeError(
+                "Lease outcome uncertain; reconciliation required"
+            ) from None
 
-    def release_screen(self, owner: str) -> Dict[str, Any]:
-        """Release leased screen."""
-        headers = {"content-type": "application/json"}
-        if self.lease_token:
-            headers["x-lease-token"] = self.lease_token
+    def release_screen(
+        self, owner: str, token: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Release leased screen and clear state only after confirmation."""
+        active_token = token or self.lease_token or self._reconciliation_token
+        headers = (
+            {"Content-Type": "application/json", "X-Lease-Token": active_token}
+            if active_token
+            else self._api_headers()
+        )
         payload = {"owner": owner}
-        if self.lease_token:
-            payload["token"] = self.lease_token
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/lease",
             data=json.dumps(payload).encode("utf-8"),
@@ -1326,8 +1400,15 @@ class ReachDriver:
             method="DELETE",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
-                return json.loads(r.read().decode("utf-8") or "{}")
+            with self._api_opener.open(req, timeout=10) as r:
+                response = json.loads(r.read().decode("utf-8") or "{}")
+                if isinstance(response, dict) and response.get("released") is True:
+                    self.lease_token = None
+                    self.handoff_gen = None
+                    self.observation_gen = None
+                    self._last_observation_meta = {}
+                    self._reconciliation_token = None
+                return response
         except Exception as e:
             logger.warning("Release screen %s failed: %s", self.screen, e)
             return {"error": str(e)}
@@ -1344,9 +1425,7 @@ class ReachDriver:
             payload["url"] = url
         if reason:
             payload["reason"] = reason
-        headers = {"content-type": "application/json"}
-        if self.lease_token:
-            headers["x-lease-token"] = self.lease_token
+        headers = self._api_headers()
         req = urllib.request.Request(
             f"{self.api_url}/agent/screens/{self.screen}/takeover",
             data=json.dumps(payload).encode("utf-8"),
@@ -1354,7 +1433,7 @@ class ReachDriver:
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=10) as r:
+            with self._api_opener.open(req, timeout=10) as r:
                 data = json.loads(r.read().decode("utf-8") or "{}")
                 if isinstance(data, dict) and "handoff_gen" in data:
                     self.handoff_gen = int(data["handoff_gen"])
@@ -1364,56 +1443,110 @@ class ReachDriver:
             return {"error": str(e)}
 
     def get_novnc_url(self) -> str:
-        """Resolve noVNC URL for current screen."""
-        screens = self.get_screens()
-        for s in screens:
-            if s.get("id") == self.screen:
-                return s.get("novnc_url", "")
-        # Fallback to default port calculation
-        host = urllib.parse.urlparse(self.api_url).hostname or "localhost"
-        return (
-            f"http://{host}:{6080 + self.screen}/vnc.html?autoconnect=1&resize=remote"
-        )
+        """Construct the authenticated viewer URL for this screen."""
+        origin = safe_url(self.api_url)
+        if not origin.startswith(("http://", "https://")):
+            raise ValueError("invalid Reach API origin")
+        return f"{origin}/viewer/{self.screen}"
 
     def call_mcp_tool(
-        self, tool_name: str, arguments: Dict[str, Any]
+        self,
+        tool_name: str,
+        arguments: Dict[str, Any],
+        *,
+        mutation: bool = False,
     ) -> Dict[str, Any]:
-        """Send JSON-RPC 2.0 tools/call to Reach MCP endpoint."""
+        """Call a Reach tool, fencing observations and mutation outcomes."""
         args_with_screen = dict(arguments)
         if "screen" not in args_with_screen:
             args_with_screen["screen"] = self.screen
         if self.sandbox and "sandbox" not in args_with_screen:
             args_with_screen["sandbox"] = self.sandbox
-
+        mutation = mutation or tool_name in {
+            "browse", "click", "type", "key", "exec", "playwright_eval", "inject"
+        }
+        if self.lease_token and self.handoff_gen is None:
+            raise RuntimeError("Lease requires an explicitly observed handoff generation")
         req_body = {
             "jsonrpc": "2.0",
             "id": int(time.time() * 1000) % 1_000_000,
             "method": "tools/call",
             "params": {"name": tool_name, "arguments": args_with_screen},
         }
-        headers = {"content-type": "application/json"}
-        if self.lease_token:
-            headers["x-lease-token"] = self.lease_token
-            if self.handoff_gen is None:
-                self.get_screens()
-            if self.handoff_gen is not None:
-                headers["x-handoff-gen"] = str(self.handoff_gen)
         req = urllib.request.Request(
             f"{self.api_url}/mcp",
             data=json.dumps(req_body).encode("utf-8"),
-            headers=headers,
+            headers=self._api_headers(),
             method="POST",
         )
         try:
-            with urllib.request.urlopen(req, timeout=60) as r:
+            with self._api_opener.open(req, timeout=60) as r:
                 resp = json.loads(r.read().decode("utf-8") or "{}")
-                if "error" in resp:
-                    raise RuntimeError(f"MCP RPC Error: {resp['error']}")
-                return resp.get("result", {})
-        except urllib.error.URLError as e:
-            raise RuntimeError(
-                f"Failed to connect to Reach MCP at {self.api_url}/mcp: {e}"
-            ) from e
+        except urllib.error.HTTPError as exc:
+            raw = exc.read().decode("utf-8", errors="replace")
+            try:
+                body = json.loads(raw)
+            except json.JSONDecodeError:
+                body = {}
+            error = body.get("error") if isinstance(body, dict) else None
+            if exc.code == 428 and error == "approval_required":
+                raise ApprovalRequiredError(body.get("digest", "")) from exc
+            if exc.code == 409 and error in {
+                "stale_plan", "fresh_observation_required", "missing_handoff_gen",
+                "stale_computer_incarnation", "stale_observation",
+            }:
+                raise StaleObservationError(str(error)) from exc
+            if mutation and exc.code >= 500:
+                raise UncertainMutationError("server failed during mutation; reconcile before retry") from exc
+            raise ReachToolError(f"HTTP {exc.code}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            if mutation:
+                raise UncertainMutationError(
+                    "transport failure during mutation; outcome is uncertain"
+                ) from exc
+            raise RuntimeError("Reach tool transport failure") from exc
+
+        if not isinstance(resp, dict):
+            raise UncertainMutationError("malformed mutation response") if mutation else ReachToolError("malformed tool response")
+        if "error" in resp:
+            raise UncertainMutationError("ambiguous mutation RPC failure") if mutation else ReachToolError("MCP RPC tool error")
+        result = resp.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("content"), list):
+            raise UncertainMutationError("malformed mutation receipt") if mutation else ReachToolError("malformed tool receipt")
+        meta = result.get("_meta")
+        if isinstance(meta, dict):
+            self._last_observation_meta = dict(meta)
+            if isinstance(meta.get("observation_gen"), int):
+                self.observation_gen = meta["observation_gen"]
+        if result.get("isError") is not False:
+            for part in result["content"]:
+                if not isinstance(part, dict) or part.get("type") != "text":
+                    continue
+                try:
+                    failure = json.loads(part.get("text", ""))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if not isinstance(failure, dict):
+                    continue
+                code = failure.get("error")
+                if code == "approval_required":
+                    raise ApprovalRequiredError(failure.get("digest", ""))
+                if code in {"stale_plan", "fresh_observation_required", "missing_handoff_gen", "stale_computer_incarnation", "stale_observation"}:
+                    raise StaleObservationError(str(code))
+                if failure.get("status") == "uncertain" or code == "executed_during_takeover":
+                    raise UncertainMutationError("mutation outcome requires reconciliation")
+                if isinstance(failure.get("http_status"), int) and failure["http_status"] < 500:
+                    raise ReachToolError("server rejected tool request")
+            raise UncertainMutationError("ambiguous mutation failure") if mutation else ReachToolError("tool failed")
+        for part in result["content"]:
+            if isinstance(part, dict) and part.get("type") == "text":
+                try:
+                    body = json.loads(part.get("text", ""))
+                except (TypeError, json.JSONDecodeError):
+                    continue
+                if isinstance(body, dict) and body.get("status") == "uncertain":
+                    raise UncertainMutationError("server reported uncertain mutation")
+        return result
 
     # --------------------------------------------------------------------------
     # Observation capture
@@ -1434,7 +1567,10 @@ class ReachDriver:
                     with open(screenshot_path, "wb") as f:
                         f.write(img_data)
                     return screenshot_path
+            raise RuntimeError("Reach returned no screenshot")
         except Exception as mcp_err:
+            if self.lease_token:
+                raise RuntimeError("Leased screenshot capture failed; refusing local fallback") from mcp_err
             logger.debug("MCP screenshot failed (%s), trying CLI", mcp_err)
 
         # Fallback to Reach CLI
@@ -1455,26 +1591,20 @@ class ReachDriver:
         except Exception as cli_err:
             logger.warning("CLI screenshot error: %s", cli_err)
 
-        # Fallback: create a 1x1 placeholder PNG if screenshot capture completely fails
-        # so agy can still run or report error
-        if not os.path.isfile(screenshot_path):
-            with open(screenshot_path, "wb") as f:
-                f.write(
-                    base64.b64decode(
-                        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg=="
-                    )
-                )
-        return screenshot_path
+        raise RuntimeError("Screenshot capture failed; no observation is available")
 
     def capture_page_text(self, current_url: Optional[str] = None) -> str:
-        """Capture DOM/page text snapshot with accessibility tree semantic refs."""
-        if not current_url:
-            return ""
+        """Observe the live tab by default; only an explicit URL requests navigation."""
+        arguments: Dict[str, Any] = {"timeout_ms": 15000, "view": "full"}
+        if current_url:
+            arguments["url"] = current_url
         try:
             res = self.call_mcp_tool(
                 "page_text",
-                {"url": current_url, "timeout_ms": 15000, "use_profile": "default"},
+                arguments,
             )
+            if res.get("isError"):
+                return ""
             content = res.get("content", [])
             for part in content:
                 if part.get("type") == "text":
@@ -1482,17 +1612,19 @@ class ReachDriver:
                     try:
                         parsed = json.loads(raw)
                         if isinstance(parsed, dict):
+                            if parsed.get("status") != "ok":
+                                continue
                             axtree = parsed.get("axtree")
                             text = parsed.get("text")
                             if axtree and text:
-                                return f"Accessibility Tree (Interact via @eN refs):\n{axtree}\n\nVisible Text Summary:\n{text[:600]}"
+                                return f"Accessibility Tree (Interact via @eN refs):\n{axtree}\n\nVisible Text:\n{text}"
                             elif axtree:
                                 return f"Accessibility Tree (Interact via @eN refs):\n{axtree}"
                             elif text:
                                 return text
                     except Exception:
                         pass
-                    return raw
+                    return ""
         except Exception as e:
             logger.debug("Page text capture failed: %s", e)
         return ""
@@ -1514,8 +1646,8 @@ class ReachDriver:
         for step in history[-6:]:
             a = step.action
             point_str = f" @ {a.point}" if a.point else ""
-            val_str = f' "{a.value}"' if a.value else ""
-            err_str = f" ERROR: {step.error}" if step.error else ""
+            val_str = "" if a.kind in {"type", "inject"} else (f' "{a.value}"' if a.value else "")
+            err_str = " ERROR" if step.error else ""
             history_lines.append(
                 f"  #{step.step_index} {a.kind}{point_str}{val_str} -> {a.description}{err_str}"
             )
@@ -1543,39 +1675,66 @@ class ReachDriver:
         return "\n\n".join(user_prompt)
 
     def invoke_agy(self, prompt: str, screenshot_path: str) -> str:
-        """Execute agy with gemini-3.8-flash-high in non-interactive plan mode."""
+        """Execute agy and retain only non-sensitive response measurements."""
         screenshot_dir = os.path.dirname(os.path.abspath(screenshot_path))
         timeout_str = f"{max(1, self.timeout_sec)}s"
         cmd = [
-            self.agy_bin,
-            "--model",
-            self.model,
-            "--output-format",
-            "json",
-            "--disable-slash-commands",
-            "--sandbox",
-            "--mode",
-            "plan",
-            "--print-timeout",
-            timeout_str,
-            "--add-dir",
-            screenshot_dir,
-            "-p",
-            prompt,
+            self.agy_bin, "--model", self.model, "--output-format", "json",
+            "--disable-slash-commands", "--sandbox", "--mode", "plan",
+            "--print-timeout", timeout_str, "--add-dir", screenshot_dir,
+            "-p", prompt,
         ]
-
-        logger.debug("Executing agy: %s", " ".join(cmd[:10]) + " ...")
+        logger.debug("Executing agy model %s", self.model)
+        started = time.perf_counter()
         proc = subprocess.run(
             cmd,
             capture_output=True,
             text=True,
+            env={key: value for key, value in os.environ.items()
+                 if key not in ("REACH_AUTH_TOKEN", "REACH_LEASE_TOKEN")},
             timeout=self.timeout_sec + 15,
         )
-
-        if proc.returncode != 0 and not proc.stdout:
-            raise RuntimeError(
-                f"agy exited with code {proc.returncode}: {proc.stderr or proc.stdout}"
-            )
+        elapsed_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        if proc.returncode != 0:
+            raise RuntimeError(f"agy exited with code {proc.returncode}")
+        try:
+            envelope = json.loads(proc.stdout)
+        except (TypeError, json.JSONDecodeError):
+            envelope = {}
+        receipt: Dict[str, Any] = {
+            "latency_ms_measured": elapsed_ms,
+            "estimated": {"latency_ms_measured": False},
+        }
+        if isinstance(envelope, dict):
+            for dest, names in {
+                "model_reported": ("model",),
+                "model_version": ("model_version", "version"),
+                "latency_ms": ("latency_ms", "latency"),
+                "input_tokens": ("input_tokens", "prompt_tokens"),
+                "output_tokens": ("output_tokens", "completion_tokens"),
+                "total_tokens": ("total_tokens",),
+            }.items():
+                for name in names:
+                    value = envelope.get(name)
+                    if isinstance(value, (str, int, float)) and not isinstance(value, bool) and value != "":
+                        receipt[dest] = value
+                        receipt["estimated"][dest] = False
+                        break
+            usage = envelope.get("usage")
+            if isinstance(usage, dict):
+                for dest, names in {
+                    "input_tokens": ("input_tokens", "prompt_tokens"),
+                    "output_tokens": ("output_tokens", "completion_tokens"),
+                    "total_tokens": ("total_tokens",),
+                }.items():
+                    if dest not in receipt:
+                        for name in names:
+                            value = usage.get(name)
+                            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                                receipt[dest] = value
+                                receipt["estimated"][dest] = False
+                                break
+        self.model_receipts.append(receipt)
         return proc.stdout
 
     def parse_action(self, agy_stdout: str) -> ReachAction:
@@ -1603,129 +1762,92 @@ class ReachDriver:
 
     @classmethod
     def extract_action_from_text(cls, text: str) -> ReachAction:
-        """Extract balanced JSON object containing 'action' from text."""
-        # Find balanced {...} blocks scanning backwards from last '{'
-        start = text.rfind("{")
-        while start != -1:
-            obj = cls._parse_balanced_at(text, start)
-            if obj is not None and isinstance(obj, dict) and "action" in obj:
-                action_data = obj["action"]
-                if isinstance(action_data, dict):
-                    return cls._map_action_dict(action_data)
-            start = text.rfind("{", 0, start)
-
-        # Fallback regex for markdown ```json blocks
-        match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(1))
-                if isinstance(parsed, dict) and "action" in parsed:
-                    return cls._map_action_dict(parsed["action"])
-            except Exception:
-                pass
-
-        # If model returned terminate or text-only explanation
-        if "terminate" in text.lower() or "done" in text.lower():
-            return ReachAction(kind="terminate", description=text.strip()[:200])
-
-        raise ValueError(f"Failed to find valid action JSON in response: {text[:200]}")
-
-    @staticmethod
-    def _parse_balanced_at(text: str, start: int) -> Optional[Dict[str, Any]]:
-        if start >= len(text) or text[start] != "{":
-            return None
-        depth = 0
-        in_string = False
-        escaped = False
-        for i in range(start, len(text)):
-            ch = text[i]
-            if in_string:
-                if escaped:
-                    escaped = False
-                elif ch == "\\":
-                    escaped = True
-                elif ch == '"':
-                    in_string = False
-            elif ch == '"':
-                in_string = True
-            elif ch == "{":
-                depth += 1
-            elif ch == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        return json.loads(text[start : i + 1])
-                    except Exception:
-                        return None
-        return None
+        """Accept one structured proposal, never infer actions from prose."""
+        text = text.strip()
+        if text.startswith("```json\n") and text.endswith("\n```"):
+            text = text[len("```json\n"):-len("\n```")]
+        proposal = json.loads(text)
+        if not isinstance(proposal, dict) or set(proposal) != {"action"}:
+            raise ValueError("Expected one action object")
+        return cls._map_action_dict(proposal["action"])
 
     @staticmethod
     def _map_action_dict(d: Dict[str, Any]) -> ReachAction:
-        kind = str(d.get("kind", "")).lower()
+        if not isinstance(d, dict):
+            raise ValueError("action must be an object")
+        allowed = {
+            "kind", "point", "ref", "target", "value", "key", "description",
+            "button", "actionClass", "outcome", "roi", "record_kind", "id",
+            "domain", "submit",
+        }
+        if set(d) - allowed:
+            raise ValueError("Unknown action field")
+        kind = d.get("kind")
         if kind not in (
-            "click",
-            "type",
-            "key",
-            "navigate",
-            "wait",
-            "scroll",
-            "auth_required",
-            "terminate",
+            "click", "type", "key", "navigate", "inject", "wait", "scroll",
+            "auth_required", "terminate",
         ):
-            # Map synonyms
-            if kind in ("press", "hotkey"):
-                kind = "key"
-            elif kind in ("browse", "goto", "open"):
-                kind = "navigate"
-            elif kind in ("finish", "stop", "complete"):
-                kind = "terminate"
-            elif kind in ("login", "2fa", "takeover"):
-                kind = "auth_required"
-            elif kind in ("sleep", "pause", "settle"):
-                kind = "wait"
-            elif kind in ("wheel", "swipe"):
-                kind = "scroll"
-            else:
-                kind = "click"
-
-        # Coordinates parsing: support point=[x,y] or x=..., y=...
-        point: Optional[Tuple[int, int]] = None
-        raw_point = d.get("point")
-        if isinstance(raw_point, (list, tuple)) and len(raw_point) >= 2:
-            try:
-                point = (int(raw_point[0]), int(raw_point[1]))
-            except (ValueError, TypeError):
-                pass
-        elif "x" in d and "y" in d:
-            try:
-                point = (int(d["x"]), int(d["y"]))
-            except (ValueError, TypeError):
-                pass
-
-        ref = d.get("ref") or d.get("reference") or d.get("target_ref")
-        if ref:
-            ref = str(ref).strip()
-            if not ref.startswith("@"):
-                ref = f"@{ref}"
-
-        roi = None
-        raw_roi = d.get("roi") or d.get("box") or d.get("bbox")
-        if raw_roi:
-            roi_obj = Roi.from_value(raw_roi)
-            if roi_obj:
-                roi = roi_obj.to_list()
-
+            raise ValueError("Unknown action kind")
+        for key in (
+            "ref", "target", "value", "key", "description", "button",
+            "actionClass", "outcome", "record_kind", "id", "domain",
+        ):
+            if key in d and not isinstance(d[key], str):
+                raise ValueError(f"{key} must be a string")
+        if "submit" in d and type(d["submit"]) is not bool:
+            raise ValueError("submit must be a boolean")
+        action_class = d.get("actionClass", "read_only")
+        if action_class not in ("read_only", "reversible_mutation"):
+            raise ValueError("Unknown action class")
+        point = d.get("point")
+        if point is not None:
+            if not isinstance(point, list) or len(point) != 2 or any(type(v) is not int or v < 0 for v in point):
+                raise ValueError("point must contain two nonnegative integers")
+            point = tuple(point)
+        ref = d.get("ref")
+        if ref is not None and not re.fullmatch(r"@?e[0-9]+", ref):
+            raise ValueError("ref must be an accessibility reference")
+        if ref is not None and not ref.startswith("@"):
+            ref = "@" + ref
+        if kind == "click" and point is None and ref is None:
+            raise ValueError("click requires point or ref")
+        if d.get("button", "left") not in ("left", "right", "middle"):
+            raise ValueError("Unknown mouse button")
+        if kind == "type" and "value" not in d:
+            raise ValueError("type requires value")
+        if kind == "key" and not d.get("key"):
+            raise ValueError("key requires key")
+        if kind == "navigate" and not (d.get("target") or d.get("value")):
+            raise ValueError("navigate requires a URL")
+        if kind == "inject":
+            record_kind = d.get("record_kind")
+            if record_kind not in ("vault", "card"):
+                raise ValueError("inject requires record_kind vault or card")
+            if not d.get("domain"):
+                raise ValueError("inject requires domain")
+            if record_kind == "card" and not d.get("id"):
+                raise ValueError("card injection requires id")
+            if record_kind == "vault" and d.get("id") is not None:
+                raise ValueError("vault injection does not accept id")
+        outcome = d.get("outcome")
+        if kind == "terminate" and outcome not in ("completed", "blocked", "failed"):
+            raise ValueError("terminate requires completed, blocked, or failed outcome")
+        if kind != "terminate" and outcome is not None:
+            raise ValueError("outcome is only valid for terminate")
+        roi = d.get("roi")
+        if roi is not None and (
+            not isinstance(roi, list) or len(roi) != 4
+            or any(type(v) is not int or v < 0 for v in roi)
+            or roi[2] == 0 or roi[3] == 0
+        ):
+            raise ValueError("roi must be a positive rectangle")
         return ReachAction(
-            kind=kind,
-            action_class=str(d.get("actionClass", "read_only")),
-            point=point,
-            ref=ref,
-            target=d.get("target"),
-            value=d.get("value"),
-            key=d.get("key") or d.get("combo"),
-            button=str(d.get("button", "left")),
-            description=str(d.get("description", "")),
-            roi=roi,
+            kind=kind, action_class=action_class, point=point, ref=ref,
+            target=d.get("target"), value=d.get("value"), key=d.get("key"),
+            button=d.get("button", "left"), description=d.get("description", ""),
+            roi=roi, outcome=outcome, record_kind=d.get("record_kind"),
+            record_id=d.get("id"), domain=d.get("domain"),
+            submit=d.get("submit", False),
         )
 
     # --------------------------------------------------------------------------
@@ -1747,7 +1869,7 @@ class ReachDriver:
         return False, None
 
     def execute_action(self, action: ReachAction) -> Dict[str, Any]:
-        """Execute Reach action using Reach MCP tools or CLI fallback."""
+        """Execute a safe action through authenticated Reach MCP tools."""
         if action.kind == "terminate":
             return {"status": "ok", "action": "terminate"}
 
@@ -1757,37 +1879,42 @@ class ReachDriver:
 
         if action.kind == "scroll":
             combo = action.key or "Page_Down"
-            return self.call_mcp_tool("key", {"combo": combo, "screen": self.screen})
+            return self.call_mcp_tool("key", {"combo": combo}, mutation=True)
 
         if action.kind == "click":
-            payload: Dict[str, Any] = {"button": action.button, "screen": self.screen}
+            payload: Dict[str, Any] = {"button": action.button}
             if action.ref:
                 payload["ref"] = action.ref
             elif action.point:
                 payload["x"] = action.point[0]
                 payload["y"] = action.point[1]
-            else:
-                payload["x"] = 100
-                payload["y"] = 100
-            return self.call_mcp_tool("click", payload)
+            return self.call_mcp_tool("click", payload, mutation=True)
 
         if action.kind == "type":
-            text = action.value or ""
-            payload = {"text": text, "screen": self.screen}
+            payload = {"text": action.value or ""}
             if action.ref:
                 payload["ref"] = action.ref
-            return self.call_mcp_tool("type", payload)
+            return self.call_mcp_tool("type", payload, mutation=True)
 
         if action.kind == "key":
             combo = action.key or action.target or "Return"
-            return self.call_mcp_tool("key", {"combo": combo, "screen": self.screen})
+            return self.call_mcp_tool("key", {"combo": combo}, mutation=True)
 
         if action.kind == "navigate":
             url = action.target or action.value or "about:blank"
             return self.call_mcp_tool(
-                "browse",
-                {"url": url, "screen": self.screen, "use_profile": "default"},
+                "browse", {"url": url}, mutation=True
             )
+
+        if action.kind == "inject":
+            request: Dict[str, Any] = {
+                "kind": action.record_kind,
+                "domain": action.domain,
+                "submit": action.submit,
+            }
+            if action.record_id is not None:
+                request["card_id"] = action.record_id
+            return self.call_mcp_tool("inject", request, mutation=True)
 
         if action.kind == "auth_required":
             vnc_url = self.get_novnc_url()
@@ -1795,10 +1922,6 @@ class ReachDriver:
             return {"status": "auth_required", "vnc_url": vnc_url}
 
         raise ValueError(f"Unknown action kind: {action.kind}")
-
-    # --------------------------------------------------------------------------
-    # Main driver loop
-    # --------------------------------------------------------------------------
 
     def drive(
         self,
@@ -1808,29 +1931,35 @@ class ReachDriver:
         """Run the Gauntlet-style vision loop until termination or takeover."""
         start_time = time.time()
         steps: List[StepRecord] = []
-        current_url = initial_url
         logger.info(
-            "Starting Reach CUA Driver. Goal: %s (Screen: %s, Task: %s)",
-            goal,
+            "Starting Reach CUA Driver (Screen: %s, Task: %s, Attempt: %s)",
             self.screen,
             self.task_id,
+            self.attempt_id,
         )
 
         if initial_url:
             try:
                 self.call_mcp_tool(
                     "browse",
-                    {
-                        "url": initial_url,
-                        "screen": self.screen,
-                        "use_profile": "default",
-                    },
+                    {"url": initial_url},
+                    mutation=True,
                 )
                 time.sleep(1.5)
-            except Exception as e:
-                logger.warning(
-                    "Failed to navigate to initial URL %s: %s", initial_url, e
+            except ReachToolError as e:
+                res = DriveResult(
+                    success=False,
+                    status=e.status,
+                    final_description="Initial navigation stopped without replay",
+                    task_id=self.task_id,
+                    error=str(e),
                 )
+                self._finalize_audit(res, goal, start_time, time.time())
+                return res
+            except Exception:
+                res = DriveResult(success=False, status="uncertain", steps=steps, error="Initial navigation outcome is unknown; reconcile before retry", task_id=self.task_id)
+                self._finalize_audit(res, goal, start_time, time.time())
+                return res
 
         try:
             for step_idx in range(1, self.max_steps + 1):
@@ -1841,7 +1970,7 @@ class ReachDriver:
                 self._archive_screenshot(
                     screenshot_path, f"step_{step_idx:03d}_before.png"
                 )
-                page_text = self.capture_page_text(current_url)
+                page_text = self.capture_page_text()
 
                 # Heuristic 2FA check on DOM
                 if page_text and AUTH_SIGNALS_RE.search(page_text):
@@ -1851,15 +1980,16 @@ class ReachDriver:
                         kind="auth_required",
                         description="2FA / Login prompt detected on page",
                     )
-                    steps.append(
+                    self._record_step(
+                        steps,
                         StepRecord(
                             step_index=step_idx,
                             action=action,
-                            observation_summary=page_text[:160],
+                            observation_summary="Authentication required",
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
                             result={"status": "auth_required", "vnc_url": vnc_url},
-                        )
+                        ),
                     )
                     res = DriveResult(
                         success=False,
@@ -1968,13 +2098,7 @@ class ReachDriver:
                     self._finalize_audit(res, goal, start_time, time.time())
                     return res
 
-                logger.info(
-                    "Step %s -> %s: %s (%s)",
-                    step_idx,
-                    action.kind,
-                    action.description,
-                    action.point or action.value or action.target or "",
-                )
+                logger.info("Step %s -> %s", step_idx, action.kind)
 
                 # Handle auth_required proposal
                 if action.kind == "auth_required":
@@ -2006,6 +2130,15 @@ class ReachDriver:
 
                 # Handle termination
                 if action.kind == "terminate":
+                    completion_status = action.outcome
+                    verified = False
+                    if action.outcome == "completed":
+                        completion_status = "unverified"
+                        if self.completion_text is not None:
+                            fresh_text = self.capture_page_text()
+                            verified = self.completion_text in fresh_text
+                            if fresh_text:
+                                completion_status = "completed" if verified else "postcondition_failed"
                     self._record_step(
                         steps,
                         StepRecord(
@@ -2016,55 +2149,22 @@ class ReachDriver:
                             else "Terminated",
                             screenshot_path=screenshot_path,
                             timestamp=step_timestamp,
-                            result={"status": "completed"},
+                            result={"status": completion_status},
                         ),
                     )
                     res = DriveResult(
-                        success=True,
-                        status="completed",
+                        success=verified,
+                        status=completion_status,
                         steps=steps,
-                        final_description=action.description or "Goal achieved",
+                        final_description=action.description,
                         task_id=self.task_id,
                     )
                     self._finalize_audit(res, goal, start_time, time.time())
                     return res
 
-                # Check Dangerous Mutation Approval Gate
-                is_dangerous, danger_reason, approved = self.approval_gate.evaluate(action)
-                if is_dangerous and not approved:
-                    logger.warning("Dangerous action paused for approval: %s", danger_reason)
-                    approval_notice = {
-                        "status": "approval_required",
-                        "action": action.to_dict(),
-                        "reason": danger_reason,
-                    }
-                    print(json.dumps(approval_notice), file=sys.stderr)
-                    self._record_step(
-                        steps,
-                        StepRecord(
-                            step_index=step_idx,
-                            action=action,
-                            observation_summary=page_text[:160]
-                            if page_text
-                            else "Dangerous mutation intercepted",
-                            screenshot_path=screenshot_path,
-                            timestamp=step_timestamp,
-                            result=approval_notice,
-                        ),
-                    )
-                    res = DriveResult(
-                        success=False,
-                        status="approval_required",
-                        steps=steps,
-                        final_description=f"Action requires approval: {danger_reason}",
-                        task_id=self.task_id,
-                    )
-                    self._finalize_audit(res, goal, start_time, time.time())
-                    return res
-
-                # Update current_url if navigating
-                if action.kind == "navigate":
-                    current_url = action.target or action.value
+                # Supervisor-only approval is enforced by the authenticated
+                # server mutation tool. The worker never prompts or relays
+                # approval text; HTTP 428 stops this drive without replay.
 
                 # Execute action
                 step_error: Optional[str] = None
@@ -2074,6 +2174,33 @@ class ReachDriver:
                 except Exception as ex:
                     step_error = str(ex)
                     logger.warning("Step %s action execution error: %s", step_idx, ex)
+                    if isinstance(ex, ReachToolError):
+                        status = ex.status
+                        failure_result: Dict[str, Any] = {"status": status}
+                        if isinstance(ex, ApprovalRequiredError):
+                            failure_result["digest"] = ex.digest
+                        self._record_step(
+                            steps,
+                            StepRecord(
+                                step_index=step_idx,
+                                action=action,
+                                observation_summary="",
+                                screenshot_path=screenshot_path,
+                                timestamp=step_timestamp,
+                                result=failure_result,
+                                error=str(ex),
+                            ),
+                        )
+                        res = DriveResult(
+                            success=False,
+                            status=status,
+                            steps=steps,
+                            final_description="Mutation stopped without replay",
+                            task_id=self.task_id,
+                            error=str(ex),
+                        )
+                        self._finalize_audit(res, goal, start_time, time.time())
+                        return res
 
                 # Capture after-screenshot for visual diff reel
                 after_shot_path: Optional[str] = None
@@ -2118,8 +2245,7 @@ class ReachDriver:
             self._finalize_audit(res, goal, start_time, time.time())
             return res
         finally:
-            pass
-
+            self.cleanup()
 
 def drive_goal(
     goal: str,
@@ -2129,15 +2255,16 @@ def drive_goal(
     max_steps: int = 20,
     initial_url: Optional[str] = None,
     task_id: Optional[str] = None,
+    attempt_id: Optional[str] = None,
     audit_dir: Optional[Union[str, Path]] = None,
     enable_audit: bool = True,
-    allow_mutations: bool = False,
-    require_approval: bool = False,
-    approval_callback: Optional[Callable[[ReachAction, str], bool]] = None,
     min_change_threshold: float = 0.01,
     max_unchanged_ticks: int = 3,
     backoff_sec: float = 0.75,
     roi: Optional[Union[List[int], Tuple[int, int, int, int], Roi, str]] = None,
+    completion_text: Optional[str] = None,
+    lease_token: Optional[str] = None,
+    handoff_gen: Optional[int] = None,
 ) -> DriveResult:
     """Convenience helper to drive a goal to completion."""
     driver = ReachDriver(
@@ -2146,18 +2273,18 @@ def drive_goal(
         model=model,
         max_steps=max_steps,
         task_id=task_id,
+        attempt_id=attempt_id,
         audit_dir=audit_dir,
         enable_audit=enable_audit,
-        allow_mutations=allow_mutations,
-        require_approval=require_approval,
-        approval_callback=approval_callback,
         min_change_threshold=min_change_threshold,
         max_unchanged_ticks=max_unchanged_ticks,
         backoff_sec=backoff_sec,
         roi=roi,
+        completion_text=completion_text,
+        lease_token=lease_token,
+        handoff_gen=handoff_gen,
     )
     return driver.drive(goal=goal, initial_url=initial_url)
-
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -2187,7 +2314,9 @@ def main() -> None:
         "--initial-url", default=None, help="Optional initial URL to open"
     )
     parser.add_argument("--workdir", default=None, help="Directory to save screenshots")
+    parser.add_argument("--completion-text", help="Caller-defined text required in a fresh page observation for verified success")
     parser.add_argument("--task-id", default=None, help="Task ID for visual audit reel")
+    parser.add_argument("--attempt-id", default=None, help="Attempt ID for lease/audit binding")
     parser.add_argument("--audit-dir", default=None, help="Directory to save audit reel report")
     parser.add_argument(
         "--no-audit",
@@ -2224,21 +2353,6 @@ def main() -> None:
         default=None,
         help="Expected handoff generation for mutating actions",
     )
-    parser.add_argument(
-        "--allow-mutations",
-        action="store_true",
-        help="Allow dangerous mutations without approval pause",
-    )
-    parser.add_argument(
-        "--require-approval",
-        action="store_true",
-        help="Always pause and require approval on dangerous mutations",
-    )
-    parser.add_argument(
-        "--non-interactive",
-        action="store_true",
-        help="Run non-interactively without prompting stdin",
-    )
     parser.add_argument("--json", action="store_true", help="Output result as JSON")
     parser.add_argument(
         "-v", "--verbose", action="store_true", help="Enable verbose debug logging"
@@ -2260,16 +2374,16 @@ def main() -> None:
         max_steps=args.max_steps,
         workdir=args.workdir,
         task_id=args.task_id,
+        attempt_id=args.attempt_id,
         audit_dir=args.audit_dir,
         enable_audit=args.enable_audit,
-        allow_mutations=args.allow_mutations,
-        require_approval=args.require_approval,
-        interactive=not args.non_interactive,
         min_change_threshold=args.min_change_threshold,
         max_unchanged_ticks=args.max_unchanged_ticks,
         backoff_sec=args.backoff_sec,
         roi=args.roi,
         handoff_gen=args.handoff_gen,
+        lease_token=os.environ.get("REACH_LEASE_TOKEN"),
+        completion_text=args.completion_text,
     )
 
     result = driver.drive(goal=args.goal, initial_url=args.initial_url)
@@ -2291,7 +2405,6 @@ def main() -> None:
         print(f"Steps executed: {len(result.steps)}")
 
     sys.exit(0 if result.success or result.status == "auth_required" else 1)
-
 
 if __name__ == "__main__":
     main()

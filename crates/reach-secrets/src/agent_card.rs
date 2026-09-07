@@ -712,6 +712,100 @@ impl AgentCardEngine {
         results.sort_by_key(|a| std::cmp::Reverse(a.created_at));
         Ok(results)
     }
+    /// Reserve an active card before handing its details to a one-shot helper.
+    ///
+    /// The persisted `INJECTING` state makes a process crash fail closed:
+    /// loading the store converts it to `LOCKED`, so callers never retry an
+    /// injection whose outcome is ambiguous.
+    pub fn reserve_for_injection(
+        &mut self,
+        card_id: &str,
+        current_url: Option<&str>,
+    ) -> Result<Card> {
+        let _lock = self.acquire_lock()?;
+        let mut cards = self.read_raw()?;
+        let card = cards
+            .get_mut(card_id)
+            .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
+        if card.status != CardStatus::Active {
+            bail!(
+                "Cannot inject card '{}' with status '{}'. Card must be ACTIVE.",
+                card_id,
+                card.status
+            );
+        }
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        if let Some(injected_at) = card.injected_at
+            && now - injected_at < 60
+        {
+            bail!(
+                "Double-submit prevented: card '{}' was injected recently at {}",
+                card_id,
+                injected_at
+            );
+        }
+        let active_url = current_url.ok_or_else(|| {
+            anyhow::anyhow!(
+                "Cannot inject card '{}': active tab URL must be verified before typing secrets",
+                card_id
+            )
+        })?;
+        validate_origin(active_url, &card.merchant)?;
+
+        static TOK_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        let counter = TOK_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let token = format!(
+            "tok_{:08x}",
+            (nanos ^ ((std::process::id() as u128) << 32) ^ counter as u128) as u64
+        );
+        card.status = CardStatus::Injecting;
+        card.injected_at = Some(now);
+        card.idempotency_token = Some(token);
+        let reserved = card.clone();
+        self.write_raw(&cards)?;
+        Ok(reserved)
+    }
+
+    /// Commit a successful or definitively rejected card injection.
+    pub fn finalize_injection(&mut self, card_id: &str) -> Result<Card> {
+        let _lock = self.acquire_lock()?;
+        let content = if self.cards_file.exists() {
+            fs::read_to_string(&self.cards_file)
+                .with_context(|| format!("Failed to read cards file {:?}", self.cards_file))?
+        } else {
+            "{}".into()
+        };
+        let mut cards = if let Ok(map) = serde_json::from_str::<HashMap<String, Card>>(&content) {
+            map
+        } else if let Ok(list) = serde_json::from_str::<Vec<Card>>(&content) {
+            list.into_iter()
+                .map(|card| (card.id.clone(), card))
+                .collect()
+        } else {
+            bail!("Failed to deserialize cards.json while finalizing injection");
+        };
+        let card = cards
+            .get_mut(card_id)
+            .ok_or_else(|| anyhow::anyhow!("Card '{}' not found", card_id))?;
+        if card.status != CardStatus::Injecting {
+            bail!(
+                "Cannot finalize card '{}' with status '{}'. Card must be INJECTING.",
+                card_id,
+                card.status
+            );
+        }
+        card.status = CardStatus::Locked;
+        let finalized = card.clone();
+        self.write_raw(&cards)?;
+        Ok(finalized)
+    }
 
     /// Build synthetic input commands for form injection.
     pub fn build_injection_commands(
@@ -1032,6 +1126,28 @@ mod tests {
         );
         assert!(err.is_err());
         assert!(err.unwrap_err().to_string().contains("ACTIVE"));
+    }
+    #[test]
+    fn test_reserve_and_finalize_card_injection() {
+        let tmp_dir = TempDir::new();
+        let cards_file = tmp_dir.path().join("cards.json");
+        let mut engine = AgentCardEngine::new(Some(cards_file));
+        let card = engine
+            .mint_card("shop.example", 20.0, 25.0, None, Some("reserve-card"))
+            .unwrap();
+
+        let reserved = engine
+            .reserve_for_injection(&card.id, Some("https://shop.example/checkout"))
+            .unwrap();
+        assert_eq!(reserved.status, CardStatus::Injecting);
+        assert_eq!(
+            engine.get_card(&card.id).unwrap().status,
+            CardStatus::Locked
+        );
+
+        let finalized = engine.finalize_injection(&card.id).unwrap();
+        assert_eq!(finalized.status, CardStatus::Locked);
+        assert!(engine.finalize_injection(&card.id).is_err());
     }
 
     #[test]

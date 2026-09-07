@@ -1,11 +1,175 @@
-use clap::Args;
+use clap::{ArgAction, Args};
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::{DockerClient, ProfileMount, Resolution, SandboxConfig, SandboxPorts};
+use reach_cli::docker::{
+    DockerClient, LifecycleMode, ProfileMount, ResetManifest, Resolution, SandboxConfig,
+    SandboxPorts, read_reset_manifest, reset_manifest_for, reset_manifest_path,
+    validate_sandbox_config, write_reset_manifest,
+};
+use std::path::PathBuf;
 use std::time::Duration;
+
+#[derive(Args, Clone, Debug, Default)]
+#[group(id = "lifecycle-mode", multiple = false)]
+pub struct LifecycleArgs {
+    /// Start without preserving any host-backed state (the default).
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub clean: bool,
+
+    /// Start with one-shot state supplied by an authorized hydration flow.
+    ///
+    /// Hydrated cookies and other credentials are intentionally not persisted
+    /// in the lifecycle manifest.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub hydrated: bool,
+
+    /// Preserve only explicitly configured host-backed mounts.
+    #[arg(long, action = ArgAction::SetTrue)]
+    pub persistent: bool,
+}
+
+impl LifecycleArgs {
+    pub fn explicit_mode(&self) -> Option<LifecycleMode> {
+        if self.clean {
+            Some(LifecycleMode::Clean)
+        } else if self.hydrated {
+            Some(LifecycleMode::Hydrated)
+        } else if self.persistent {
+            Some(LifecycleMode::Persistent)
+        } else {
+            None
+        }
+    }
+}
+
+/// Resolve create's lifecycle choice. State is clean by default; a profile
+/// mount is never silently downgraded to a clean lifecycle.
+pub fn create_lifecycle_mode(
+    lifecycle: &LifecycleArgs,
+    has_profile: bool,
+    has_workspace: bool,
+) -> anyhow::Result<LifecycleMode> {
+    let mode = lifecycle.explicit_mode().unwrap_or(LifecycleMode::Clean);
+    if has_profile && mode != LifecycleMode::Persistent {
+        anyhow::bail!("--persist-profile requires explicit --persistent");
+    }
+    if mode == LifecycleMode::Hydrated && has_workspace {
+        anyhow::bail!(
+            "--hydrated cannot be combined with --workspace; use --persistent for durable mounts"
+        );
+    }
+    if mode == LifecycleMode::Persistent && !has_profile && !has_workspace {
+        anyhow::bail!("--persistent requires --persist-profile or --workspace");
+    }
+    Ok(mode)
+}
+
+/// Stable manifest location for a sandbox. The configured workspace root is
+/// used as a state root even when a sandbox mounts a custom workspace path, so
+/// a clean recreation can still find its manifest after removing that mount.
+pub fn lifecycle_manifest_path(cfg: &ReachConfig, name: &str) -> PathBuf {
+    reset_manifest_path(&cfg.sandbox.resolved_workspace_dir(), name)
+}
+
+/// Set the manifest's mode without ever adding runtime credentials or
+/// capability state to it.
+pub fn lifecycle_manifest_for(config: &SandboxConfig, mode: LifecycleMode) -> ResetManifest {
+    let mut manifest = reset_manifest_for(config);
+    manifest.mode = mode;
+    if !matches!(mode, LifecycleMode::Persistent) {
+        manifest.workspace = None;
+        manifest.profile_name = None;
+        manifest.writable_workspace = false;
+        manifest.restart_unless_stopped = false;
+    }
+    manifest
+}
+
+pub(crate) fn persist_lifecycle_manifest(
+    cfg: &ReachConfig,
+    config: &SandboxConfig,
+    mode: LifecycleMode,
+) -> anyhow::Result<PathBuf> {
+    let path = lifecycle_manifest_path(cfg, &config.name);
+    write_reset_manifest(&path, &lifecycle_manifest_for(config, mode))?;
+    Ok(path)
+}
+pub(crate) fn lifecycle_manifest_candidates(
+    cfg: &ReachConfig,
+    config: &SandboxConfig,
+) -> Vec<PathBuf> {
+    let stable = lifecycle_manifest_path(cfg, &config.name);
+    let mut paths = vec![stable.clone()];
+    if let Some(workspace) = &config.workspace {
+        let adjacent = reset_manifest_path(workspace, &config.name);
+        if adjacent != stable {
+            paths.push(adjacent);
+        }
+    }
+    paths
+}
+
+pub(crate) fn read_lifecycle_manifest(
+    cfg: &ReachConfig,
+    config: &SandboxConfig,
+) -> anyhow::Result<(PathBuf, ResetManifest)> {
+    let existing: Vec<PathBuf> = lifecycle_manifest_candidates(cfg, config)
+        .into_iter()
+        .filter(|path| path.is_file())
+        .collect();
+    let path = match existing.as_slice() {
+        [] => anyhow::bail!(
+            "sandbox '{}' has no lifecycle manifest; refusing to inherit runtime state. \
+             Recover with `reach create --name {} --clean` (or explicitly recreate with \
+             `--persistent` after restoring its manifest)",
+            config.name,
+            config.name
+        ),
+        [path] => path,
+        _ => anyhow::bail!(
+            "sandbox '{}' has ambiguous lifecycle manifests at {}; remove the stale copy \
+             before retrying",
+            config.name,
+            existing
+                .iter()
+                .map(|path| path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    };
+    let manifest = read_reset_manifest(path)?;
+    anyhow::ensure!(
+        manifest.schema_version == reach_cli::docker::RESET_MANIFEST_SCHEMA_VERSION,
+        "unsupported lifecycle manifest schema {} for sandbox '{}'",
+        manifest.schema_version,
+        config.name
+    );
+    anyhow::ensure!(
+        manifest.name == config.name,
+        "lifecycle manifest name '{}' does not match sandbox '{}'",
+        manifest.name,
+        config.name
+    );
+    match manifest.mode {
+        LifecycleMode::Persistent => anyhow::ensure!(
+            manifest.workspace.is_some() || manifest.profile_name.is_some(),
+            "persistent lifecycle manifest for '{}' authorizes no persistent mount",
+            config.name
+        ),
+        LifecycleMode::Clean | LifecycleMode::Hydrated => anyhow::ensure!(
+            manifest.workspace.is_none() && manifest.profile_name.is_none(),
+            "non-persistent lifecycle manifest for '{}' contains mount state",
+            config.name
+        ),
+    }
+    Ok((path.clone(), manifest))
+}
 
 #[derive(Args)]
 pub struct CreateArgs {
+    #[command(flatten)]
+    pub lifecycle: LifecycleArgs,
+
     /// Name for the sandbox container
     #[arg(long, default_value = "reach")]
     pub name: String,
@@ -180,6 +344,14 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
         writable_workspace: args.writable_workspace,
     };
 
+    let mode = create_lifecycle_mode(
+        &args.lifecycle,
+        config.profile.is_some(),
+        config.workspace.is_some(),
+    )?;
+    validate_sandbox_config(&config)?;
+    persist_lifecycle_manifest(&cfg, &config, mode)?;
+
     let docker = DockerClient::new(cfg.docker.socket_path())?;
     let sandbox = docker.create(config).await?;
 
@@ -279,20 +451,16 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
     }
 
     println!();
-    if let Some(p) = sandbox.ports.novnc {
-        for i in 0..sandbox.ports.screens {
-            let label = if sandbox.ports.screens > 1 {
-                format!("VNC (screen {i}):")
-            } else {
-                "VNC:".to_string()
-            };
-            println!(
-                "    {:<18} {}",
-                label.bold(),
-                format!("http://localhost:{}", p + i as u16).cyan()
-            );
-        }
-    }
+    println!(
+        "    {}  reach serve --sandbox {}",
+        "API:".bold(),
+        sandbox.name.cyan()
+    );
+    println!(
+        "    {}  reach vnc {} (after a worker leases the screen)",
+        "Viewer:".bold(),
+        sandbox.name.cyan()
+    );
     if let Some(p) = sandbox.ports.health {
         println!(
             "    {}  {}",

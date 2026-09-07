@@ -6,8 +6,8 @@ Stores credentials outside the microVM in ~/.reach/vault/secrets.json
 Supports:
   - domain mapping: maps domains (e.g. github.com, x.com) to username, password, totp_secret
   - RFC 6238 TOTP code generation (zero external dependencies)
-  - in-memory credential injection via Reach MCP / synthetic input typing
-    without ever writing passwords to container disk
+  - authenticated host-native injection through the Reach MCP server, without
+    exposing secret values to model context, scripts, or command arguments
   - optional encryption with PBKDF2-HMAC-SHA256 authenticated keystream
 """
 
@@ -33,6 +33,12 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional, Tuple, Union
 
 logger = logging.getLogger("reach_vault")
+class _NoReachRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_API_OPENER = urllib.request.build_opener(_NoReachRedirect())
 
 DEFAULT_VAULT_DIR = Path.home() / ".reach" / "vault"
 DEFAULT_VAULT_FILE = DEFAULT_VAULT_DIR / "secrets.json"
@@ -422,114 +428,88 @@ class ReachVault:
         type_totp: bool = True,
         mcp_caller: Optional[Callable[[str, Dict[str, Any]], Dict[str, Any]]] = None,
         current_url: Optional[str] = None,
+        lease_token: Optional[str] = None,
+        handoff_gen: Optional[int] = None,
+        observation_gen: Optional[int] = None,
     ) -> Dict[str, Any]:
-        """Inject credentials directly into the active window on the target screen.
+        """Request host-native vault injection through the authenticated server.
 
-        Uses Reach MCP input typing (streamed synthetic X11 keypresses) or CDP
-        without writing any password or secret to container disk.
-
-        Enforces origin validation: verifies that the active tab's domain matches
-        the target bound domain before typing any credentials.
+        Secret values are never passed as tool arguments, generated scripts, or
+        command-line arguments. The server resolves the native vault record.
         """
         canonical = normalize_domain(domain)
-        creds = self.get(canonical)
-        username = creds["username"]
-        password = creds["password"]
-        totp_secret = creds.get("totp_secret")
-
-        api = (api_url or DEFAULT_REACH_API).rstrip("/")
-
-        def _call_mcp(tool_name: str, arguments: Dict[str, Any]) -> Dict[str, Any]:
-            if mcp_caller is not None:
-                return mcp_caller(tool_name, arguments)
-
+        if not canonical:
+            raise ValueError("domain cannot be empty")
+        request: Dict[str, Any] = {
+            "kind": "vault",
+            "domain": canonical,
+            "submit": bool(submit),
+        }
+        if mcp_caller is not None:
+            response = mcp_caller("inject", request)
+        else:
+            if not lease_token:
+                raise ValueError("authenticated lease_token is required for injection")
+            api = (api_url or DEFAULT_REACH_API).rstrip("/")
             payload = {
                 "jsonrpc": "2.0",
                 "id": int(time.time() * 1000) % 1_000_000,
                 "method": "tools/call",
-                "params": {"name": tool_name, "arguments": arguments},
+                "params": {"name": "inject", "arguments": {**request, "screen": screen}},
             }
+            headers = {
+                "content-type": "application/json",
+                "X-Lease-Token": lease_token,
+            }
+            if handoff_gen is not None:
+                headers["X-Handoff-Gen"] = str(handoff_gen)
+            if observation_gen is not None:
+                headers["X-Observation-Gen"] = str(observation_gen)
             req = urllib.request.Request(
-                f"{api}/mcp",
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"content-type": "application/json"},
-                method="POST",
+                f"{api}/mcp", data=json.dumps(payload).encode("utf-8"),
+                headers=headers, method="POST",
             )
-            with urllib.request.urlopen(req, timeout=30) as r:
-                res = json.loads(r.read().decode("utf-8") or "{}")
-                if "error" in res:
-                    raise RuntimeError(f"MCP RPC Error: {res['error']}")
-                return res.get("result", {})
-
-        # Step 0: Read active tab URL and verify origin before typing secrets
-        active_url = current_url
-        if not active_url:
             try:
-                page_info = _call_mcp("page_text", {"screen": screen})
-                if isinstance(page_info, dict):
-                    active_url = (
-                        page_info.get("url")
-                        or page_info.get("active_url")
-                        or page_info.get("current_url")
-                    )
-                    if not active_url and "text" in page_info:
+                with _API_OPENER.open(req, timeout=30) as result:
+                    response = json.loads(result.read().decode("utf-8") or "{}")
+            except urllib.error.HTTPError as exc:
+                try:
+                    body = json.loads(exc.read().decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    body = {}
+                if exc.code == 428 and body.get("error") == "approval_required":
+                    return {"status": "approval_required", "digest": body.get("digest")}
+                if exc.code == 409:
+                    return {"status": "stale_observation"}
+                return {"status": "uncertain"}
+            except (urllib.error.URLError, TimeoutError, OSError):
+                return {"status": "uncertain"}
+
+        if not isinstance(response, dict):
+            return {"status": "uncertain"}
+        if "result" in response:
+            result = response.get("result")
+            if not isinstance(result, dict) or result.get("isError") is not False:
+                return {"status": "uncertain"}
+            content = result.get("content")
+            if isinstance(content, list):
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") == "text":
                         try:
-                            parsed_text = json.loads(page_info["text"])
-                            if isinstance(parsed_text, dict):
-                                active_url = parsed_text.get("url")
-                        except Exception:
-                            pass
-            except Exception as e:
-                logger.debug("Failed to query page_text for active tab URL: %s", e)
-
-        if not active_url:
-            raise RuntimeError(
-                f"Failed to inspect active tab URL before credential injection on screen {screen}"
-            )
-
-        validate_origin(active_url, canonical)
-
-        # Step 1: Type username into currently focused field
-        logger.info("Injecting username into screen %s for %s", screen, canonical)
-        _call_mcp("type", {"text": username, "screen": screen})
-        time.sleep(delay_sec)
-
-        # Step 2: Tab into password field
-        _call_mcp("key", {"combo": "Tab", "screen": screen})
-        time.sleep(delay_sec)
-
-        # Step 3: Type password (pure synthetic input; never written to file)
-        logger.info("Injecting password into screen %s for %s (in-memory)", screen, canonical)
-        _call_mcp("type", {"text": password, "screen": screen})
-        time.sleep(delay_sec)
-
-        # Step 4: Submit if requested
-        if submit:
-            _call_mcp("key", {"combo": "Return", "screen": screen})
-            time.sleep(delay_sec)
-
-        totp_code: Optional[str] = None
-        if totp_secret:
-            totp_code = generate_totp(totp_secret)
-            if type_totp:
-                # Give page a brief moment to transition to 2FA prompt
-                time.sleep(max(1.0, delay_sec * 4))
-                logger.info("Injecting 6-digit TOTP code into screen %s", screen)
-                _call_mcp("type", {"text": totp_code, "screen": screen})
-                if submit:
-                    time.sleep(delay_sec)
-                    _call_mcp("key", {"combo": "Return", "screen": screen})
-
+                            response = json.loads(part.get("text", ""))
+                        except (TypeError, json.JSONDecodeError):
+                            return {"status": "uncertain"}
+                        break
+        status = response.get("status")
+        if status not in {"filled", "submitted", "auth_required", "rejected"}:
+            if status == "uncertain":
+                return {"status": "uncertain"}
+            return {"status": "uncertain"}
         return {
-            "status": "injected",
-            "screen": screen,
+            "status": status,
+            "outcome": response.get("outcome", status),
+            "submitted": bool(response.get("submitted", submit)),
             "domain": canonical,
-            "username": username,
-            "password_injected": True,
-            "submitted": submit,
-            "totp_generated": totp_code is not None,
-            "totp_code": totp_code,
-            "active_url": active_url,
         }
 
 
@@ -563,14 +543,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     p_set.add_argument("--pass", dest="password", required=True, help="Password")
     p_set.add_argument("--totp", dest="totp", default=None, help="Optional TOTP base32 secret")
 
-    # get <domain> [--reveal]
-    p_get = subparsers.add_parser("get", help="Retrieve credentials for a domain")
+    # get <domain> (always metadata-only)
+    p_get = subparsers.add_parser("get", help="Retrieve metadata for a domain")
     p_get.add_argument("domain", help="Target domain")
-    p_get.add_argument(
-        "--reveal",
-        action="store_true",
-        help="Display raw plaintext password in output (default: redacted to prevent accidental exfiltration)",
-    )
 
     # list
     subparsers.add_parser("list", help="List registered domains (redacting passwords)")
@@ -578,50 +553,21 @@ def main(argv: Optional[list[str]] = None) -> int:
     # delete <domain>
     p_del = subparsers.add_parser("delete", help="Delete credentials for a domain")
     p_del.add_argument("domain", help="Target domain")
-
     # totp <domain> [--current-url <url>]
-    p_totp = subparsers.add_parser("totp", help="Generate current 6-digit TOTP code")
+    p_totp = subparsers.add_parser("totp", help="Check whether a TOTP is configured")
     p_totp.add_argument("domain", help="Target domain")
-    p_totp.add_argument(
-        "--current-url",
-        default=None,
-        help="Active tab URL override for origin validation before revealing TOTP code",
-    )
-
+    p_totp.add_argument("--current-url", default=None)
     # inject <screen> <domain>
     p_inj = subparsers.add_parser(
-        "inject", help="Inject credentials into screen via input typing"
+        "inject", help="Request authenticated host-native credential injection"
     )
     p_inj.add_argument("screen", type=int, help="Screen ID (e.g. 0)")
     p_inj.add_argument("domain", help="Target domain")
-    p_inj.add_argument(
-        "--api-url",
-        default=DEFAULT_REACH_API,
-        help="Reach API URL (default http://127.0.0.1:4200)",
-    )
-    p_inj.add_argument(
-        "--no-submit",
-        action="store_false",
-        dest="submit",
-        help="Do not press Return after typing password/TOTP",
-    )
-    p_inj.add_argument(
-        "--no-totp",
-        action="store_false",
-        dest="type_totp",
-        help="Do not type TOTP code if secret is present",
-    )
-    p_inj.add_argument(
-        "--delay",
-        type=float,
-        default=0.25,
-        help="Inter-keystroke/field delay in seconds (default 0.25)",
-    )
-    p_inj.add_argument(
-        "--current-url",
-        default=None,
-        help="Active tab URL override for testing or manual origin verification",
-    )
+    p_inj.add_argument("--api-url", default=DEFAULT_REACH_API, help="Reach API URL")
+    p_inj.add_argument("--no-submit", action="store_false", dest="submit")
+    p_inj.add_argument("--lease-token", required=True, help="Authenticated lease capability")
+    p_inj.add_argument("--handoff-gen", type=int, default=None)
+    p_inj.add_argument("--observation-gen", type=int, default=None)
 
     args = parser.parse_args(argv)
     vault = ReachVault(vault_path=args.vault_path, key=args.key)
@@ -639,12 +585,11 @@ def main(argv: Optional[list[str]] = None) -> int:
 
         if args.command == "get":
             res = vault.get(args.domain)
-            if not getattr(args, "reveal", False):
-                res["password"] = "[REDACTED]"
-                res["_revealed"] = False
-            else:
-                res["_revealed"] = True
-            print(json.dumps(res, indent=2))
+            print(json.dumps({
+                "domain": normalize_domain(args.domain),
+                "username": bool(res.get("username")),
+                "has_totp": bool(res.get("totp_secret")),
+            }, indent=2))
             return 0
 
         if args.command == "list":
@@ -660,8 +605,11 @@ def main(argv: Optional[list[str]] = None) -> int:
         if args.command == "totp":
             if getattr(args, "current_url", None):
                 validate_origin(args.current_url, args.domain)
-            code = vault.get_totp(args.domain)
-            print(json.dumps({"domain": args.domain, "totp": code}, indent=2))
+            res = vault.list_domains().get(normalize_domain(args.domain), {})
+            print(json.dumps({
+                "domain": normalize_domain(args.domain),
+                "has_totp": bool(res.get("has_totp")),
+            }, indent=2))
             return 0
 
         if args.command == "inject":
@@ -670,12 +618,14 @@ def main(argv: Optional[list[str]] = None) -> int:
                 domain=args.domain,
                 api_url=args.api_url,
                 submit=args.submit,
-                delay_sec=args.delay,
-                type_totp=args.type_totp,
-                current_url=args.current_url,
+                lease_token=args.lease_token,
+                handoff_gen=args.handoff_gen,
+                observation_gen=args.observation_gen,
             )
             print(json.dumps(res, indent=2))
-            return 0
+            return 0 if res.get("status") not in {
+                "uncertain", "approval_required", "stale_observation"
+            } else 1
 
     except Exception as e:
         sys.stderr.write(f"Error: {e}\n")

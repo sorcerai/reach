@@ -1,6 +1,21 @@
-"""Unit tests for Reach CUA Driver (reach_drive.py)."""
+"""Unit tests for Reach CUA Driver (reach_drive.py) under the strict
+action-proposal contract:
+
+- The parser accepts exactly one JSON object holding an action object
+  (an optional whole fenced JSON block is also accepted); surrounding
+  prose is rejected.
+- Only canonical kinds are valid: click, type, key, navigate, wait,
+  scroll, auth_required, terminate. Unknown kinds and synonyms reject.
+- Typed fields are validated (e.g. a nonnumeric click point rejects).
+- A terminate proposal must carry outcome completed|blocked|failed.
+- Drive-level success requires explicit outcome=completed, a
+  caller-configured completion_text, and a freshly captured page_text
+  containing it after termination; anything else is unsuccessful.
+- agy nonzero exit is never accepted despite plausible stdout.
+"""
 
 import json
+import subprocess
 from pathlib import Path
 import sys
 import unittest
@@ -18,6 +33,7 @@ from scripts.reach_drive import (  # noqa: E402
     ReachAction,
     ReachDriver,
     StepRecord,
+    DriveResult,
 )
 
 
@@ -29,10 +45,15 @@ class ReachDriverTests(unittest.TestCase):
             model="gemini-3.8-flash-high",
             max_steps=5,
             timeout_sec=60,
+            enable_audit=False,
         )
 
     def tearDown(self) -> None:
         self.driver.cleanup()
+
+    # ------------------------------------------------------------------
+    # Prompt construction (Gauntlet control boundaries)
+    # ------------------------------------------------------------------
 
     def test_prompt_construction_matches_gauntlet_protocol(self) -> None:
         screenshot_path = "/tmp/fake_shot.png"
@@ -69,11 +90,21 @@ class ReachDriverTests(unittest.TestCase):
         self.assertIn("#1 navigate", prompt)
         self.assertIn("END GAUNTLET UNTRUSTED PAGE/GOAL DATA.", prompt)
 
+    # ------------------------------------------------------------------
+    # Strict action-proposal parsing
+    # ------------------------------------------------------------------
+
     def test_parse_action_valid_json(self) -> None:
-        raw_text = (
-            'Some thinking here... {"action": {"actionClass": "read_only", '
-            '"kind": "click", "point": [240, 480], "button": "left", '
-            '"description": "Click the submit button"}}'
+        # One pure JSON object with an action object: accepted.
+        raw_text = json.dumps(
+            {
+                "action": {
+                    "kind": "click",
+                    "point": [240, 480],
+                    "button": "left",
+                    "description": "Click the submit button",
+                }
+            }
         )
         action = ReachDriver.extract_action_from_text(raw_text)
         self.assertEqual(action.kind, "click")
@@ -103,6 +134,7 @@ class ReachDriverTests(unittest.TestCase):
         self.assertEqual(action.target, "Search input")
 
     def test_parse_action_markdown_fenced(self) -> None:
+        # A whole fenced JSON block (nothing before or after): accepted.
         raw_text = """```json
 {
   "action": {
@@ -116,7 +148,47 @@ class ReachDriverTests(unittest.TestCase):
         self.assertEqual(action.kind, "key")
         self.assertEqual(action.key, "Return")
 
-    def test_parse_action_auth_required_and_terminate(self) -> None:
+    def test_parse_action_rejects_surrounding_prose(self) -> None:
+        # Prose around a raw object or around a fenced block is rejected.
+        pure = json.dumps({"action": {"kind": "click", "point": [240, 480]}})
+        fenced = "```json\n" + pure + "\n```"
+        for response in (
+            "Sure, clicking now: " + pure,
+            pure + "\nLet me know if that works.",
+            "Here is my proposal:\n" + fenced,
+            fenced + "\nHope that helps.",
+        ):
+            with self.subTest(response=response), self.assertRaises(ValueError):
+                ReachDriver.extract_action_from_text(response)
+
+    def test_parse_action_terminate_requires_valid_outcome(self) -> None:
+        # Missing or invalid terminate outcome rejects.
+        for outcome in (None, "", "maybe", "success", "COMPLETED"):
+            action_data = {"kind": "terminate", "description": "Done"}
+            if outcome is not None:
+                action_data["outcome"] = outcome
+            with self.subTest(outcome=outcome), self.assertRaises(ValueError):
+                ReachDriver.extract_action_from_text(json.dumps({"action": action_data}))
+
+        # Each canonical outcome parses and is preserved on the action.
+        for outcome in ("completed", "blocked", "failed"):
+            with self.subTest(outcome=outcome):
+                action = ReachDriver.extract_action_from_text(
+                    json.dumps({"action": {"kind": "terminate", "outcome": outcome}})
+                )
+                self.assertEqual(action.kind, "terminate")
+                self.assertEqual(action.outcome, outcome)
+
+    def test_parse_action_rejects_nonnumeric_click_point(self) -> None:
+        # Malformed typed fields reject instead of silently degrading to a
+        # click without coordinates.
+        for point in (["left", 100], "center", [100]):
+            with self.subTest(point=point), self.assertRaises(ValueError):
+                ReachDriver.extract_action_from_text(
+                    json.dumps({"action": {"kind": "click", "point": point}})
+                )
+
+    def test_parse_action_auth_required(self) -> None:
         auth_text = json.dumps(
             {
                 "action": {
@@ -127,17 +199,6 @@ class ReachDriverTests(unittest.TestCase):
         )
         action_auth = ReachDriver.extract_action_from_text(auth_text)
         self.assertEqual(action_auth.kind, "auth_required")
-
-        term_text = json.dumps(
-            {
-                "action": {
-                    "kind": "terminate",
-                    "description": "Goal accomplished successfully",
-                }
-            }
-        )
-        action_term = ReachDriver.extract_action_from_text(term_text)
-        self.assertEqual(action_term.kind, "terminate")
 
     def test_auth_signals_regex(self) -> None:
         self.assertTrue(
@@ -151,57 +212,171 @@ class ReachDriverTests(unittest.TestCase):
             AUTH_SIGNALS_RE.search("Welcome to our blog article about computers")
         )
 
-    @patch.object(ReachDriver, "call_mcp_tool")
-    def test_execute_action_dispatches_correctly(self, mock_mcp: MagicMock) -> None:
-        mock_mcp.return_value = {"status": "ok"}
-
-        # Click action
-        self.driver.execute_action(
-            ReachAction(kind="click", point=(300, 450), button="right")
+    def test_invoke_agy_rejects_nonzero_exit_despite_stdout(self) -> None:
+        # A nonzero agy exit is never accepted, even when stdout carries a
+        # well-formed SUCCESS envelope proposing a completed termination.
+        decoy_stdout = json.dumps(
+            {
+                "status": "SUCCESS",
+                "response": json.dumps(
+                    {
+                        "action": {
+                            "kind": "terminate",
+                            "outcome": "completed",
+                            "description": "Done",
+                        }
+                    }
+                ),
+            }
         )
-        mock_mcp.assert_called_with(
-            "click", {"x": 300, "y": 450, "button": "right", "screen": 0}
+        fake_proc = subprocess.CompletedProcess(
+            args=[], returncode=1, stdout=decoy_stdout, stderr="boom"
         )
+        with patch(
+            "scripts.reach_drive.subprocess.run", return_value=fake_proc
+        ), self.assertRaises(RuntimeError):
+            self.driver.invoke_agy("prompt", "/tmp/dummy.png")
 
-        # Type action
-        self.driver.execute_action(ReachAction(kind="type", value="hello reach"))
-        mock_mcp.assert_called_with("type", {"text": "hello reach", "screen": 0})
+    # ------------------------------------------------------------------
+    # Ref parsing (accessibility-tree references)
+    # ------------------------------------------------------------------
 
-        # Key action
-        self.driver.execute_action(ReachAction(kind="key", key="Escape"))
-        mock_mcp.assert_called_with("key", {"combo": "Escape", "screen": 0})
+    def test_parse_ref_click_action_normalizes_ref(self) -> None:
+        raw_text = '{"action": {"kind": "click", "ref": "@e3", "button": "left", "description": "Click login"}}'
+        action = ReachDriver.extract_action_from_text(raw_text)
+        self.assertEqual(action.kind, "click")
+        self.assertEqual(action.ref, "@e3")
+        self.assertIsNone(action.point)
 
-        # Navigate action
-        self.driver.execute_action(
-            ReachAction(kind="navigate", target="https://example.com")
-        )
-        mock_mcp.assert_called_with(
-            "browse",
-            {"url": "https://example.com", "screen": 0, "use_profile": "default"},
+    def test_parse_ref_type_action_normalizes_ref(self) -> None:
+        raw_text = '{"action": {"kind": "type", "ref": "e1", "value": "alice@reach.io", "description": "Enter email"}}'
+        action = ReachDriver.extract_action_from_text(raw_text)
+        self.assertEqual(action.kind, "type")
+        self.assertEqual(action.ref, "@e1")
+        self.assertEqual(action.value, "alice@reach.io")
+
+    def test_capture_page_text_extracts_axtree_and_refs(self) -> None:
+        page_text_payload = json.dumps({
+            "status": "ok",
+            "url": "https://example.com/login",
+            "title": "Login",
+            "text": "Login page body text",
+            "axtree": "[heading \"Sign In\"]\n[@e1: textbox \"Email\" focused x=200 y=100 w=200 h=30]\n[@e2: button \"Submit\" x=200 y=150 w=80 h=30]",
+            "refs": {
+                "e1": {"ref": "e1", "role": "textbox", "name": "Email", "point": [300, 115]},
+                "e2": {"ref": "e2", "role": "button", "name": "Submit", "point": [240, 165]}
+            }
+        })
+
+        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
+            mock_mcp.return_value = {
+                "content": [{"type": "text", "text": page_text_payload}]
+            }
+            res = self.driver.capture_page_text("https://example.com/login")
+            self.assertIn("Accessibility Tree (Interact via @eN refs):", res)
+            self.assertIn("@e1: textbox \"Email\"", res)
+            self.assertIn("@e2: button \"Submit\"", res)
+
+    # ------------------------------------------------------------------
+    # Drive loop outcome contract
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _terminate_proposal(
+        description: str = "Found answer: 42",
+        outcome: str = "completed",
+    ) -> str:
+        return json.dumps(
+            {
+                "status": "SUCCESS",
+                "response": json.dumps(
+                    {
+                        "action": {
+                            "kind": "terminate",
+                            "outcome": outcome,
+                            "description": description,
+                        }
+                    }
+                ),
+            }
         )
 
     @patch.object(ReachDriver, "capture_screenshot")
     @patch.object(ReachDriver, "capture_page_text")
     @patch.object(ReachDriver, "invoke_agy")
-    def test_drive_loop_completes_on_terminate(
+    def test_drive_loop_completed_requires_fresh_matching_page_text(
         self, mock_agy: MagicMock, mock_text: MagicMock, mock_shot: MagicMock
     ) -> None:
         mock_shot.return_value = "/tmp/dummy.png"
-        mock_text.return_value = "Page content"
-        mock_agy.return_value = json.dumps(
-            {
-                "status": "SUCCESS",
-                "response": json.dumps(
-                    {"action": {"kind": "terminate", "description": "Found answer: 42"}}
-                ),
-            }
-        )
+        mock_agy.return_value = self._terminate_proposal()
 
-        result = self.driver.drive(goal="Find the answer")
+        # Fresh post-termination capture contains the caller postcondition:
+        # the only path to verified success.
+        mock_text.side_effect = [
+            "Loading data...",
+            "final report shows answer: 42 confirmed",
+        ]
+        driver = ReachDriver(
+            max_steps=1, enable_audit=False, completion_text="answer: 42"
+        )
+        try:
+            result = driver.drive(goal="Find the answer")
+        finally:
+            driver.cleanup()
         self.assertTrue(result.success)
         self.assertEqual(result.status, "completed")
         self.assertEqual(result.final_description, "Found answer: 42")
         self.assertEqual(len(result.steps), 1)
+
+        # A pre-action observation containing the marker does not count:
+        # only the freshly captured post-termination page text is
+        # authoritative, so a failed postcondition cannot yield success.
+        mock_text.side_effect = [
+            "answer: 42 was already visible",
+            "page changed, marker gone",
+        ]
+        driver = ReachDriver(
+            max_steps=1, enable_audit=False, completion_text="answer: 42"
+        )
+        try:
+            result = driver.drive(goal="Find the answer")
+        finally:
+            driver.cleanup()
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "postcondition_failed")
+
+        # An absent (unset) completion_text can never produce success,
+        # even when the fresh page text happens to contain the marker.
+        mock_text.side_effect = ["plain page", "answer: 42 present on screen"]
+        driver = ReachDriver(max_steps=1, enable_audit=False)
+        try:
+            result = driver.drive(goal="Find the answer")
+        finally:
+            driver.cleanup()
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "unverified")
+
+    @patch.object(ReachDriver, "capture_screenshot")
+    @patch.object(ReachDriver, "capture_page_text")
+    @patch.object(ReachDriver, "invoke_agy")
+    def test_drive_loop_blocked_outcome_is_unsuccessful(
+        self, mock_agy: MagicMock, mock_text: MagicMock, mock_shot: MagicMock
+    ) -> None:
+        mock_shot.return_value = "/tmp/dummy.png"
+        mock_text.return_value = "Page content"
+        mock_agy.return_value = self._terminate_proposal(
+            description="Hit a paywall", outcome="blocked"
+        )
+
+        driver = ReachDriver(
+            max_steps=1, enable_audit=False, completion_text="answer: 42"
+        )
+        try:
+            result = driver.drive(goal="Find the answer")
+        finally:
+            driver.cleanup()
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "blocked")
 
     @patch.object(ReachDriver, "capture_screenshot")
     @patch.object(ReachDriver, "capture_page_text")
@@ -296,59 +471,32 @@ class ReachDriverTests(unittest.TestCase):
 
         with patch("time.sleep"):  # skip sleep delays in test
             result = self.driver.drive(goal="Endless loop")
-
-    def test_parse_and_execute_ref_click_action(self) -> None:
-        raw_text = '{"action": {"kind": "click", "ref": "@e3", "button": "left", "description": "Click login"}}'
-        action = ReachDriver.extract_action_from_text(raw_text)
-        self.assertEqual(action.kind, "click")
-        self.assertEqual(action.ref, "@e3")
-        self.assertIsNone(action.point)
-
-        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
-            mock_mcp.return_value = {"status": "ok"}
-            self.driver.execute_action(action)
-            mock_mcp.assert_called_once_with(
-                "click",
-                {"ref": "@e3", "button": "left", "screen": 0},
-            )
-
-    def test_parse_and_execute_ref_type_action(self) -> None:
-        raw_text = '{"action": {"kind": "type", "ref": "e1", "value": "alice@reach.io", "description": "Enter email"}}'
-        action = ReachDriver.extract_action_from_text(raw_text)
-        self.assertEqual(action.kind, "type")
-        self.assertEqual(action.ref, "@e1")
-        self.assertEqual(action.value, "alice@reach.io")
-
-        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
-            mock_mcp.return_value = {"status": "ok"}
-            self.driver.execute_action(action)
-            mock_mcp.assert_called_once_with(
-                "type",
-                {"text": "alice@reach.io", "ref": "@e1", "screen": 0},
-            )
-
-    def test_capture_page_text_extracts_axtree_and_refs(self) -> None:
-        page_text_payload = json.dumps({
-            "status": "ok",
-            "url": "https://example.com/login",
-            "title": "Login",
-            "text": "Login page body text",
-            "axtree": "[heading \"Sign In\"]\n[@e1: textbox \"Email\" focused x=200 y=100 w=200 h=30]\n[@e2: button \"Submit\" x=200 y=150 w=80 h=30]",
-            "refs": {
-                "e1": {"ref": "e1", "role": "textbox", "name": "Email", "point": [300, 115]},
-                "e2": {"ref": "e2", "role": "button", "name": "Submit", "point": [240, 165]}
-            }
-        })
-
-        with patch.object(self.driver, "call_mcp_tool") as mock_mcp:
-            mock_mcp.return_value = {
-                "content": [{"type": "text", "text": page_text_payload}]
-            }
-            res = self.driver.capture_page_text("https://example.com/login")
-            self.assertIn("Accessibility Tree (Interact via @eN refs):", res)
-            self.assertIn("@e1: textbox \"Email\"", res)
-            self.assertIn("@e2: button \"Submit\"", res)
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "max_steps_exceeded")
+        self.assertEqual(len(result.steps), self.driver.max_steps)
 
 
+    def test_injection_proposal_contains_only_server_record_fields(self) -> None:
+        action = ReachDriver.extract_action_from_text(
+            json.dumps({
+                "action": {
+                    "kind": "inject",
+                    "record_kind": "card",
+                    "id": "card_123",
+                    "domain": "shop.example",
+                    "submit": True,
+                }
+            })
+        )
+        self.assertEqual(action.record_kind, "card")
+        self.assertEqual(action.record_id, "card_123")
+        self.assertEqual(action.domain, "shop.example")
+        self.assertTrue(action.submit)
+        self.assertNotIn("card_number", action.to_dict())
+        self.assertNotIn("cvv", action.to_dict())
+
+    def test_nonterminal_status_cannot_be_successful(self) -> None:
+        result = DriveResult(success=True, status="uncertain")
+        self.assertFalse(result.success)
 if __name__ == "__main__":
     unittest.main()

@@ -76,9 +76,8 @@ class TestRoutineRecorder(unittest.TestCase):
         )
         self.assertEqual(step1.step_index, 1)
         self.assertEqual(step1.action_type, "navigate")
-        self.assertEqual(step1.url, "https://www.google.com")
-        self.assertTrue(step1.before_frame.endswith("step_001_before.png"))
-        self.assertTrue(step1.after_frame.endswith("step_001_after.png"))
+        self.assertIsNone(step1.before_frame)
+        self.assertIsNone(step1.after_frame)
 
         # Step 2: click input field with selector & ARIA tag
         step2 = recorder.record_step(
@@ -127,11 +126,12 @@ class TestRoutineRecorder(unittest.TestCase):
         self.assertEqual(data["screen"], 0)
         self.assertEqual(len(data["steps"]), 4)
 
-        # Verify frame files saved under frames/
-        frames_dir = Path(self.temp_dir) / "test_record_flow" / "frames"
-        self.assertTrue((frames_dir / "step_001_before.png").is_file())
-        self.assertTrue((frames_dir / "step_001_after.png").is_file())
-        self.assertTrue((frames_dir / "step_004_after.png").is_file())
+        # Screenshots are ephemeral and never archived.
+        self.assertFalse((Path(self.temp_dir) / "test_record_flow" / "frames").exists())
+        self.assertTrue(
+            all(not call.args and not call.kwargs for call in self.mock_driver.capture_page_text.call_args_list)
+        )
+
 
     def test_record_actions_with_semantic_reference(self) -> None:
         recorder = RoutineRecorder(
@@ -197,10 +197,8 @@ class TestRoutineRecorder(unittest.TestCase):
             "url": "https://example.com/checkout",
         })
         self.assertEqual(len(recorder.steps), 2)
-        self.assertEqual(recorder.steps[1].action_type, "type")
-        self.assertEqual(recorder.steps[1].text, "john_doe@example.com")
-        self.assertEqual(recorder.steps[1].reference, "@e2")
-
+        self.assertIsNone(recorder.steps[1].text)
+        self.assertIsNone(recorder.steps[1].input_name)
         # Process key event
         tap._process_event({
             "type": "key",
@@ -251,7 +249,7 @@ class TestRoutineCompiler(unittest.TestCase):
                     timestamp="2026-09-05T00:00:01Z",
                     action_type="navigate",
                     url="https://duckduckgo.com",
-                    after_frame="frames/step_001_after.png",
+                    metadata={"after_frame_hash": compute_frame_hash_hex(self.frame1)},
                 ),
                 TraceStep(
                     step_index=2,
@@ -267,9 +265,10 @@ class TestRoutineCompiler(unittest.TestCase):
                     timestamp="2026-09-05T00:00:05Z",
                     action_type="type",
                     text="Tesla Motors",
+                    input_name="query",
                     selector="input#searchbox_input",
                     aria_tag="Search query",
-                    dom_snapshot="Search Results Dashboard",
+                    metadata={"dom_keywords": ["dashboard"]},
                 ),
             ],
         )
@@ -277,26 +276,24 @@ class TestRoutineCompiler(unittest.TestCase):
         compiler = RoutineCompiler(screen_width=1280, screen_height=720)
         compiled = compiler.compile(trace, routines_dir=self.temp_dir)
 
-        # 1. Parameterization: "Tesla Motors" should be extracted into "query"
         self.assertIn("query", compiled.parameters)
-        self.assertEqual(compiled.parameters["query"], "Tesla Motors")
-
+        self.assertIsNone(compiled.parameters["query"])
         # 2. Normalized coordinates for step 2
         click_step = compiled.steps[1]
         self.assertEqual(click_step.action.point, (640, 360))
         self.assertEqual(click_step.action.normalized_point, (0.5, 0.5))
         self.assertEqual(click_step.action.selector, "input#searchbox_input")
-
-        # 3. Parameter placeholder injected into step 3 value
         type_step = compiled.steps[2]
+
         self.assertEqual(type_step.action.value, "{{query}}")
 
         # 4. Injected Checkpoints
         nav_step = compiled.steps[0]
         # URL checkpoint on navigate
-        url_cps = [c for c in nav_step.checkpoints if c.type == "url_contains"]
+        url_cps = [c for c in nav_step.checkpoints if c.type == "url_origin_equals"]
         self.assertTrue(len(url_cps) >= 1)
-        self.assertIn("duckduckgo.com", url_cps[0].value)
+        self.assertEqual(url_cps[0].value, "https://duckduckgo.com")
+
 
         # Visual pHash checkpoint on navigate after_frame
         phash_cps = [c for c in nav_step.checkpoints if c.type == "visual_phash"]
@@ -311,6 +308,61 @@ class TestRoutineCompiler(unittest.TestCase):
         # routine.json written to disk
         routine_json_path = self.routine_dir / "routine.json"
         self.assertTrue(routine_json_path.is_file())
+
+    def test_navigation_path_query_uses_named_runtime_url(self) -> None:
+        trace = RoutineTrace(
+            name="url_routine",
+            screen=0,
+            created_at="2026-09-05T00:00:00Z",
+            steps=[
+                TraceStep(
+                    step_index=1,
+                    timestamp="2026-09-05T00:00:01Z",
+                    action_type="navigate",
+                    url="https://example.test/path?secret=canary",
+                )
+            ],
+        )
+
+        compiled = RoutineCompiler().compile(trace, routines_dir=self.temp_dir)
+        action = compiled.steps[0].action
+
+        self.assertEqual(action.url, "https://example.test")
+        self.assertIsInstance(action.input_name, str)
+        self.assertIn(action.input_name, compiled.parameters)
+        self.assertIsNone(compiled.parameters[action.input_name])
+        self.assertEqual(action.to_dict()["url"], "https://example.test")
+
+        persisted = (Path(self.temp_dir) / "url_routine" / "routine.json").read_text(
+            encoding="utf-8"
+        )
+        self.assertNotIn("canary", persisted)
+        self.assertNotIn("/path", persisted)
+        credential_trace = RoutineTrace(
+            name="credential_root",
+            screen=0,
+            created_at="2026-09-05T00:00:00Z",
+            steps=[
+                TraceStep(
+                    step_index=1,
+                    timestamp="2026-09-05T00:00:01Z",
+                    action_type="navigate",
+                    url="https://alice:secret@example.test/",
+                )
+            ],
+        )
+        credential_compiled = RoutineCompiler().compile(
+            credential_trace, routines_dir=self.temp_dir  # gitleaks:allow -- keyword arguments, not a secret
+        )
+        credential_action = credential_compiled.steps[0].action
+        self.assertEqual(credential_action.url, "https://example.test")
+        self.assertIsInstance(credential_action.input_name, str)
+        credential_persisted = (
+            Path(self.temp_dir) / "credential_root" / "routine.json"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("alice", credential_persisted)
+        self.assertNotIn("secret", credential_persisted)
+
 
     def test_compile_trace_with_semantic_reference(self) -> None:
         trace_data = {
@@ -380,8 +432,8 @@ class TestRoutineReplayer(unittest.TestCase):
                     },
                     "checkpoints": [
                         {
-                            "type": "url_contains",
-                            "value": "example.com",
+                            "type": "url_origin_equals",
+                            "value": "https://example.com",
                             "description": "URL check",
                         },
                         {
@@ -396,6 +448,7 @@ class TestRoutineReplayer(unittest.TestCase):
                     "step_index": 2,
                     "action": {
                         "kind": "type",
+                        "input_name": "query",
                         "value": "{{query}}",
                         "selector": "input#query",
                         "description": "Type search keyword",
@@ -428,7 +481,8 @@ class TestRoutineReplayer(unittest.TestCase):
 
     def test_deterministic_replay_success_with_parameter_override(self) -> None:
         # Mock URL and DOM page text to satisfy checkpoints
-        self.mock_driver.call_mcp_tool.return_value = {"url": "https://example.com/search?q=Tesla"}
+        self.mock_driver.call_mcp_tool.return_value = {"isError": False, "content": [
+            {"type": "text", "text": json.dumps({"status": "ok", "url": "https://example.com/search?q=Tesla"})}]}
         self.mock_driver.capture_page_text.return_value = "Operation Success: Tesla results loaded"
 
         replayer = RoutineReplayer(
@@ -442,12 +496,90 @@ class TestRoutineReplayer(unittest.TestCase):
         self.assertTrue(res.success)
         self.assertEqual(res.status, "completed")
         self.assertEqual(res.steps_executed, 2)
-        self.assertEqual(res.parameters_used["query"], "Tesla")
+        self.assertIn("query", res.parameters_used)
+        self.assertNotIn("Tesla", json.dumps(res.to_dict()))
         self.assertFalse(res.healed)
+    def test_lookalike_origin_checkpoint_stops_before_named_input(self) -> None:
+        self.mock_driver.call_mcp_tool.return_value = {
+            "isError": False,
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "ok", "url": "https://example.com.evil.test/search",
+            })}],
+        }
+        self.mock_driver.capture_page_text.return_value = "Operation Success"
+        replayer = RoutineReplayer(
+            routine_name="demo_routine",
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+            heal_with_cua=False,
+        )
+
+        result = replayer.replay(params={"query": "Tesla"})
+
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "failed")
+        self.assertEqual(self.mock_driver.execute_action.call_count, 1)
+
+    def test_runtime_url_input_is_required_and_delivered_in_full(self) -> None:
+        recorder_driver = MagicMock()
+        recorder_driver.capture_screenshot.return_value = None
+        recorder_driver.capture_page_text.return_value = ""
+        recorder = RoutineRecorder(
+            routine_name="demo_routine",
+            screen=0,
+            routines_dir=self.temp_dir,
+            driver=recorder_driver,
+        )
+        recorder.record_step(
+            action_type="navigate",
+            url="https://example.test/path?secret=canary",
+            execute=False,
+        )
+        trace_file = self.routine_dir / "trace.json"
+        self.assertTrue(trace_file.is_file())
+        trace_payload = trace_file.read_text(encoding="utf-8")
+        self.assertNotIn("canary", trace_payload)
+        self.assertNotIn("/path", trace_payload)
+
+        RoutineCompiler().compile("demo_routine", routines_dir=self.temp_dir)
+        replayer = RoutineReplayer(
+            routine_name="demo_routine",
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+            heal_with_cua=False,
+        )
+        input_name = replayer.routine.steps[0].action.input_name
+        self.assertIsInstance(input_name, str)
+
+        missing = replayer.replay(params={})
+        self.assertFalse(missing.success)
+        self.assertEqual(missing.status, "missing_parameters")
+        self.mock_driver.execute_action.assert_not_called()
+
+        wrong_origin = replayer.replay(
+            params={input_name: "https://evil.test/path?secret=canary"}
+        )
+        self.assertFalse(wrong_origin.success)
+        self.assertEqual(wrong_origin.status, "invalid_parameters")
+        self.mock_driver.execute_action.assert_not_called()
+
+        full_url = "https://example.test/path?secret=canary"
+        self.mock_driver.call_mcp_tool.return_value = {
+            "isError": False,
+            "content": [{"type": "text", "text": json.dumps({"status": "ok", "url": full_url})}],
+        }
+        replayed = replayer.replay(params={input_name: full_url})
+        self.assertTrue(replayed.success)
+        action = self.mock_driver.execute_action.call_args[0][0]
+        self.assertEqual(action.value, full_url)
+        self.assertEqual(action.target, full_url)
+        self.assertNotIn("canary", json.dumps(replayed.to_dict()))
+
 
     def test_checkpoint_failure_triggers_cua_self_healing(self) -> None:
         # Checkpoint failure: page text returns "404 Not Found", missing "success"
-        self.mock_driver.call_mcp_tool.return_value = {"url": "https://example.com/search"}
+        self.mock_driver.call_mcp_tool.return_value = {"isError": False, "content": [
+            {"type": "text", "text": json.dumps({"status": "ok", "url": "https://example.com/search"})}]}
         self.mock_driver.capture_page_text.return_value = "Layout shifted: 404 Not Found"
 
         # Mock the CUA vision driver for healing
@@ -501,15 +633,56 @@ class TestRoutineReplayer(unittest.TestCase):
         self.assertTrue(res.healed)
         self.assertTrue(len(res.healed_steps) >= 1)
 
-        # Verify routine.json was healed and written to disk
         with open(self.routine_dir / "routine.json", "r", encoding="utf-8") as f:
-            healed_json = json.load(f)
+            self.assertEqual(json.load(f), self.routine_data)
 
-        self.assertIsNotNone(healed_json["healed_at"])
-        self.assertGreaterEqual(healed_json["version"], 2)
-        # Newly recorded action was spliced into the routine
-        step_kinds = [s["action"]["kind"] for s in healed_json["steps"]]
-        self.assertIn("click", step_kinds)
+    def test_healing_model_success_cannot_bypass_failed_postcondition(self) -> None:
+        replayer = RoutineReplayer(
+            routine_name="demo_routine", routines_dir=self.temp_dir,
+            driver=self.mock_driver, heal_with_cua=True,
+        )
+        self.mock_driver.capture_page_text.return_value = "Still broken"
+        step = replayer.routine.steps[1]
+        proposal = DriveResult(success=True, status="completed")
+        with patch.object(ReachDriver, "drive", return_value=proposal):
+            recovered, _, _, _ = replayer._heal_step(step, step.action, "broken", {}, 1)
+        self.assertFalse(recovered)
+
+    def test_uncertain_mutation_stops_recovery_without_healing(self) -> None:
+        self.mock_driver.call_mcp_tool.return_value = {
+            "isError": False,
+            "content": [{"type": "text", "text": json.dumps({
+                "status": "ok", "url": "https://example.com/search",
+            })}],
+        }
+        self.mock_driver.execute_action.return_value = {
+            "status": "uncertain",
+            "error": "transport outcome unknown",
+        }
+        replayer = RoutineReplayer(
+            routine_name="demo_routine",
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+            heal_with_cua=True,
+        )
+        with patch.object(ReachDriver, "drive") as drive:
+            result = replayer.replay(params={"query": "Tesla"})
+        self.assertFalse(result.success)
+        self.assertEqual(result.status, "uncertain")
+        drive.assert_not_called()
+
+    def test_invalid_visual_hash_fails_checkpoint(self) -> None:
+        replayer = RoutineReplayer(
+            routine_name="demo_routine",
+            routines_dir=self.temp_dir,
+            driver=self.mock_driver,
+            heal_with_cua=False,
+        )
+        checkpoint = Checkpoint(type="visual_phash", expected_hash="not-a-hash", threshold=1.0)
+        valid, failed, reason = replayer._validate_checkpoints([checkpoint])
+        self.assertFalse(valid)
+        self.assertIs(failed, checkpoint)
+        self.assertIn("valid evidence", reason)
 
     def test_deterministic_replay_dispatches_ref(self) -> None:
         action = CompiledAction(
@@ -533,6 +706,12 @@ class TestRoutineReplayer(unittest.TestCase):
 
 class TestTemplateAndHashingUtilities(unittest.TestCase):
     """Test helper functions."""
+
+    def test_invalid_frame_cannot_become_a_visual_checkpoint(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            frame = Path(directory) / "invalid.png"
+            frame.write_bytes(b"not an image")
+            self.assertIsNone(compute_frame_hash_hex(frame))
 
     def test_render_template_double_and_single_braces(self) -> None:
         params = {"company": "Acme Corp", "role": "Engineer"}

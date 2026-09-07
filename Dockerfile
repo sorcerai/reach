@@ -75,25 +75,19 @@ RUN pip install --break-system-packages \
     && scrapling install \
     && rm -rf /var/lib/apt/lists/*
 
-# Layer 5: noVNC
-RUN git_url="https://github.com/novnc/noVNC.git" && \
-    apt-get update && apt-get install -y --no-install-recommends git && \
-    git clone --branch v1.5.0 --depth 1 $git_url /opt/noVNC && \
-    git clone --branch v0.12.0 --depth 1 https://github.com/novnc/websockify /opt/noVNC/utils/websockify && \
-    apt-get purge -y git && apt-get autoremove -y && rm -rf /var/lib/apt/lists/*
-
-# Layer 6: reach-supervisor binary
+# Layer 5: reach-supervisor binary
 COPY --from=builder /build/target/release/reach-supervisor /usr/local/bin/reach-supervisor
 
 COPY scripts/reach-chrome /usr/local/bin/reach-chrome
 COPY scripts/reach-wallpaper /usr/local/bin/reach-wallpaper
 COPY scripts/reach-home /usr/local/bin/reach-home
+COPY scripts/reach_viewer_auth.py /opt/reach/reach_viewer_auth.py
 RUN chmod +x /usr/local/bin/reach-chrome /usr/local/bin/reach-wallpaper /usr/local/bin/reach-home \
     && mkdir -p /etc/chromium/policies/managed /opt/reach \
+    && chmod 0644 /opt/reach/reach_viewer_auth.py \
     && chmod -R a+rX /opt/ms-playwright
 COPY assets/home.html /opt/reach/home.html
-COPY assets/reach-banner.js /opt/noVNC/reach-banner.js
-RUN chmod -R a+rX /opt/reach /opt/noVNC/reach-banner.js
+RUN chmod -R a+rX /opt/reach
 COPY config/chrome-policies.json /etc/chromium/policies/managed/reach.json
 
 # Layer 7: User + permissions + X11 socket dir
@@ -107,7 +101,8 @@ COPY config/chrome-policies.json /etc/opt/chrome/policies/managed/reach.json
 # Openbox config and Chrome profiles
 RUN mkdir -p /home/sandbox/.config/openbox /home/sandbox/.config/google-chrome-profiles
 COPY config/openbox-rc.xml /home/sandbox/.config/openbox/rc.xml
-RUN chown -R sandbox:sandbox /home/sandbox
+RUN chown -R sandbox:sandbox /home/sandbox \
+    && install -d -o sandbox -g sandbox -m 0700 /run/reach
 
 USER sandbox
 WORKDIR /home/sandbox
