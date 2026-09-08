@@ -1,7 +1,7 @@
 use clap::Args;
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::DockerClient;
+use reach_cli::runtime::RuntimeClient;
 
 use super::create::read_lifecycle_manifest;
 
@@ -12,11 +12,12 @@ pub struct DestroyArgs {
 }
 
 pub async fn run(args: DestroyArgs) -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let inspected = docker.inspect_config(&args.target).await?;
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
+    let sandbox = runtime.find(&args.target).await?;
+    let inspected = runtime.inspect_config(&sandbox.container_id).await?;
     let (manifest_path, _) = read_lifecycle_manifest(&cfg, &inspected)?;
-    docker.destroy(&args.target).await?;
+    runtime.destroy(&sandbox.container_id).await?;
     std::fs::remove_file(&manifest_path).map_err(|error| {
         anyhow::anyhow!(
             "sandbox '{}' was destroyed, but lifecycle manifest '{}' could not be removed: {}",

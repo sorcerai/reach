@@ -1,9 +1,9 @@
 use clap::Args;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::DockerClient;
 use reach_cli::mcp::{
     JsonRpcRequest, JsonRpcResponse, McpInitializeResult, RequestId, tool_definitions,
 };
+use reach_cli::runtime::RuntimeClient;
 use reach_cli::tools::{ToolContext, dispatch};
 use std::io::{BufRead, Write};
 
@@ -14,13 +14,13 @@ pub struct ConnectArgs {
 }
 
 pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let _sandbox = docker.find(&args.target).await?;
-    let profile_broker = reach_cli::profile::ProfileBroker::default_broker();
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
+    let _sandbox = runtime.find(&args.target).await?;
+    let profile_broker = reach_cli::profile::ProfileBroker::default_broker()?;
     let cookie_jars = reach_cli::profile::CookieJarService::default_service();
     let ctx = ToolContext {
-        docker: &docker,
+        runtime: &runtime,
         public_host: cfg.server.effective_public_host(),
         agent: None,
         profile_broker: Some(&profile_broker),

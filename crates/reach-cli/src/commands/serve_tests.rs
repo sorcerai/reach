@@ -4,8 +4,13 @@ use axum::http::Request;
 use tower::ServiceExt;
 
 fn test_state(auth_token: Option<&str>) -> Arc<AppState> {
-    let docker = DockerClient::new(None).unwrap();
-    let agent = AgentState::new(2);
+    let runtime =
+        RuntimeClient::from_config(&ReachConfig::default()).expect("default runtime config");
+    test_state_with_runtime(Arc::new(runtime), auth_token)
+}
+
+fn test_state_with_runtime(runtime: Arc<RuntimeClient>, auth_token: Option<&str>) -> Arc<AppState> {
+    let agent = Arc::new(AgentState::new(2));
     let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::new(
         std::path::PathBuf::from("/tmp/reach-test-profiles"),
     ));
@@ -13,7 +18,7 @@ fn test_state(auth_token: Option<&str>) -> Arc<AppState> {
         std::path::PathBuf::from("/tmp/reach-test-jars"),
     ));
     Arc::new(AppState {
-        docker,
+        runtime,
         default_sandbox: Some("fixture".into()),
         public_host: "127.0.0.1".into(),
         bind_host: "127.0.0.1".into(),
@@ -24,7 +29,136 @@ fn test_state(auth_token: Option<&str>) -> Arc<AppState> {
         accounts: Default::default(),
         viewer_sessions: Default::default(),
         raw_viewer_token: "test-only-backend-token".into(),
+        viewer_token_target: tokio::sync::Mutex::new(None),
     })
+}
+
+async fn metadata_runtime(
+    reset_success: bool,
+) -> (
+    Arc<RuntimeClient>,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+) {
+    metadata_runtime_with_reset_gate(reset_success, None).await
+}
+
+async fn metadata_runtime_with_reset_gate(
+    reset_success: bool,
+    reset_gate: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+) -> (
+    Arc<RuntimeClient>,
+    tokio::task::JoinHandle<()>,
+    Arc<std::sync::atomic::AtomicUsize>,
+    std::path::PathBuf,
+) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixListener;
+
+    let socket = std::env::temp_dir().join(format!(
+        "reach-serve-test-{}.sock",
+        uuid::Uuid::new_v4().simple()
+    ));
+    let listener = UnixListener::bind(&socket).expect("bind metadata broker");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let observed_calls = Arc::clone(&calls);
+    let task = tokio::spawn(async move {
+        let mut reset_gate = reset_gate;
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            observed_calls.fetch_add(1, Ordering::Relaxed);
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 4096];
+            let content_length = loop {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+                let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                else {
+                    continue;
+                };
+                let header = String::from_utf8_lossy(&request[..header_end]);
+                break header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Content-Length:"))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+            };
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap()
+                + 4;
+            while request.len() < header_end + content_length {
+                let Ok(read) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if read == 0 {
+                    return;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let payload: serde_json::Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length]).unwrap();
+            let method = payload
+                .get("method")
+                .and_then(|value| value.as_str())
+                .unwrap();
+            let result = match method {
+                "list" => serde_json::json!([{
+                    "name": "fixture",
+                    "container_id": "00000000-0000-4000-8000-000000000001",
+                    "status": "running",
+                    "image": "fixture",
+                    "ports": {
+                        "vnc": null,
+                        "novnc": 6080,
+                        "health": null,
+                        "screens": 2,
+                        "extra": []
+                    },
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "allow_exec": false
+                }]),
+                "incarnation" => serde_json::json!("fixture-incarnation"),
+                "exec_input" => {
+                    if let Some((started, release)) = reset_gate.take() {
+                        started.notify_one();
+                        release.notified().await;
+                    }
+                    serde_json::json!({
+                        "exit_code": if reset_success { 0 } else { 1 },
+                        "stdout": "",
+                        "stderr": if reset_success { "" } else { "reset failed" }
+                    })
+                }
+                _ => return,
+            };
+            let body = serde_json::to_vec(&serde_json::json!({"result": result})).unwrap();
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            if stream.write_all(response.as_bytes()).await.is_err()
+                || stream.write_all(&body).await.is_err()
+            {
+                return;
+            }
+        }
+    });
+    let mut config = ReachConfig::default();
+    config.runtime.backend = reach_cli::config::RuntimeBackend::Microvm;
+    config.runtime.broker_socket = Some(socket.clone());
+    let runtime = RuntimeClient::from_config(&config).expect("metadata runtime config");
+    (Arc::new(runtime), task, calls, socket)
 }
 
 #[test]
@@ -606,7 +740,8 @@ async fn test_takeover_state_machine_http_endpoints_and_gating() {
 
 #[tokio::test]
 async fn test_tool_call_locked_profile_returns_http_423() {
-    let state = test_state(None);
+    let (runtime, server, _, socket) = metadata_runtime(true).await;
+    let state = test_state_with_runtime(runtime, None);
     let app = build_app(state.clone());
 
     // Acquire lock on profile "test-work" via state.profile_broker
@@ -635,11 +770,14 @@ async fn test_tool_call_locked_profile_returns_http_423() {
     let body_json: serde_json::Value = serde_json::from_slice(&body_bytes).unwrap();
     assert_eq!(body_json.get("error").unwrap(), "profile_locked");
     assert_eq!(body_json.get("profile").unwrap(), "test-work");
+    server.abort();
+    let _ = std::fs::remove_file(socket);
 }
 
 #[tokio::test]
 async fn test_mcp_tool_call_locked_profile_returns_error() {
-    let state = test_state(None);
+    let (runtime, server, _, socket) = metadata_runtime(true).await;
+    let state = test_state_with_runtime(runtime, None);
     let app = build_app(state.clone());
 
     // Acquire lock on profile "test-work-mcp" via state.profile_broker
@@ -695,6 +833,8 @@ async fn test_mcp_tool_call_locked_profile_returns_error() {
     let err_obj: serde_json::Value = serde_json::from_str(text).expect("text should be json");
     assert_eq!(err_obj.get("error").unwrap(), "profile_locked");
     assert_eq!(err_obj.get("profile").unwrap(), "test-work-mcp");
+    server.abort();
+    let _ = std::fs::remove_file(socket);
 }
 
 #[tokio::test]
@@ -942,7 +1082,8 @@ async fn test_takeover_busy_drain_and_timeout() {
 
 #[tokio::test]
 async fn test_lease_screen_is_creation_only_for_same_owner_label() {
-    let state = test_state(None);
+    let (runtime, server, calls, socket) = metadata_runtime(true).await;
+    let state = test_state_with_runtime(runtime, None);
     let app = build_app(state.clone());
 
     let lease = state.agent.lease_screen(0, "worker-a").unwrap();
@@ -981,6 +1122,91 @@ async fn test_lease_screen_is_creation_only_for_same_owner_label() {
         state.agent.lease_token(0).as_deref(),
         Some(lease.token.as_str())
     );
+    assert_eq!(
+        calls.load(std::sync::atomic::Ordering::Relaxed),
+        0,
+        "rejected lease must not contact the runtime",
+    );
+    server.abort();
+    let _ = std::fs::remove_file(socket);
+}
+#[tokio::test]
+async fn test_failed_lease_reset_rolls_back_only_provisional_authority() {
+    let (runtime, server, _, socket) = metadata_runtime(false).await;
+    let state = test_state_with_runtime(runtime, None);
+    let app = build_app(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/screens/0/lease")
+        .header("Host", "127.0.0.1:4200")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"owner": "worker"}"#))
+        .unwrap();
+    let res = app.oneshot(req).await.unwrap();
+    assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!state.agent.is_leased(0));
+    assert!(!state.agent.is_busy(0));
+    assert_eq!(state.agent.lease_token(0), None);
+    server.abort();
+    let _ = std::fs::remove_file(socket);
+}
+
+#[tokio::test]
+async fn test_cancelled_lease_request_rolls_back_after_reset_finishes() {
+    let reset_started = Arc::new(tokio::sync::Notify::new());
+    let reset_release = Arc::new(tokio::sync::Notify::new());
+    let (runtime, server, _, socket) = metadata_runtime_with_reset_gate(
+        true,
+        Some((Arc::clone(&reset_started), Arc::clone(&reset_release))),
+    )
+    .await;
+    let state = test_state_with_runtime(runtime, None);
+    let app = build_app(state.clone());
+
+    let req = Request::builder()
+        .method("POST")
+        .uri("/agent/screens/0/lease")
+        .header("Host", "127.0.0.1:4200")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"owner": "cancelled-worker"}"#))
+        .unwrap();
+    let handler = tokio::spawn(app.clone().oneshot(req));
+    tokio::time::timeout(std::time::Duration::from_secs(1), reset_started.notified())
+        .await
+        .expect("lease reset did not reach the broker");
+
+    assert!(
+        state.agent.lease_token(0).is_some(),
+        "lease authority must be provisional while reset is running",
+    );
+    handler.abort();
+    assert!(handler.await.unwrap_err().is_cancelled());
+    assert!(state.agent.is_busy(0));
+
+    reset_release.notify_one();
+    assert!(
+        state
+            .agent
+            .wait_for_drain(0, std::time::Duration::from_secs(1))
+            .await,
+        "detached reset did not release its admission",
+    );
+    assert!(!state.agent.is_leased(0));
+    assert_eq!(state.agent.lease_token(0), None);
+
+    let retry = Request::builder()
+        .method("POST")
+        .uri("/agent/screens/0/lease")
+        .header("Host", "127.0.0.1:4200")
+        .header("Content-Type", "application/json")
+        .body(Body::from(r#"{"owner": "replacement-worker"}"#))
+        .unwrap();
+    let response = app.oneshot(retry).await.unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+
+    server.abort();
+    let _ = std::fs::remove_file(socket);
 }
 
 #[tokio::test]

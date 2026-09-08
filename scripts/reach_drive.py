@@ -1437,6 +1437,7 @@ class ReachDriver:
                 data = json.loads(r.read().decode("utf-8") or "{}")
                 if isinstance(data, dict) and "handoff_gen" in data:
                     self.handoff_gen = int(data["handoff_gen"])
+                    self._clear_observation()
                 return data
         except Exception as e:
             logger.warning("Failed to set takeover for screen %s: %s", self.screen, e)
@@ -1449,6 +1450,38 @@ class ReachDriver:
             raise ValueError("invalid Reach API origin")
         return f"{origin}/viewer/{self.screen}"
 
+    @staticmethod
+    def _is_observation_call(tool_name: str, arguments: Dict[str, Any]) -> bool:
+        return tool_name in {"screenshot", "page_text"} or (
+            tool_name == "browse" and arguments.get("snapshot") is True
+        )
+
+    def _clear_observation(self) -> None:
+        self.observation_gen = None
+        self._last_observation_meta = {}
+
+    def _retain_observation_meta(
+        self,
+        meta: Dict[str, Any],
+        request_token: Optional[str],
+        request_handoff: Optional[int],
+    ) -> None:
+        """Accept server metadata only while the initiating lease is still current."""
+        if request_token != self.lease_token or request_handoff != self.handoff_gen:
+            raise StaleObservationError("observation response crossed lease or handoff boundary")
+        if type(meta.get("observation_gen")) is not int:
+            raise StaleObservationError("observation response omitted a valid generation")
+        previous = self._last_observation_meta
+        if isinstance(previous, dict):
+            for field in ("incarnation", "task_id", "attempt_id"):
+                if previous.get(field) is not None and meta.get(field) != previous[field]:
+                    raise StaleObservationError("observation response crossed lease identity")
+            old_gen = previous.get("observation_gen")
+            if type(old_gen) is int and meta["observation_gen"] < old_gen:
+                raise StaleObservationError("observation response is older than the current observation")
+        self.observation_gen = meta["observation_gen"]
+        self._last_observation_meta = dict(meta)
+
     def call_mcp_tool(
         self,
         tool_name: str,
@@ -1457,9 +1490,14 @@ class ReachDriver:
         mutation: bool = False,
     ) -> Dict[str, Any]:
         """Call a Reach tool, fencing observations and mutation outcomes."""
+        request_screen = self.screen
+        request_token = self.lease_token
+        request_handoff = self.handoff_gen
         args_with_screen = dict(arguments)
-        if "screen" not in args_with_screen:
-            args_with_screen["screen"] = self.screen
+        caller_screen = args_with_screen.get("screen")
+        if caller_screen is not None and caller_screen != request_screen:
+            raise ReachToolError("tool request screen does not match driver binding")
+        args_with_screen["screen"] = request_screen
         if self.sandbox and "sandbox" not in args_with_screen:
             args_with_screen["sandbox"] = self.sandbox
         mutation = mutation or tool_name in {
@@ -1506,6 +1544,10 @@ class ReachDriver:
                 ) from exc
             raise RuntimeError("Reach tool transport failure") from exc
 
+        if (request_screen != self.screen
+                or request_token != self.lease_token
+                or request_handoff != self.handoff_gen):
+            raise StaleObservationError("tool response crossed lease, screen, or handoff boundary")
         if not isinstance(resp, dict):
             raise UncertainMutationError("malformed mutation response") if mutation else ReachToolError("malformed tool response")
         if "error" in resp:
@@ -1513,11 +1555,6 @@ class ReachDriver:
         result = resp.get("result")
         if not isinstance(result, dict) or not isinstance(result.get("content"), list):
             raise UncertainMutationError("malformed mutation receipt") if mutation else ReachToolError("malformed tool receipt")
-        meta = result.get("_meta")
-        if isinstance(meta, dict):
-            self._last_observation_meta = dict(meta)
-            if isinstance(meta.get("observation_gen"), int):
-                self.observation_gen = meta["observation_gen"]
         if result.get("isError") is not False:
             for part in result["content"]:
                 if not isinstance(part, dict) or part.get("type") != "text":
@@ -1538,6 +1575,16 @@ class ReachDriver:
                 if isinstance(failure.get("http_status"), int) and failure["http_status"] < 500:
                     raise ReachToolError("server rejected tool request")
             raise UncertainMutationError("ambiguous mutation failure") if mutation else ReachToolError("tool failed")
+        if self._is_observation_call(tool_name, args_with_screen):
+            meta = result.get("_meta")
+            if self.lease_token and not isinstance(meta, dict):
+                raise StaleObservationError("leased observation response omitted metadata")
+            if isinstance(meta, dict):
+                self._retain_observation_meta(meta, request_token, request_handoff)
+        elif tool_name == "auth_handoff":
+            self._clear_observation()
+        else:
+            self.observation_gen = None
         for part in result["content"]:
             if isinstance(part, dict) and part.get("type") == "text":
                 try:

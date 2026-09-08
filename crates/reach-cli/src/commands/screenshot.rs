@@ -1,7 +1,7 @@
 use clap::Args;
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::DockerClient;
+use reach_cli::runtime::RuntimeClient;
 use std::io::Write;
 
 #[derive(Args)]
@@ -19,10 +19,10 @@ pub struct ScreenshotArgs {
 }
 
 pub async fn run(args: ScreenshotArgs) -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
     let display = reach_cli::tools::display_for(args.screen);
-    let png_bytes = docker.screenshot(&args.target, &display).await?;
+    let png_bytes = runtime.screenshot(&args.target, &display).await?;
 
     match args.output {
         Some(path) => {

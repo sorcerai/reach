@@ -15,8 +15,8 @@ action-proposal contract:
 """
 
 import json
-import subprocess
 from pathlib import Path
+import subprocess
 import sys
 import unittest
 from unittest.mock import MagicMock, patch
@@ -32,8 +32,10 @@ from scripts.reach_drive import (  # noqa: E402
     AGY_UNTRUSTED_SCREENSHOT_LABEL,
     ReachAction,
     ReachDriver,
+    ReachToolError,
     StepRecord,
     DriveResult,
+    StaleObservationError,
 )
 
 
@@ -278,6 +280,78 @@ class ReachDriverTests(unittest.TestCase):
             self.assertIn("@e2: button \"Submit\"", res)
 
     # ------------------------------------------------------------------
+    def test_observation_metadata_cannot_replace_current_lease_identity(self) -> None:
+        self.driver.lease_token = "lease-a"
+        self.driver.handoff_gen = 4
+        self.driver.observation_gen = 7
+        self.driver._last_observation_meta = {
+            "observation_gen": 7,
+            "incarnation": "inc-a",
+            "task_id": "task-a",
+            "attempt_id": "attempt-a",
+        }
+        current = dict(self.driver._last_observation_meta)
+        for meta in (
+            {**current, "observation_gen": 8, "incarnation": "inc-b"},
+            {**current, "observation_gen": 8, "task_id": None},
+            {
+                key: value
+                for key, value in {**current, "observation_gen": 8}.items()
+                if key != "attempt_id"
+            },
+        ):
+            self.driver.observation_gen = current["observation_gen"]
+            self.driver._last_observation_meta = dict(current)
+            response = MagicMock()
+            response.__enter__.return_value = response
+            response.read.return_value = json.dumps({
+                "result": {
+                    "content": [{"type": "text", "text": "{\"status\":\"ok\"}"}],
+                    "_meta": meta,
+                    "isError": False,
+                }
+            }).encode()
+            with self.subTest(meta=meta), patch.object(
+                self.driver._api_opener, "open", return_value=response,
+            ):
+                self.driver.call_mcp_tool("click", {"x": 1, "y": 1})
+                with self.assertRaises(StaleObservationError):
+                    self.driver.call_mcp_tool("screenshot", {})
+
+
+    def test_call_mcp_tool_rejects_explicit_screen_different_from_driver_binding(self) -> None:
+        self.driver.lease_token = "lease-a"
+        self.driver.handoff_gen = 4
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = json.dumps({
+            "result": {"content": [], "isError": False},
+        }).encode()
+        with patch.object(self.driver._api_opener, "open", return_value=response) as opened:
+            with self.assertRaises(ReachToolError):
+                self.driver.call_mcp_tool("click", {"screen": 1, "x": 1, "y": 1})
+        opened.assert_not_called()
+
+    def test_call_mcp_tool_rejects_response_after_screen_rebinding(self) -> None:
+        self.driver.lease_token = "lease-a"
+        self.driver.handoff_gen = 4
+        response = MagicMock()
+        response.__enter__.return_value = response
+
+        def read_response() -> bytes:
+            self.driver.screen = 1
+            return json.dumps({
+                "result": {
+                    "content": [{"type": "text", "text": "stale screen content"}],
+                    "isError": False,
+                    "_meta": {"observation_gen": 8},
+                },
+            }).encode()
+
+        response.read.side_effect = read_response
+        with patch.object(self.driver._api_opener, "open", return_value=response):
+            with self.assertRaises(StaleObservationError):
+                self.driver.call_mcp_tool("screenshot", {})
     # Drive loop outcome contract
     # ------------------------------------------------------------------
 

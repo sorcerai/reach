@@ -360,11 +360,11 @@ impl ProfileBroker {
         }
     }
 
-    pub fn default_broker() -> Self {
-        let base_dir = crate::config::ReachConfig::load()
+    pub fn default_broker() -> anyhow::Result<Self> {
+        let base_dir = crate::config::ReachConfig::load()?
             .sandbox
             .resolved_profile_dir();
-        Self::new(base_dir)
+        Ok(Self::new(base_dir))
     }
 
     pub fn base_dir(&self) -> &Path {

@@ -1,9 +1,9 @@
 name: reach-agent-computer
-version: "0.2.0"
-description: "Lease one reach Agent Computer screen per Hermes profile, route reach MCP tools to it, provide reach_drive (CUA via agy), and record human takeovers."
+version: "0.3.0"
+description: "Lease one reach Agent Computer screen per Hermes profile, route reach MCP tools to it, provide reach_smart_browse (tiered fast path -> headed Chrome escalation), reach_drive (CUA via agy), and record human takeovers."
 author: "Reach Team"
 kind: standalone
-provides_tools: [reach_lease_screen, reach_release_screen, reach_status, reach_drive]
+provides_tools: [reach_lease_screen, reach_release_screen, reach_status, reach_tool, reach_drive, reach_smart_browse]
 provides_hooks: [on_session_start, pre_llm_call, pre_tool_call, post_tool_call, on_session_finalize]
 config_schema:
   api_url:
@@ -13,3 +13,7 @@ config_schema:
   repo_root:
     type: str
     description: "agent-computer checkout containing scripts/reach_drive.py (default: derived from plugin path)"
+  allow_exec:
+    type: bool
+    default: false
+    description: "Request guest execution permission for new leases; also requires a Reach computer created with --allow-exec. Never grants host execution."

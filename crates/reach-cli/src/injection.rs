@@ -8,7 +8,7 @@ use serde_json::json;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{docker::DockerClient, lease::LeaseGrant};
+use crate::{lease::LeaseGrant, runtime::RuntimeClient};
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -353,7 +353,7 @@ fn make_payload(
 }
 
 async fn run_helper(
-    docker: &DockerClient,
+    runtime: &RuntimeClient,
     target: &str,
     payload: Vec<u8>,
 ) -> Result<HelperOutcome> {
@@ -362,7 +362,7 @@ async fn run_helper(
         "-c".into(),
         INJECTION_HELPER_SOURCE.into(),
     ];
-    let output = docker.exec_input(target, &command, &payload).await?;
+    let output = runtime.exec_input(target, &command, &payload).await?;
     if output.exit_code != 0 {
         bail!("injection helper exited with status {}", output.exit_code);
     }
@@ -388,7 +388,7 @@ async fn run_helper(
 }
 
 pub async fn inject(
-    docker: &DockerClient,
+    runtime: &RuntimeClient,
     target: &str,
     screen: u32,
     grant: &LeaseGrant,
@@ -468,7 +468,7 @@ pub async fn inject(
         _ => bail!("injection kind must be exactly 'vault' or 'card'"),
     };
     let payload = make_payload(request, screen, secret, &origins)?;
-    let helper = run_helper(docker, target, payload).await?;
+    let helper = run_helper(runtime, target, payload).await?;
     if let (Some(mut engine), Some(card_id)) = (card_engine.take(), card_id.as_deref()) {
         engine.finalize_injection(card_id)?;
     }

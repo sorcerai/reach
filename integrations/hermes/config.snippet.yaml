@@ -8,6 +8,7 @@ plugins:
     reach-agent-computer:
       settings:
         api_url: http://127.0.0.1:4200  # reach REST (lease/takeover); no env vars needed
+        allow_exec: false             # new leases only; also requires reach create --allow-exec
 # Install: ln -s <agent-computer>/integrations/hermes/plugins/reach-agent-computer ~/.hermes/plugins/
 #          ln -s <agent-computer>/integrations/hermes/skills/agent-computer      ~/.hermes/skills/
 # Everything below is reach-lab (Linux VM) specific; skip on a macOS host.

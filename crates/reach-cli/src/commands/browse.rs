@@ -1,7 +1,8 @@
 use clap::Args;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::{DockerClient, ProfileMount};
+use reach_cli::docker::ProfileMount;
 use reach_cli::profile::{CookieJarService, LockHolderInfo, ProfileBroker};
+use reach_cli::runtime::RuntimeClient;
 use reach_cli::tools::browse_command_input;
 
 #[derive(Args, Clone, Debug)]
@@ -36,13 +37,13 @@ pub struct BrowseArgs {
 }
 
 pub async fn run(args: BrowseArgs) -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
 
     let target = match args.sandbox.as_deref() {
         Some(s) => s.to_string(),
         None => {
-            let list = docker.list().await?;
+            let list = runtime.list().await?;
             list.into_iter()
                 .find(|s| matches!(s.status, reach_cli::docker::SandboxStatus::Running))
                 .map(|s| s.name)
@@ -69,7 +70,7 @@ pub async fn run(args: BrowseArgs) -> anyhow::Result<()> {
         ProfileMount::container_path_for(&profile_name)
     };
 
-    let broker = ProfileBroker::default_broker();
+    let broker = ProfileBroker::default_broker()?;
     let holder = LockHolderInfo::new(Some(args.screen), Some("reach browse".into()), None);
     let _lease = broker
         .acquire_with_holder(&profile_name, args.timeout_ms, Some(holder))
@@ -93,7 +94,7 @@ pub async fn run(args: BrowseArgs) -> anyhow::Result<()> {
         &display,
         None,
     );
-    let result = docker.exec_input(&target, &command, &payload).await?;
+    let result = runtime.exec_input(&target, &command, &payload).await?;
     if result.exit_code != 0 {
         anyhow::bail!("browser launch or hydration failed");
     }

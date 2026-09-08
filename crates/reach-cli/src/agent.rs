@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ScreenPhase {
@@ -281,13 +281,90 @@ impl BusyGuard<'_> {
         owner: &str,
         grant: crate::lease::LeaseGrant,
     ) -> Result<LeaseResponse, LeaseError> {
-        self.agent.allocate(self.screen, owner, grant, true)
+        self.agent.allocate(self.screen, owner, grant, true, true)
     }
 }
 
 impl<'a> Drop for BusyGuard<'a> {
     fn drop(&mut self) {
         self.agent.dec_busy(self.screen);
+    }
+}
+
+struct ProvisionalLease {
+    owner: String,
+    token: String,
+    handoff_gen: u64,
+}
+
+/// Owned admission for a lease provision operation.
+///
+/// Unlike `BusyGuard`, this guard can outlive the request future. That is
+/// required when the runtime may continue a detached reset after cancellation:
+/// the screen remains busy until the reset task commits or rolls back the
+/// exact provisional token.
+pub struct OwnedBusyGuard {
+    agent: Arc<AgentState>,
+    screen: u32,
+    provisional: Option<ProvisionalLease>,
+}
+
+impl OwnedBusyGuard {
+    pub fn allocate(
+        &mut self,
+        owner: &str,
+        grant: crate::lease::LeaseGrant,
+    ) -> Result<LeaseResponse, LeaseError> {
+        let lease = self
+            .agent
+            .allocate(self.screen, owner, grant, true, false)?;
+        self.provisional = Some(ProvisionalLease {
+            owner: owner.to_owned(),
+            token: lease.token.clone(),
+            handoff_gen: lease.handoff_gen,
+        });
+        Ok(lease)
+    }
+
+    pub fn commit(&mut self) -> Result<(), LeaseError> {
+        let Some(provisional) = self.provisional.as_ref() else {
+            return Ok(());
+        };
+        self.agent.publish_provisional(
+            self.screen,
+            &provisional.owner,
+            &provisional.token,
+            provisional.handoff_gen,
+        )?;
+        self.provisional = None;
+        Ok(())
+    }
+
+    pub fn rollback(&mut self) {
+        let Some(provisional) = self.provisional.as_ref() else {
+            return;
+        };
+        if self
+            .agent
+            .rollback_provisional(
+                self.screen,
+                &provisional.owner,
+                &provisional.token,
+                provisional.handoff_gen,
+            )
+            .is_ok()
+        {
+            self.provisional = None;
+        }
+    }
+}
+
+impl Drop for OwnedBusyGuard {
+    fn drop(&mut self) {
+        self.rollback();
+        if self.provisional.is_none() {
+            self.agent.dec_busy(self.screen);
+        }
     }
 }
 
@@ -484,6 +561,41 @@ impl AgentState {
             screen,
         })
     }
+    /// Bind an owned admission to an in-flight lease provision operation.
+    ///
+    /// The returned guard is backed by an `Arc`, so a spawned reset task can
+    /// retain busy state if the HTTP request is cancelled.
+    pub fn begin_tool_owned(
+        self: &Arc<Self>,
+        screen: u32,
+        token: Option<&str>,
+        generation: Option<u64>,
+    ) -> Result<OwnedBusyGuard, &'static str> {
+        let mut screens = self.screens.lock().unwrap();
+        let s = screens
+            .iter_mut()
+            .find(|s| s.id == screen)
+            .ok_or("screen_not_found")?;
+        if s.lease_token.as_deref() != token {
+            return Err("invalid_lease");
+        }
+        if Some(s.handoff_gen) != generation {
+            return Err("stale_plan");
+        }
+        if !matches!(s.phase, ScreenPhase::Idle | ScreenPhase::AgentActive) {
+            return Err("takeover_active");
+        }
+        if s.busy {
+            return Err("screen_busy");
+        }
+        *self.active_tools.lock().unwrap().entry(screen).or_insert(0) += 1;
+        s.busy = true;
+        Ok(OwnedBusyGuard {
+            agent: Arc::clone(self),
+            screen,
+            provisional: None,
+        })
+    }
 
     /// Increment the active tool counter on `screen` and synchronize `ScreenState::busy`.
     pub fn inc_busy(&self, screen: u32) {
@@ -590,7 +702,7 @@ impl AgentState {
 
     /// Allocate a free screen. Owner labels are diagnostic, not credentials.
     pub fn lease_screen(&self, id: u32, owner: &str) -> Result<LeaseResponse, LeaseError> {
-        self.allocate(id, owner, crate::lease::LeaseGrant::clean(), false)
+        self.allocate(id, owner, crate::lease::LeaseGrant::clean(), false, true)
     }
 
     fn allocate(
@@ -599,6 +711,7 @@ impl AgentState {
         owner: &str,
         grant: crate::lease::LeaseGrant,
         owns_permit: bool,
+        publish: bool,
     ) -> Result<LeaseResponse, LeaseError> {
         let mut screens = self.screens.lock().unwrap();
         if screens.iter().any(|s| {
@@ -636,8 +749,59 @@ impl AgentState {
         s.approval = None;
         let handoff_gen = s.handoff_gen;
         drop(screens);
-        let _ = self.phase_notify.send(id);
+        if publish {
+            let _ = self.phase_notify.send(id);
+        }
         Ok(LeaseResponse::new(id, owner, token, handoff_gen))
+    }
+
+    fn publish_provisional(
+        &self,
+        id: u32,
+        owner: &str,
+        token: &str,
+        handoff_gen: u64,
+    ) -> Result<(), LeaseError> {
+        let screens = self.screens.lock().unwrap();
+        let s = screens
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or(LeaseError::NotFound(id))?;
+        if s.owner.as_deref() != Some(owner)
+            || s.lease_token.as_deref() != Some(token)
+            || s.handoff_gen != handoff_gen
+            || !s.busy
+        {
+            return Err(LeaseError::InvalidToken { id });
+        }
+        drop(screens);
+        let _ = self.phase_notify.send(id);
+        Ok(())
+    }
+
+    fn rollback_provisional(
+        &self,
+        id: u32,
+        owner: &str,
+        token: &str,
+        handoff_gen: u64,
+    ) -> Result<(), LeaseError> {
+        let mut screens = self.screens.lock().unwrap();
+        let s = screens
+            .iter_mut()
+            .find(|s| s.id == id)
+            .ok_or(LeaseError::NotFound(id))?;
+        if s.owner.as_deref() != Some(owner)
+            || s.lease_token.as_deref() != Some(token)
+            || s.handoff_gen != handoff_gen
+            || !s.busy
+        {
+            return Err(LeaseError::InvalidToken { id });
+        }
+        Self::clear_lease(s);
+        drop(screens);
+        let _ = self.phase_notify.send(id);
+        Ok(())
     }
 
     /// Release using the capability; only the supervisor may eject a human.

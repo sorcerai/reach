@@ -1,11 +1,11 @@
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::{DockerClient, SandboxStatus};
-
+use reach_cli::docker::SandboxStatus;
+use reach_cli::runtime::RuntimeClient;
 pub async fn run() -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let sandboxes = docker.list().await?;
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
+    let sandboxes = runtime.list().await?;
 
     if sandboxes.is_empty() {
         println!("{}", "No reach sandboxes running.".dimmed());

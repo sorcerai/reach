@@ -10,9 +10,9 @@ use bollard::models::{
 };
 use bollard::network::CreateNetworkOptions;
 use futures::StreamExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::Duration;
 
 // ═══════════════════════════════════════════════════════════
 // Sandbox configuration
@@ -21,7 +21,7 @@ use std::time::Duration;
 /// Path inside the container where the durable workspace mount lands.
 pub const WORKSPACE_CONTAINER_PATH: &str = "/workspace";
 
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct SandboxConfig {
     pub name: String,
     pub image: String,
@@ -42,10 +42,6 @@ pub struct SandboxConfig {
     ///
     /// Never logged, never put in a container label — round-tripped for
     /// `recreate` via the container's `VNC_PASSWORD` env var instead.
-    ///
-    /// Note: because the password is passed via the container's `VNC_PASSWORD`
-    /// environment variable, it is visible to any process or user with access
-    /// to `docker inspect`.
     pub vnc_password: Option<String>,
     /// Whether the sandbox container allows arbitrary shell command execution via the `exec` tool.
     pub allow_exec: bool,
@@ -212,12 +208,7 @@ impl std::fmt::Debug for SandboxConfig {
 }
 
 /// Bind mount that backs a persistent Chrome profile.
-///
-/// `host_path` is created on the host (if missing) and mounted into the
-/// container at `container_path`. `name` is propagated as the
-/// `reach.profile` label so that `reach list` and downstream tools can
-/// discover the profile attached to a sandbox.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProfileMount {
     pub name: String,
     pub host_path: PathBuf,
@@ -225,23 +216,16 @@ pub struct ProfileMount {
 }
 
 impl ProfileMount {
-    /// Container path used for a profile of the given `name`.
-    ///
-    /// All persistent profiles live under
-    /// `/home/sandbox/.config/google-chrome-profiles/<name>` in the
-    /// container so the path is stable across sandboxes.
     pub fn container_path_for(name: &str) -> String {
         format!("/home/sandbox/.config/google-chrome-profiles/{name}")
     }
 
-    /// Host path used for a profile of the given `name`, rooted at
-    /// `base_dir` (typically `~/.local/share/reach/profiles`).
     pub fn host_path_for(base_dir: &std::path::Path, name: &str) -> PathBuf {
         base_dir.join(name)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
     pub width: u32,
     pub height: u32,
@@ -264,16 +248,11 @@ impl std::fmt::Display for Resolution {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPorts {
     pub vnc: u16,
     pub novnc: u16,
     pub health: u16,
-    /// Additional host:container port pairs to publish, beyond the three
-    /// built-in ports above. Used for ad-hoc workflows that need to expose
-    /// extra services from inside the sandbox — e.g. forwarding Chrome's
-    /// remote debugging port (9222) so a host process can drive an agent
-    /// browser via CDP. Each tuple is (host_port, container_port).
     pub extra: Vec<(u16, u16)>,
 }
 
@@ -315,7 +294,7 @@ impl Default for SandboxConfig {
 // Sandbox runtime state
 // ═══════════════════════════════════════════════════════════
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Sandbox {
     pub name: String,
     pub container_id: String,
@@ -327,7 +306,7 @@ pub struct Sandbox {
     pub allow_exec: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SandboxStatus {
     Running,
@@ -348,27 +327,22 @@ impl From<&str> for SandboxStatus {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SandboxPortMapping {
     pub vnc: Option<u16>,
     pub novnc: Option<u16>,
     pub health: Option<u16>,
     pub screens: u32,
-    /// Extra (host_port, container_port) pairs published by the user via
-    /// `--extra-port`. Empty when no extras were requested.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra: Vec<(u16, u16)>,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExecOutput {
     pub exit_code: i64,
     pub stdout: String,
     pub stderr: String,
 }
-
-// ═══════════════════════════════════════════════════════════
-// Labels
 // ═══════════════════════════════════════════════════════════
 
 pub struct Labels;
@@ -1120,38 +1094,6 @@ impl DockerClient {
         })
     }
 
-    pub async fn screenshot(&self, target: &str, display: &str) -> Result<Vec<u8>> {
-        let shot_id = uuid::Uuid::new_v4().simple();
-        let disp_clean = display.replace(':', "_");
-        let shot_file = format!("/tmp/_reach_shot_{disp_clean}_{shot_id}.png");
-        let out = self
-            .exec(
-                target,
-
-                &[
-                    "bash".into(),
-                    "-c".into(),
-                    format!(
-                        "DISPLAY={display} scrot -z '{shot_file}' && base64 -w 0 '{shot_file}' && rm -f '{shot_file}'"
-                    ),
-                ],
-            )
-            .await?;
-
-        if out.exit_code != 0 {
-            bail!("screenshot failed: {}", out.stderr);
-        }
-
-        use base64::Engine;
-        // Defensive: strip any whitespace in case `base64 -w 0` is unavailable
-        // and the CLI falls back to line-wrapped output.
-        let clean: String = out.stdout.chars().filter(|c| !c.is_whitespace()).collect();
-        let bytes = base64::engine::general_purpose::STANDARD
-            .decode(&clean)
-            .context("failed to decode screenshot base64")?;
-
-        Ok(bytes)
-    }
     /// Return the container's current identity. A restart changes StartedAt,
     /// so this value is not a stable container-name alias.
     pub async fn incarnation(&self, target: &str) -> Result<String> {
@@ -1243,145 +1185,6 @@ impl DockerClient {
         })
     }
 
-    /// Reset only the browser process session and clipboard for one screen.
-    /// Persistent profile files remain untouched.
-    pub async fn reset_screen(&self, target: &str, screen: u32) -> Result<()> {
-        let _ = screen_cdp_port(screen)?;
-        let output = self
-            .exec(
-                target,
-                &[
-                    "python3".into(),
-                    "-c".into(),
-                    RESET_SCREEN_SCRIPT.into(),
-                    screen.to_string(),
-                ],
-            )
-            .await?;
-        if output.exit_code != 0 {
-            bail!(
-                "screen reset failed closed for screen {screen}: {}",
-                output.stderr.trim()
-            );
-        }
-        Ok(())
-    }
-
-    /// Run a Playwright-driven "navigate and extract text" script in the
-    /// sandbox.
-    ///
-    /// The Python helper launches headed Chromium on Xvfb (so the page is
-    /// visible through noVNC) and prints a single JSON object on stdout.
-    pub async fn page_text(&self, target: &str, opts: &PageTextOptions) -> Result<PageTextOutput> {
-        let screen_num: u32 = opts
-            .display
-            .as_deref()
-            .and_then(|d| d.strip_prefix(':'))
-            .and_then(|n| n.parse().ok())
-            .map(|d: u32| if d >= 99 { d - 99 } else { d })
-            .unwrap_or(0);
-
-        let payload = serde_json::json!({
-            "url": opts.url,
-            "wait_for": opts.wait_for,
-            "selector": opts.selector,
-            "format": opts.format,
-            "timeout_ms": opts.timeout_ms,
-            "user_data_dir": opts.user_data_dir,
-            "hydrated_cookies": opts.hydrated_cookies,
-            "display": opts.display,
-            "screen": screen_num,
-            "allowed_origins": opts.allowed_origins,
-        });
-
-        let payload =
-            serde_json::to_vec(&payload).context("failed to serialize page_text payload")?;
-        let out = self
-            .exec_input(target, &browser_helper_command(PAGE_TEXT_SCRIPT), &payload)
-            .await?;
-
-        parse_page_text_exec_output(&out)
-    }
-
-    /// Execute an opaque ref action against its captured native page target.
-    pub async fn page_action(&self, target: &str, opts: &PageActionOptions) -> Result<String> {
-        let payload = serde_json::json!({
-            "target_id": opts.target_id,
-            "loader_id": opts.loader_id,
-            "selector": opts.selector,
-            "backend_node_id": opts.backend_node_id,
-            "action": opts.action,
-            "button": opts.button,
-            "text": opts.text,
-            "clear": opts.clear,
-            "submit": opts.submit,
-            "timeout_ms": opts.timeout_ms,
-            "user_data_dir": opts.user_data_dir,
-            "display": opts.display,
-            "screen": opts.screen,
-        });
-        let payload =
-            serde_json::to_vec(&payload).context("failed to serialize page action payload")?;
-        let deadline = Duration::from_millis(opts.timeout_ms.max(1_000).saturating_add(3_000));
-        let out = tokio::time::timeout(
-            deadline,
-            self.exec_input(
-                target,
-                &browser_helper_command(PAGE_ACTION_SCRIPT),
-                &payload,
-            ),
-        )
-        .await
-        .context("native page action timed out")??;
-        if out.exit_code != 0 {
-            bail!("native page action helper failed");
-        }
-        let line = last_json_line(&out.stdout).context("native page action returned no outcome")?;
-        let result: serde_json::Value =
-            serde_json::from_str(&line).context("native page action returned malformed output")?;
-        if result.get("status").and_then(|v| v.as_str()) != Some("ok") {
-            bail!("native page action rejected");
-        }
-        Ok(line)
-    }
-
-    /// Open a URL in the sandbox Chrome and (optionally) poll for a
-    /// post-auth signal.
-    ///
-    /// Returns immediately with `status = "auth_required"` and the noVNC
-    /// URL if no `wait_for_*` condition is set; otherwise it polls inside
-    /// the container until the condition is met or `timeout_seconds`
-    /// elapses.
-    pub async fn auth_handoff(
-        &self,
-        target: &str,
-        opts: &AuthHandoffOptions,
-    ) -> Result<AuthHandoffOutput> {
-        let payload = serde_json::json!({
-            "url": opts.url,
-            "wait_for_selector": opts.wait_for_selector,
-            "wait_for_url_contains": opts.wait_for_url_contains,
-            "timeout_seconds": opts.timeout_seconds,
-            "user_data_dir": opts.user_data_dir,
-            "storage_state": opts.storage_state,
-            "reason": opts.reason,
-            "display": opts.display,
-            "headless": false,
-        });
-
-        let payload =
-            serde_json::to_vec(&payload).context("failed to serialize auth_handoff payload")?;
-        let out = self
-            .exec_input(
-                target,
-                &browser_helper_command(AUTH_HANDOFF_SCRIPT),
-                &payload,
-            )
-            .await?;
-
-        parse_auth_handoff_exec_output(&out)
-    }
-
     /// Rebuild the [`SandboxConfig`] that produced `target`, reading it back
     /// from Docker's inspect output (labels + `HostConfig`).
     pub async fn inspect_config(&self, target: &str) -> Result<SandboxConfig> {
@@ -1391,58 +1194,10 @@ impl DockerClient {
             .inspect_container(&sandbox.container_id, None)
             .await
             .context("failed to inspect container")?;
-        let fallback_profile_dir = crate::config::ReachConfig::load()
+        let fallback_profile_dir = crate::config::ReachConfig::load()?
             .sandbox
             .resolved_profile_dir();
         config_from_inspect(&resp, &fallback_profile_dir)
-    }
-
-    /// Recreate `target`: read back its config and volumes, destroy the
-    /// container, and create a fresh one with the same settings (host
-    /// bind mounts for `/workspace` and any persisted profile are
-    /// untouched, since `destroy` only removes the container).
-    pub async fn recreate(&self, target: &str, image: Option<String>) -> Result<Sandbox> {
-        let mut config = self.inspect_config(target).await?;
-        if let Some(image) = image {
-            config.image = image;
-        }
-        let name = config.name.clone();
-        self.destroy(target).await?;
-        self.create(config).await.with_context(|| {
-            format!(
-                "destroyed sandbox '{name}' but failed to recreate it; its workspace and \
-                 profile directories are intact — rerun `reach recreate` with a valid --image, \
-                 or `reach create --name {name} ...`"
-            )
-        })
-    }
-
-    pub async fn wait_healthy(&self, target: &str, timeout: Duration) -> Result<()> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        loop {
-            if tokio::time::Instant::now() > deadline {
-                bail!("timeout waiting for sandbox '{}' to become healthy", target);
-            }
-
-            let out = self
-                .exec(
-                    target,
-                    &[
-                        "curl".into(),
-                        "-sf".into(),
-                        "http://localhost:8400/health".into(),
-                    ],
-                )
-                .await;
-
-            if let Ok(result) = out
-                && result.exit_code == 0
-            {
-                return Ok(());
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
     }
 }
 
@@ -1475,7 +1230,7 @@ fn extract_ports(ports: &[bollard::models::Port]) -> SandboxPortMapping {
 // page_text + auth_handoff: types, helpers, embedded Python
 // ═══════════════════════════════════════════════════════════
 
-/// Inputs to [`DockerClient::page_text`].
+/// Inputs to the shared runtime `page_text` helper.
 #[derive(Debug, Clone, Default)]
 pub struct PageTextOptions {
     pub url: String,
@@ -1535,7 +1290,7 @@ pub struct PageActionOptions {
     pub screen: u32,
 }
 
-/// Inputs to [`DockerClient::auth_handoff`].
+/// Inputs to the shared runtime `auth_handoff` helper.
 #[derive(Debug, Clone, Default)]
 pub struct AuthHandoffOptions {
     pub url: String,
@@ -1587,7 +1342,7 @@ fn parse_page_text_json(stdout: &str) -> Option<PageTextOutput> {
 fn parse_auth_handoff_json(stdout: &str) -> Option<AuthHandoffOutput> {
     last_json_line(stdout).and_then(|l| serde_json::from_str(&l).ok())
 }
-fn parse_page_text_exec_output(out: &ExecOutput) -> Result<PageTextOutput> {
+pub(crate) fn parse_page_text_exec_output(out: &ExecOutput) -> Result<PageTextOutput> {
     let parsed = parse_page_text_json(&out.stdout);
     if let Some(parsed) = parsed {
         if parsed.status == "error" {
@@ -1610,7 +1365,7 @@ fn parse_page_text_exec_output(out: &ExecOutput) -> Result<PageTextOutput> {
     bail!("page_text returned malformed output: {}", out.stdout.trim());
 }
 
-fn parse_auth_handoff_exec_output(out: &ExecOutput) -> Result<AuthHandoffOutput> {
+pub(crate) fn parse_auth_handoff_exec_output(out: &ExecOutput) -> Result<AuthHandoffOutput> {
     if let Some(parsed) = parse_auth_handoff_json(&out.stdout) {
         if parsed.status == "error" {
             bail!(
@@ -1636,7 +1391,7 @@ fn parse_auth_handoff_exec_output(out: &ExecOutput) -> Result<AuthHandoffOutput>
 }
 /// Build the fixed command used by browser helpers. All request data,
 /// including URLs and account state, is attached through stdin by callers.
-fn browser_helper_command(script: &str) -> Vec<String> {
+pub(crate) fn browser_helper_command(script: &str) -> Vec<String> {
     vec!["python3".into(), "-c".into(), script.into()]
 }
 
@@ -1644,7 +1399,7 @@ fn browser_helper_command(script: &str) -> Vec<String> {
 ///
 /// The Python helpers may print warnings on stdout (Playwright, etc.)
 /// before the result line, so we scan from the bottom.
-fn last_json_line(stdout: &str) -> Option<String> {
+pub(crate) fn last_json_line(stdout: &str) -> Option<String> {
     stdout
         .lines()
         .rev()

@@ -1,5 +1,65 @@
 # Deployment
 
+## Private MicroVM Runtime
+
+The nested Hermes path uses an explicit Firecracker/KVM runtime instead of Docker:
+Hermes → authenticated Reach API → owner-only Unix broker socket → vsock guest agent.
+The broker runs as a dedicated **non-root** Linux identity with KVM access. Hermes must
+not share its UID, KVM group, broker socket, image directory, or guest storage.
+
+Configure the API account's Reach `config.toml`:
+
+```toml
+[runtime]
+backend = "microvm"
+broker_socket = "/run/reach-microvm/broker.sock"
+```
+
+An invalid backend or unavailable broker fails explicitly; it does not fall back to
+Docker. Existing Docker deployments retain the default backend.
+The broker JSON `socket` must exactly match `runtime.broker_socket`. The path is
+configurable; there is no automatic alias between differently named sockets.
+
+Provision a verified ARM64 kernel and Firecracker binary on the Linux host. Build a
+matching `reach-supervisor`, then build a fresh image inside an owned Linux build VM:
+
+```bash
+sudo python3 scripts/build_microvm_image.py \
+  --repo /opt/reach-src \
+  --supervisor /opt/reach-src/target/debug/reach-supervisor \
+  --output /var/lib/reach-images/rootfs.ext4 \
+  --output-root /var/lib/reach-images
+```
+
+The builder reports the image SHA256. Register that digest and the independently
+verified kernel digest in the private broker JSON configuration. Its required
+fields and lifecycle contract are documented in the
+[nested integration plan](superpowers/plans/2026-09-07-nested-hermes-integration.md#phase-b-actual-broker-and-guest-transport).
+Run `scripts/reach_microvm_broker.py --config /var/lib/reach-broker/broker.json`
+under the dedicated broker identity and a process supervisor, not as root.
+
+With the broker ready and the API credential loaded privately:
+
+```bash
+reach create --name nested-hermes --image browser --allow-exec --no-restart
+reach serve --sandbox nested-hermes --port 4200 --host 127.0.0.1
+```
+
+Hermes execution also requires the plugin's explicit `allow_exec` opt-in. These
+permissions authorize **guest** execution, never host execution. The current
+MicroVM backend rejects host bind mounts, persistent-profile mounts, extra raw port
+publication, and unsupported restart settings rather than silently weakening them.
+Use the authenticated Reach viewer; do not expose raw VNC, CDP, supervisor, or
+broker management ports using the Docker examples below.
+
+Cold browser startup has a bounded readiness budget. A mutation timeout is an
+uncertain outcome: observe the actual state and replan before a new approval; never
+automatically replay it. After same-name replacement, explicitly acquire fresh
+authority and fresh DOM references.
+
+The [2026-09-08 acceptance record](nested-hermes-acceptance.md) documents the tested
+networkless topology, exact candidate, guards, checks, and remaining limitations.
+
 ## Docker Image Build
 
 ### Local Build

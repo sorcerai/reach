@@ -7,6 +7,7 @@ leased /tools and /mcp primitive (screenshot and live_view included).
 """
 
 import http.server
+import io
 import json
 import os
 import sys
@@ -31,7 +32,7 @@ from __init__ import (  # noqa: E402
 )
 
 
-class FakeReachServer(http.server.HTTPServer):
+class FakeReachServer(http.server.ThreadingHTTPServer):
     """Fake reach host daemon with real capability enforcement."""
 
     def __init__(self) -> None:
@@ -39,6 +40,7 @@ class FakeReachServer(http.server.HTTPServer):
         self.auth_token = "test-supervisor-token"
         self.screens: List[Dict[str, Any]] = [
             {"id": i, "owner": None, "lease_token": None, "handoff_gen": 1 + i,
+             "observation_gen": 0, "incarnation": f"inc-{i}-0",
              "phase": "Idle", "busy": False, "takeover_pending": False,
              "takeover_url": None, "leased_at": None,
              "novnc_url": f"http://127.0.0.1:{6080 + i}/vnc.html"}
@@ -48,15 +50,22 @@ class FakeReachServer(http.server.HTTPServer):
         self.request_count = 0
         self.redirects_followed = 0
         self._lease_seq = 0
+        self.delay_tool: Optional[str] = None
+        self.tool_started = threading.Event()
+        self.release_delayed_tool = threading.Event()
 
     def reset(self) -> None:
         for s in self.screens:
             s.update(owner=None, lease_token=None, phase="Idle", busy=False,
                      takeover_pending=False, takeover_url=None, leased_at=None,
-                     handoff_gen=1 + s["id"])
+                     handoff_gen=1 + s["id"], observation_gen=0,
+                     incarnation=f"inc-{s['id']}-0")
         self.tool_calls.clear()
         self.request_count = 0
         self.redirects_followed = 0
+        self.delay_tool = None
+        self.tool_started.clear()
+        self.release_delayed_tool.set()
 
 
 class FakeReachHandler(http.server.BaseHTTPRequestHandler):
@@ -98,7 +107,7 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
         sid = args.get("screen", 0)
         return next((s for s in self.server.screens if s["id"] == sid), self.server.screens[0])
 
-    def _validate_tool_auth(self, args: Dict[str, Any]) -> Optional[Tuple[int, Dict[str, Any]]]:
+    def _validate_tool_auth(self, args: Dict[str, Any], tool: str = "") -> Optional[Tuple[int, Dict[str, Any]]]:
         """Full Phase-1 enforcement for /tools and /mcp primitives."""
         kind, lease_screen = self._auth()
         if kind == "none":
@@ -118,17 +127,32 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
                                  "provided_gen": int(gen)}
             except ValueError:
                 return 400, {"error": "invalid X-Handoff-Gen header"}
+            if tool in {"click", "type", "key", "exec", "playwright_eval", "inject"}:
+                obs = self.headers.get("X-Observation-Gen")
+                if obs is None:
+                    return 409, {"error": "fresh_observation_required"}
+                try:
+                    if int(obs) != screen["observation_gen"]:
+                        return 409, {"error": "fresh_observation_required"}
+                except ValueError:
+                    return 400, {"error": "invalid X-Observation-Gen header"}
         if screen["phase"] not in ("AgentActive", "Idle"):
             return 409, {"error": "takeover_active", "phase": screen["phase"],
                          "handoff_gen": screen["handoff_gen"]}
         return None
 
+    def _meta(self, screen: Dict[str, Any]) -> Dict[str, Any]:
+        return {"observation_gen": screen["observation_gen"],
+                "incarnation": screen["incarnation"], "task_id": None, "attempt_id": None}
+
     def _record(self, name: str, args: Dict[str, Any], status: int) -> None:
         self.server.tool_calls.append({
             "tool": name, "screen": args.get("screen", 0), "status": status,
             "gen": self.headers.get("X-Handoff-Gen"),
+            "observation_gen": self.headers.get("X-Observation-Gen"),
             "had_lease_token": self.headers.get("X-Lease-Token") is not None,
         })
+
 
     # -- routes -------------------------------------------------------------
 
@@ -153,14 +177,20 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
     def do_POST(self) -> None:
         body = self._body()
         if self.path == "/mcp":
-            err = self._validate_tool_auth(body.get("params", {}).get("arguments", {}))
-            if err:
-                return self._respond(*err)
             name = body.get("params", {}).get("name", "")
             args = body.get("params", {}).get("arguments", {})
+            err = self._validate_tool_auth(args, name)
+            if err:
+                return self._respond(*err)
             self._record(name, args, 200)
+            screen = self._screen_for_args(args)
+            if name in {"screenshot", "page_text"} or (
+                name == "browse" and args.get("snapshot") is True
+            ):
+                screen["observation_gen"] += 1
+            elif name in {"click", "type", "key", "exec", "playwright_eval", "inject"}:
+                screen["observation_gen"] += 1
             if name == "auth_handoff":
-                screen = self._screen_for_args(args)
                 screen.update(
                     takeover_pending=True,
                     takeover_url=screen["novnc_url"],
@@ -180,17 +210,28 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
                      "elements_count": 42})
             return self._respond(200, {
                 "jsonrpc": "2.0", "id": body.get("id", 1),
-                "result": {"content": [{"type": "text", "text": text}], "isError": False},
+                "result": {"content": [{"type": "text", "text": text}], "isError": False,
+                           "_meta": self._meta(screen)},
             })
         if self.path.startswith("/tools/"):
-            err = self._validate_tool_auth(body)
-            if err:
-                self._record(self.path.split("/")[2], body, err[0])
-                return self._respond(*err)
             name = self.path.split("/")[2]
+            err = self._validate_tool_auth(body, name)
+            if err:
+                self._record(name, body, err[0])
+                return self._respond(*err)
+            screen = self._screen_for_args(body)
+            if name == "exec" and not screen.get("allow_exec", False):
+                return self._respond(403, {"error": "execution_not_granted"})
             self._record(name, body, 200)
+            if name in {"screenshot", "page_text"}:
+                screen["observation_gen"] += 1
+            elif name in {"click", "type", "key", "exec", "playwright_eval", "inject"}:
+                screen["observation_gen"] += 1
+            response_meta = self._meta(screen)
+            if self.server.delay_tool == name:
+                self.server.tool_started.set()
+                self.server.release_delayed_tool.wait(5)
             if name == "auth_handoff":
-                screen = self._screen_for_args(body)
                 screen.update(
                     takeover_pending=True,
                     takeover_url=screen["novnc_url"],
@@ -205,8 +246,10 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
                 })
                 return self._respond(200, {
                     "content": [{"type": "text", "text": text}], "isError": False,
+                    "_meta": response_meta,
                 })
-            return self._respond(200, {"status": "ok", "tool": name, "echo": body})
+            return self._respond(200, {"status": "ok", "tool": name, "echo": body,
+                                       "_meta": response_meta})
         kind, lease_screen = self._auth()
         if kind == "none":
             return self._respond(401, {"error": "unauthorized"})
@@ -223,7 +266,10 @@ class FakeReachHandler(http.server.BaseHTTPRequestHandler):
             self.server._lease_seq += 1
             screen.update(owner=body.get("owner", "default"),
                           lease_token=f"tok-{screen['id']}-{self.server._lease_seq}",
-                          phase="AgentActive", leased_at="now")
+                          phase="AgentActive", leased_at="now",
+                          allow_exec=body.get("allow_exec") is True,
+                          observation_gen=0,
+                          incarnation=f"inc-{screen['id']}-{self.server._lease_seq}")
             return self._respond(200, {"status": "ok", "id": screen["id"],
                                        "owner": screen["owner"],
                                        "token": screen["lease_token"],
@@ -353,6 +399,24 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
         self.assertEqual(missing["status"], "error")
         self.assertIn("session binding", missing["message"])
 
+    def test_execution_permission_requires_a_new_operator_enabled_lease(self) -> None:
+        on_session_start(session_id="default")
+        self.ctx.settings["allow_exec"] = "false"
+        on_session_start(session_id="misconfigured")
+        operation = {"name": "exec", "arguments": {"command": "true"}}
+        for session in ("default", "misconfigured"):
+            denied = _call(self.ctx, "reach_tool", operation, session_id=session)
+            self.assertEqual(denied["status"], "error")
+        on_session_finalize(session_id="misconfigured")
+
+        self.ctx.settings["allow_exec"] = True
+        on_session_start(session_id="enabled")
+        _call(self.ctx, "reach_tool", {"name": "screenshot", "arguments": {}}, "enabled")
+        retained = _call(self.ctx, "reach_tool", operation, session_id="default")
+        self.assertEqual(retained["status"], "error")
+        enabled = _call(self.ctx, "reach_tool", operation, session_id="enabled")
+        self.assertEqual(enabled["status"], "ok")
+
     def test_same_profile_sessions_get_independent_leases(self) -> None:
         on_session_start(session_id="sA", platform="cli")
         on_session_start(session_id="sB", platform="cli")
@@ -401,6 +465,19 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
         on_session_start(session_id="s1")  # leases screen 0 as "piper"
         res = reach_lease_screen(screen=0, owner="piper")  # same owner label, standalone key
         self.assertEqual(res["status"], "conflict")
+
+    def test_unavailable_computer_is_error_not_lease_conflict(self) -> None:
+        def unavailable(handler: FakeReachHandler) -> None:
+            handler._body()
+            handler._respond(503, {"error": "no_bound_computer"})
+
+        with patch.object(FakeReachHandler, "do_POST", unavailable):
+            result = _call(self.ctx, "reach_lease_screen", {})
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("HTTP 503", result["message"])
+        self.assertIn("no_bound_computer", result["message"])
+        self.assertFalse(get_state("s1")["has_lease"])
 
     # -- pre_tool_call routing / native MCP block ---------------------------
 
@@ -479,6 +556,116 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
         self.assertEqual(out["status"], "ok")
         self.assertEqual(self.server.tool_calls[-1]["screen"], 0)
 
+
+    def test_successful_observation_without_metadata_is_rejected_without_content(self) -> None:
+        on_session_start(session_id="s1")
+        response = {
+            "status": "stale-secret",
+            "_meta": {"observation_gen": "not-an-int"},
+        }
+        with patch.object(plugin, "_http_request", return_value=response):
+            result = _call(
+                self.ctx, "reach_tool",
+                {"name": "screenshot", "arguments": {}}, "s1",
+            )
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("result", result)
+        self.assertIsNone(plugin._sessions["s1"]["observation_gen"])
+
+    def test_observation_identity_or_generation_regression_is_rejected_without_content(self) -> None:
+        on_session_start(session_id="s1")
+        self.assertEqual(
+            _call(self.ctx, "reach_tool",
+                  {"name": "screenshot", "arguments": {}}, "s1")["status"],
+            "ok",
+        )
+        current = dict(plugin._sessions["s1"]["_observation_meta"])
+        for meta in (
+            {
+                **current,
+                "observation_gen": current["observation_gen"] + 1,
+                "incarnation": "different-incarnation",
+            },
+            {**current, "observation_gen": current["observation_gen"] - 1},
+            {key: value for key, value in current.items() if key != "incarnation"},
+            {**current, "incarnation": None},
+        ):
+            with self.subTest(meta=meta), patch.object(
+                plugin, "_http_request",
+                return_value={"status": "stale-secret", "_meta": meta},
+            ):
+                result = _call(
+                    self.ctx, "reach_tool",
+                    {"name": "screenshot", "arguments": {}}, "s1",
+                )
+            self.assertEqual(result["status"], "error")
+            self.assertNotIn("result", result)
+
+    def test_malformed_lease_receipt_releases_usable_token_before_discard(self) -> None:
+        reset_state("s1")
+        calls: List[Tuple[str, str, Optional[str]]] = []
+
+        def fake_http(
+            path: str, method: str = "GET", body: Any = None, **kwargs: Any
+        ) -> Any:
+            calls.append((path, method, kwargs.get("lease_token")))
+            if path == "/agent/screens":
+                return [{"id": 0, "owner": None, "leased_at": None, "novnc_url": ""}]
+            if method == "POST":
+                return {"token": "usable-token"}
+            if method == "DELETE":
+                return {"released": True}
+            raise AssertionError(f"unexpected request: {path} {method}")
+
+        with patch.object(plugin, "_http_request", side_effect=fake_http):
+            result = _call(self.ctx, "reach_lease_screen", {}, "s1")
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(calls[-1], ("/agent/screens/0/lease", "DELETE", "usable-token"))
+        self.assertFalse(get_state("s1")["has_lease"])
+
+    def test_malformed_lease_cleanup_failure_retains_capability_without_tool_use(self) -> None:
+        reset_state("s1")
+        calls: List[Tuple[str, str, Optional[str]]] = []
+
+        def fake_http(
+            path: str, method: str = "GET", body: Any = None, **kwargs: Any
+        ) -> Any:
+            calls.append((path, method, kwargs.get("lease_token")))
+            if path == "/agent/screens":
+                return [{"id": 0, "owner": None, "leased_at": None, "novnc_url": ""}]
+            if method == "POST":
+                return {"token": "usable-token"}
+            if method == "DELETE":
+                return {}
+            raise AssertionError(f"unexpected request: {path} {method}")
+
+        with patch.object(plugin, "_http_request", side_effect=fake_http):
+            result = _call(self.ctx, "reach_lease_screen", {}, "s1")
+            self.assertEqual(result["status"], "error")
+            state = plugin._sessions["s1"]
+            self.assertEqual(state["screen"], 0)
+            self.assertEqual(state["token"], "usable-token")
+            self.assertIsNone(state["handoff_gen"])
+            tool = _call(
+                self.ctx, "reach_tool",
+                {"name": "screenshot", "arguments": {}}, "s1",
+            )
+        self.assertEqual(tool["status"], "error")
+        self.assertEqual(len(calls), 3)
+        self.assertTrue(get_state("s1")["has_lease"])
+
+    def test_release_requires_confirmed_receipt_and_retains_capability(self) -> None:
+        on_session_start(session_id="s1")
+        token = plugin._sessions["s1"]["token"]
+        for receipt in ({}, {"released": False}, []):
+            with self.subTest(receipt=receipt), patch.object(
+                plugin, "_http_request", return_value=receipt,
+            ):
+                result = _call(self.ctx, "reach_release_screen", {}, "s1")
+            self.assertEqual(result["status"], "error")
+            self.assertTrue(result["state_retained"])
+            self.assertEqual(plugin._sessions["s1"]["token"], token)
+            self.assertEqual(get_state("s1")["screen"], 0)
     # -- release lifecycle ----------------------------------------------------
 
     def test_finalize_releases_lease_only_for_that_session(self) -> None:
@@ -566,6 +753,7 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
                        {"name": "auth_handoff",
                         "arguments": {"url": "https://login"}}, "s1")
         self.assertEqual(result["status"], "ok")
+
         self.assertEqual(self.server.screens[0]["phase"], "HandoffPending")
         server_gen = self.server.screens[0]["handoff_gen"]
         before_hook = self.server.request_count
@@ -577,6 +765,140 @@ class ReachAgentComputerPluginTests(unittest.TestCase):
         self.assertEqual(self.server.request_count, before_hook)
         self.assertEqual(plugin._sessions["s1"]["handoff_gen"], server_gen)
         self.assertTrue(self.server.screens[0]["takeover_pending"])
+    def test_observation_generation_handover_authorizes_sensitive_action(self) -> None:
+        on_session_start(session_id="s1")
+        screenshot = _call(self.ctx, "reach_tool",
+                           {"name": "screenshot", "arguments": {}}, "s1")
+        self.assertEqual(screenshot["status"], "ok")
+
+        click = _call(self.ctx, "reach_tool",
+                      {"name": "click", "arguments": {"x": 10, "y": 20}}, "s1")
+        self.assertEqual(click["status"], "ok")
+        self.assertEqual(self.server.tool_calls[-1]["tool"], "click")
+
+    def test_observation_metadata_cannot_cross_session_or_lease_boundaries(self) -> None:
+        on_session_start(session_id="s1")
+        old_token = plugin._sessions["s1"]["token"]
+        self.server.delay_tool = "screenshot"
+        self.server.release_delayed_tool.clear()
+        delayed_result: Dict[str, Any] = {}
+
+        def delayed_call() -> None:
+            delayed_result["value"] = _call(
+                self.ctx, "reach_tool", {"name": "screenshot", "arguments": {}}, "s1"
+            )
+
+        worker = threading.Thread(target=delayed_call)
+        worker.start()
+        self.assertTrue(self.server.tool_started.wait(2))
+
+        # Release and reacquire the same screen while the old response is in flight.
+        plugin._http_request(
+            "/agent/screens/0/lease", "DELETE", {"owner": "piper"},
+            api_url=self.api_url, lease_token=old_token
+        )
+        reset_state("s1")
+        on_session_start(session_id="s1")
+        self.server.release_delayed_tool.set()
+        worker.join(2)
+        self.assertEqual(delayed_result["value"]["status"], "error")
+        self.assertNotIn("result", delayed_result["value"])
+
+        # The old observation cannot authorize a mutation on the new lease.
+        rejected = _call(self.ctx, "reach_tool",
+                         {"name": "click", "arguments": {"x": 10, "y": 20}}, "s1")
+        self.assertEqual(rejected["status"], "error")
+        self.assertIn("fresh_observation_required", rejected["message"])
+
+        # A fresh observation on the reacquired lease does authorize it.
+        self.assertEqual(
+            _call(self.ctx, "reach_tool",
+                  {"name": "screenshot", "arguments": {}}, "s1")["status"],
+            "ok",
+        )
+        self.assertEqual(
+            _call(self.ctx, "reach_tool",
+                  {"name": "click", "arguments": {"x": 10, "y": 20}}, "s1")["status"],
+            "ok",
+        )
+
+    def test_delayed_observation_crossing_same_lease_handoff_is_ignored(self) -> None:
+        on_session_start(session_id="s1")
+        started = threading.Event()
+        release = threading.Event()
+        delayed_result: Dict[str, Any] = {}
+        fresh_observation = False
+
+        def response(observation_gen: int) -> Dict[str, Any]:
+            return {
+                "status": "ok",
+                "tool": "screenshot",
+                "_meta": {
+                    "observation_gen": observation_gen,
+                    "incarnation": "inc-0-1",
+                    "task_id": None,
+                    "attempt_id": None,
+                },
+            }
+
+        def stale(error: str) -> urllib.error.HTTPError:
+            return urllib.error.HTTPError(
+                self.api_url + "/tools/click", 409, "stale", {},
+                io.BytesIO(json.dumps({"error": error}).encode()),
+            )
+
+        def fake_http(
+            path: str, method: str = "GET", body: Any = None,
+            api_url: Optional[str] = None, timeout: float = 35.0,
+            lease_token: Optional[str] = None, handoff_gen: Optional[int] = None,
+            observation_gen: Optional[int] = None,
+        ) -> Dict[str, Any]:
+            nonlocal fresh_observation
+            name = path.rsplit("/", 1)[-1]
+            if name == "screenshot" and not fresh_observation:
+                started.set()
+                self.assertTrue(release.wait(2))
+                return response(1)
+            if name == "screenshot":
+                fresh_observation = True
+                return response(2)
+            self.assertEqual(name, "click")
+            if not fresh_observation:
+                if observation_gen is not None:
+                    raise stale("stale_observation")
+                raise stale("fresh_observation_required")
+            self.assertEqual(observation_gen, 2)
+            return {"status": "ok", "tool": "click"}
+
+        def delayed_call() -> None:
+            delayed_result["value"] = _call(
+                self.ctx, "reach_tool", {"name": "screenshot", "arguments": {}}, "s1"
+            )
+
+        with patch.object(plugin, "_http_request", side_effect=fake_http):
+            worker = threading.Thread(target=delayed_call)
+            worker.start()
+            self.assertTrue(started.wait(2))
+
+            # Same lease, but handback changes the handoff generation before
+            # the delayed observation response completes.
+            plugin._sessions["s1"]["handoff_gen"] += 1
+            release.set()
+            worker.join(2)
+            self.assertEqual(delayed_result["value"]["status"], "error")
+            self.assertNotIn("result", delayed_result["value"])
+            fresh_observation = True
+
+            self.assertEqual(
+                _call(self.ctx, "reach_tool",
+                      {"name": "screenshot", "arguments": {}}, "s1")["status"],
+                "ok",
+            )
+            self.assertEqual(
+                _call(self.ctx, "reach_tool",
+                      {"name": "click", "arguments": {"x": 10, "y": 20}}, "s1")["status"],
+                "ok",
+            )
 
     def test_post_tool_call_ignores_failed_handoff_response(self) -> None:
         on_session_start(session_id="s1")

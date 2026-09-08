@@ -2,9 +2,9 @@ use clap::Args;
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
 use reach_cli::docker::{
-    DockerClient, LifecycleMode, ProfileMount, ResetManifest, SandboxConfig,
-    validate_sandbox_config,
+    LifecycleMode, ProfileMount, ResetManifest, SandboxConfig, validate_sandbox_config,
 };
+use reach_cli::runtime::RuntimeClient;
 use std::time::Duration;
 
 use super::create::{
@@ -86,9 +86,10 @@ fn config_for_lifecycle(
 }
 
 pub async fn run(args: RecreateArgs) -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let inspected = docker.inspect_config(&args.target).await?;
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
+    let sandbox = runtime.find(&args.target).await?;
+    let inspected = runtime.inspect_config(&sandbox.container_id).await?;
     let (manifest_path, manifest) = read_lifecycle_manifest(&cfg, &inspected)?;
     let mode = args
         .lifecycle
@@ -100,23 +101,23 @@ pub async fn run(args: RecreateArgs) -> anyhow::Result<()> {
     // Install the scrubbed manifest before destruction. If recreation fails,
     // a later attempt cannot fall back to the old password/capability state.
     persist_lifecycle_manifest(&cfg, &config, mode)?;
-    docker.destroy(&args.target).await?;
-    let sandbox = docker.create(config).await?;
-    docker
-        .wait_healthy(&sandbox.name, Duration::from_secs(45))
+    runtime.destroy(&sandbox.container_id).await?;
+    let new_sandbox = runtime.create(config).await?;
+    runtime
+        .wait_healthy(&new_sandbox.container_id, Duration::from_secs(45))
         .await?;
 
     // A custom/legacy adjacent manifest is no longer authoritative after a
     // successful recreation through the stable state root.
-    if manifest_path != lifecycle_manifest_path(&cfg, &sandbox.name) {
+    if manifest_path != lifecycle_manifest_path(&cfg, &new_sandbox.name) {
         let _ = std::fs::remove_file(manifest_path);
     }
 
     println!(
         "{} recreated {} ({})",
         "\u{2713}".green(),
-        sandbox.name,
-        &sandbox.container_id[..12]
+        new_sandbox.name,
+        &new_sandbox.container_id[..12]
     );
     Ok(())
 }

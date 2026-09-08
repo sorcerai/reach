@@ -2,10 +2,11 @@ use clap::{ArgAction, Args};
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
 use reach_cli::docker::{
-    DockerClient, LifecycleMode, ProfileMount, ResetManifest, Resolution, SandboxConfig,
-    SandboxPorts, read_reset_manifest, reset_manifest_for, reset_manifest_path,
-    validate_sandbox_config, write_reset_manifest,
+    LifecycleMode, ProfileMount, ResetManifest, Resolution, SandboxConfig, SandboxPorts,
+    read_reset_manifest, reset_manifest_for, reset_manifest_path, validate_sandbox_config,
+    write_reset_manifest,
 };
+use reach_cli::runtime::RuntimeClient;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -294,7 +295,7 @@ pub fn parse_memory(s: &str) -> Result<u64, String> {
 }
 
 pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
-    let cfg = ReachConfig::load();
+    let cfg = ReachConfig::load()?;
     let resolution = Resolution::parse(&args.resolution)?;
 
     let profile = args.persist_profile.as_ref().map(|name| {
@@ -352,8 +353,8 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
     validate_sandbox_config(&config)?;
     persist_lifecycle_manifest(&cfg, &config, mode)?;
 
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let sandbox = docker.create(config).await?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
+    let sandbox = runtime.create(config).await?;
 
     println!();
     println!("  {}", "reach create".bold());
@@ -443,8 +444,8 @@ pub async fn run(args: CreateArgs) -> anyhow::Result<()> {
 
     if !args.no_wait {
         print!("  \u{2819} {}", "Waiting for health...".dimmed());
-        docker
-            .wait_healthy(&args.name, Duration::from_secs(30))
+        runtime
+            .wait_healthy(&sandbox.container_id, Duration::from_secs(30))
             .await?;
         print!("\r");
         println!("  {} Healthy", "\u{2713}".green());

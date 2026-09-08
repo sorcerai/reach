@@ -9,10 +9,10 @@ use axum::{Json, Router};
 use clap::Args;
 use reach_cli::agent::{AgentState, ScreenInfoResponse};
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::DockerClient;
 use reach_cli::mcp::{
     JsonRpcRequest, JsonRpcResponse, McpInitializeResult, ToolResponse, tool_definitions,
 };
+use reach_cli::runtime::RuntimeClient;
 use reach_cli::tools::{ToolContext, dispatch};
 use std::convert::Infallible;
 use std::sync::Arc;
@@ -39,22 +39,43 @@ pub struct ServeArgs {
     #[arg(long)]
     pub auth_token: Option<String>,
 }
-
 pub struct AppState {
-    pub docker: DockerClient,
+    pub runtime: Arc<RuntimeClient>,
     pub default_sandbox: Option<String>,
     pub public_host: String,
     pub bind_host: String,
     pub auth_token: Option<String>,
-    pub agent: AgentState,
+    pub agent: Arc<AgentState>,
     pub profile_broker: Arc<reach_cli::profile::ProfileBroker>,
     pub cookie_jars: Arc<reach_cli::profile::CookieJarService>,
     pub accounts: std::collections::BTreeMap<String, reach_cli::lease::AccountPolicy>,
     pub viewer_sessions: super::viewer::ViewerSessions,
     pub raw_viewer_token: String,
+    pub viewer_token_target: tokio::sync::Mutex<Option<String>>,
 }
 
 impl AppState {
+    pub async fn ensure_viewer_token(&self, target: &str) -> anyhow::Result<()> {
+        let mut provisioned = self.viewer_token_target.lock().await;
+        if provisioned.as_deref() == Some(target) {
+            return Ok(());
+        }
+        let helper = "import os,sys\nos.makedirs('/run/reach',mode=0o700,exist_ok=True)\nfd=os.open('/run/reach/viewer-token',os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)\nos.fchmod(fd,0o600)\nwith os.fdopen(fd,'wb') as f: f.write(sys.stdin.buffer.read())";
+        let receipt = self
+            .runtime
+            .exec_input(
+                target,
+                &["python3".into(), "-c".into(), helper.into()],
+                self.raw_viewer_token.as_bytes(),
+            )
+            .await?;
+        if receipt.exit_code != 0 {
+            anyhow::bail!("failed to initialize private viewer transport");
+        }
+        *provisioned = Some(target.to_owned());
+        Ok(())
+    }
+
     pub fn is_allowed_host(&self, host_header: &str) -> bool {
         let host_candidate = extract_host(host_header);
         if host_candidate.is_empty() {
@@ -62,8 +83,6 @@ impl AppState {
         }
 
         let candidate_lower = host_candidate.to_ascii_lowercase();
-
-        // 1. Always allow loopback
         if candidate_lower == "localhost"
             || candidate_lower == "127.0.0.1"
             || candidate_lower == "::1"
@@ -71,22 +90,15 @@ impl AppState {
             return true;
         }
 
-        // 2. Allow configured bind host
         let bind = extract_host(&self.bind_host).to_ascii_lowercase();
         if !bind.is_empty() && bind != "0.0.0.0" && bind != "::" && candidate_lower == bind {
             return true;
         }
 
-        // 3. Allow configured public host
         let pub_host = normalize_host_target(&self.public_host).to_ascii_lowercase();
-        if !pub_host.is_empty() && candidate_lower == pub_host {
-            return true;
-        }
-
-        false
+        !pub_host.is_empty() && candidate_lower == pub_host
     }
 }
-
 pub fn extract_host(host_header: &str) -> &str {
     let host = host_header.trim();
     if host.starts_with('[') {
@@ -156,23 +168,33 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     let port = args.port;
     let host = args.host.clone();
 
-    let cfg = ReachConfig::load();
+    let cfg = ReachConfig::load()?;
     let public_host = args
         .public_host
         .unwrap_or_else(|| cfg.server.effective_public_host());
 
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
-    let default_sandbox = resolve_sandbox_name(&docker, args.sandbox.as_deref())
-        .await
-        .ok();
+    let runtime = Arc::new(RuntimeClient::from_config(&cfg)?);
+    let default_sandbox = match resolve_sandbox_name(&runtime, args.sandbox.as_deref()).await {
+        Ok(name) => Some(name),
+        Err(error)
+            if matches!(
+                &cfg.runtime.backend,
+                reach_cli::config::RuntimeBackend::Docker
+            ) =>
+        {
+            tracing::warn!(error = %error, "no default sandbox available");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let screens_count = match default_sandbox.as_deref() {
-        Some(name) => match docker.find(name).await {
+        Some(name) => match runtime.find(name).await {
             Ok(sb) => sb.ports.screens.max(1),
             Err(_) => 1,
         },
         None => 1,
     };
-    let agent = AgentState::new(screens_count);
+    let agent = Arc::new(AgentState::new(screens_count));
     let auth_token = args
         .auth_token
         .or_else(|| std::env::var("REACH_AUTH_TOKEN").ok())
@@ -182,23 +204,10 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
     }
 
     let raw_viewer_token = uuid::Uuid::new_v4().to_string();
-    if let Some(target) = default_sandbox.as_deref() {
-        let helper = "import os,sys\nos.makedirs('/run/reach',mode=0o700,exist_ok=True)\nfd=os.open('/run/reach/viewer-token',os.O_WRONLY|os.O_CREAT|os.O_TRUNC|os.O_NOFOLLOW,0o600)\nos.fchmod(fd,0o600)\nwith os.fdopen(fd,'wb') as f: f.write(sys.stdin.buffer.read())";
-        let receipt = docker
-            .exec_input(
-                target,
-                &["python3".into(), "-c".into(), helper.into()],
-                raw_viewer_token.as_bytes(),
-            )
-            .await?;
-        if receipt.exit_code != 0 {
-            anyhow::bail!("failed to initialize private viewer transport");
-        }
-    }
-    let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::default_broker());
+    let profile_broker = Arc::new(reach_cli::profile::ProfileBroker::default_broker()?);
     let cookie_jars = Arc::new(reach_cli::profile::CookieJarService::default_service());
     let state = Arc::new(AppState {
-        docker,
+        runtime,
         default_sandbox,
         public_host,
         bind_host: host.clone(),
@@ -209,6 +218,7 @@ pub async fn run(args: ServeArgs) -> anyhow::Result<()> {
         accounts: cfg.accounts,
         viewer_sessions: super::viewer::ViewerSessions::default(),
         raw_viewer_token,
+        viewer_token_target: tokio::sync::Mutex::new(None),
     });
 
     println!("Live view host: {}", state.public_host);
@@ -410,13 +420,13 @@ async fn auth_middleware(
 }
 
 async fn resolve_sandbox_name(
-    docker: &DockerClient,
+    runtime: &RuntimeClient,
     requested: Option<&str>,
 ) -> anyhow::Result<String> {
     if let Some(name) = requested {
         return Ok(name.to_string());
     }
-    let sandboxes = docker.list().await?;
+    let sandboxes = runtime.list().await?;
     sandboxes
         .into_iter()
         .find(|s| matches!(s.status, reach_cli::docker::SandboxStatus::Running))
@@ -426,7 +436,7 @@ async fn resolve_sandbox_name(
 
 async fn resolve_sandbox(state: &AppState, requested: Option<&str>) -> anyhow::Result<String> {
     resolve_sandbox_name(
-        &state.docker,
+        &state.runtime,
         requested.or(state.default_sandbox.as_deref()),
     )
     .await
@@ -438,7 +448,7 @@ async fn agent_screens_handler(
     axum::extract::Query(query): axum::extract::Query<HumanTokenQuery>,
 ) -> Json<Vec<ScreenInfoResponse>> {
     let sb = match resolve_sandbox(&state, None).await {
-        Ok(name) => state.docker.find(&name).await.ok(),
+        Ok(name) => state.runtime.find(&name).await.ok(),
         Err(_) => None,
     };
 
@@ -480,7 +490,7 @@ async fn agent_screen_get_handler(
     headers: HeaderMap,
 ) -> Result<Json<ScreenInfoResponse>, (StatusCode, Json<serde_json::Value>)> {
     let sb = match resolve_sandbox(&state, None).await {
-        Ok(name) => state.docker.find(&name).await.ok(),
+        Ok(name) => state.runtime.find(&name).await.ok(),
         Err(_) => None,
     };
 
@@ -710,17 +720,22 @@ async fn agent_lease_handler(
             *output = value.clone();
         }
     }
-    let permit = state
+
+    // Reserve the screen before any runtime call. Duplicate or conflicting
+    // admissions therefore fail closed without resetting the guest.
+    let mut permit = state
         .agent
-        .begin_tool(id, None, state.agent.handoff_gen(id))
+        .begin_tool_owned(id, None, state.agent.handoff_gen(id))
         .map_err(|e| super::security::reject(StatusCode::CONFLICT, e))?;
+
     let target = state.default_sandbox.as_deref().ok_or_else(|| {
         super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "no_bound_computer")
     })?;
-    grant.incarnation = state.docker.incarnation(target).await.map_err(|_| {
+    let sandbox = state.runtime.find(target).await.map_err(|_| {
         super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "computer_unavailable")
     })?;
-    let sandbox = state.docker.find(target).await.map_err(|_| {
+    let target_id = sandbox.container_id.clone();
+    grant.incarnation = state.runtime.incarnation(&target_id).await.map_err(|_| {
         super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "computer_unavailable")
     })?;
     if grant.account.is_some() && sandbox.allow_exec {
@@ -736,20 +751,37 @@ async fn agent_lease_handler(
         ));
     }
     grant.allow_exec = body.allow_exec;
-    state.docker.reset_screen(target, id).await.map_err(|_| {
-        super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "screen_cleanup_failed")
-    })?;
-    match permit.allocate(&body.owner, grant) {
-        Ok(lease) => Ok(Json(serde_json::json!({
-            "status": "ok",
-            "id": id,
-            "owner": body.owner,
-            "token": lease.token,
-            "handoff_gen": lease.handoff_gen,
-        }))),
-        Err(e) => Err((
+
+    // Keep admission until reset completes. A canceled request drops the
+    // task's owned receipt, rolling back the unpublished grant only after
+    // the guest operation has finished.
+    let lease = permit.allocate(&body.owner, grant).map_err(|e| {
+        (
             StatusCode::CONFLICT,
             Json(serde_json::json!({ "error": e.to_string() })),
+        )
+    })?;
+    let runtime = Arc::clone(&state.runtime);
+    let reset_task = tokio::spawn(async move {
+        runtime.reset_screen(&target_id, id).await.map_err(|_| ())?;
+        Ok::<_, ()>((lease, permit))
+    });
+    match reset_task.await {
+        Ok(Ok((lease, mut permit))) => {
+            permit.commit().map_err(|_| {
+                super::security::reject(StatusCode::SERVICE_UNAVAILABLE, "screen_cleanup_failed")
+            })?;
+            Ok(Json(serde_json::json!({
+                "status": "ok",
+                "id": id,
+                "owner": body.owner,
+                "token": lease.token,
+                "handoff_gen": lease.handoff_gen,
+            })))
+        }
+        Ok(Err(())) | Err(_) => Err(super::security::reject(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "screen_cleanup_failed",
         )),
     }
 }
@@ -1178,14 +1210,19 @@ async fn tool_call_handler(
             Json(serde_json::json!({"error": "sandbox_out_of_scope"})),
         ));
     }
-    let target_result = resolve_sandbox(&state, sandbox_arg).await;
-    let target = target_result.as_deref().unwrap_or("");
-    if target.is_empty() {
-        return Err(super::security::reject(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "computer_unavailable",
-        ));
-    }
+    let target_result = match resolve_sandbox(&state, sandbox_arg).await {
+        Ok(name) => state.runtime.find(&name).await,
+        Err(error) => Err(error),
+    };
+    let target = match target_result.as_ref() {
+        Ok(sandbox) => sandbox.container_id.as_str(),
+        Err(_) => {
+            return Err(super::security::reject(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "computer_unavailable",
+            ));
+        }
+    };
     let grant =
         super::security::prepare(&state, &headers, screen, target, &tool, &mut args).await?;
     let scoped_cookies = super::security::cookies(grant.as_ref());
@@ -1196,9 +1233,9 @@ async fn tool_call_handler(
         .map(String::from);
 
     let ctx = ToolContext {
-        docker: &state.docker,
+        runtime: state.runtime.as_ref(),
         public_host: state.public_host.clone(),
-        agent: Some(&state.agent),
+        agent: Some(state.agent.as_ref()),
         profile_broker: Some(&state.profile_broker),
         cookie_jars: if grant.is_some() {
             scoped_cookies.as_ref()
@@ -1212,7 +1249,7 @@ async fn tool_call_handler(
         request_args.as_object_mut().map(|a| a.remove("screen"));
         match serde_json::from_value::<reach_cli::injection::InjectionRequest>(request_args) {
             Ok(request) => match reach_cli::injection::inject(
-                &state.docker,
+                state.runtime.as_ref(),
                 target,
                 screen,
                 grant
@@ -1266,13 +1303,6 @@ async fn tool_call_handler(
             }
             _ => {}
         }
-    }
-
-    if let Err(e) = target_result {
-        return Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": e.to_string() })),
-        ));
     }
 
     let result = finish_handoff(&_permit, &headers, &tool, &args, result);

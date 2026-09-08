@@ -95,7 +95,7 @@ async fn current_browser_origin(
         )
     })?;
     let output = state
-        .docker
+        .runtime
         .exec_input(
             target,
             &[
@@ -229,7 +229,7 @@ pub async fn prepare(
             .authorize(tool, args)
             .map_err(|e| reject(StatusCode::FORBIDDEN, e))?;
         let incarnation = state
-            .docker
+            .runtime
             .incarnation(target)
             .await
             .map_err(|_| reject(StatusCode::SERVICE_UNAVAILABLE, "computer_unavailable"))?;
@@ -263,7 +263,7 @@ pub async fn prepare(
             .and_then(Value::as_str)
             .is_some_and(|url| !url.is_empty())
     {
-        if let Ok(incarnation) = state.docker.incarnation(target).await {
+        if let Ok(incarnation) = state.runtime.incarnation(target).await {
             reach_cli::refs::global_ref_table().clear_screen(&incarnation, screen);
         }
         state.agent.invalidate_observation(screen);

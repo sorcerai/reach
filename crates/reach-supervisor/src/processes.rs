@@ -1,9 +1,9 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use std::fs::OpenOptions;
 use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{FileTypeExt, OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 use std::time::Duration;
 use tokio::process::{Child, Command};
@@ -365,22 +365,21 @@ impl Supervisor {
     pub async fn start_all(&mut self) -> Result<()> {
         self.prepare_vnc_password_files()?;
         let specs = self.process_table();
+        // Cold Python imports can exceed five seconds under a nested vCPU.
+        // Share one readiness budget across the stack, below the broker's boot deadline.
+        let deadline = time::Instant::now() + Duration::from_secs(45);
         for spec in specs {
-            self.spawn_process(spec).await?;
+            if let Err(error) = self.spawn_process(spec, deadline).await {
+                self.stop_all().await?;
+                return Err(error);
+            }
         }
         tracing::info!("all processes started");
         Ok(())
     }
 
-    async fn spawn_process(&mut self, spec: ProcessSpec) -> Result<()> {
+    async fn spawn_process(&mut self, spec: ProcessSpec, deadline: time::Instant) -> Result<()> {
         tracing::info!(name = spec.name, cmd = spec.command, "starting process");
-
-        let mut cmd = Command::new(spec.command);
-        cmd.env_remove("VNC_PASSWORD");
-        cmd.args(&spec.args);
-        for (k, v) in &spec.env {
-            cmd.env(k, v);
-        }
 
         // Push as Starting before spawn
         let idx = self.processes.len();
@@ -389,23 +388,16 @@ impl Supervisor {
             state: ProcessState::Starting,
         });
 
-        let child = cmd
-            .spawn()
-            .with_context(|| format!("failed to spawn {}", spec.name))?;
-
+        let child = match self.spawn_ready_child(&spec, deadline).await {
+            Ok(child) => child,
+            Err(error) => {
+                self.processes[idx].state = ProcessState::Stopped;
+                return Err(error);
+            }
+        };
         let pid = child.id().unwrap_or(0);
 
-        // Wait for ready check
-        self.wait_ready(&spec.ready_check).await?;
-
         tracing::info!(name = %spec.name, pid, "process ready");
-
-        if spec.name.starts_with("xvfb-") {
-            let display = spec.args.first().cloned().unwrap_or_else(|| ":99".into());
-            set_root_background(&display).await;
-        }
-
-        // Transition to Running
         self.processes[idx] = ManagedProcess {
             spec,
             state: ProcessState::Running {
@@ -419,29 +411,136 @@ impl Supervisor {
         Ok(())
     }
 
-    async fn wait_ready(&self, check: &ReadyCheck) -> Result<()> {
+    async fn ensure_readiness_unclaimed(&self, check: &ReadyCheck) -> Result<()> {
         match check {
-            ReadyCheck::Immediate => Ok(()),
+            ReadyCheck::Immediate => {}
             ReadyCheck::FileExists(path) => {
-                for _ in 0..50 {
-                    if Path::new(path).exists() {
-                        return Ok(());
+                let readiness = Path::new(path);
+                if readiness.exists() {
+                    let metadata = std::fs::symlink_metadata(path)
+                        .with_context(|| format!("failed to inspect readiness artifact: {path}"))?;
+                    if metadata.file_type().is_socket() {
+                        if tokio::net::UnixStream::connect(path).await.is_ok() {
+                            bail!("readiness endpoint already accepts connections: {path}");
+                        }
+                    } else {
+                        bail!("readiness artifact already exists: {path}");
                     }
-                    time::sleep(Duration::from_millis(100)).await;
                 }
-                anyhow::bail!("timeout waiting for {path}")
             }
             ReadyCheck::TcpPort(port) => {
                 let addr = format!("127.0.0.1:{port}");
-                for _ in 0..50 {
-                    if tokio::net::TcpStream::connect(&addr).await.is_ok() {
-                        return Ok(());
-                    }
-                    time::sleep(Duration::from_millis(100)).await;
+                if tokio::net::TcpStream::connect(&addr).await.is_ok() {
+                    bail!("readiness endpoint already accepts connections: {addr}");
                 }
-                anyhow::bail!("timeout waiting for port {port}")
             }
         }
+        Ok(())
+    }
+
+    async fn spawn_ready_child(
+        &self,
+        spec: &ProcessSpec,
+        deadline: time::Instant,
+    ) -> Result<Child> {
+        self.ensure_readiness_unclaimed(&spec.ready_check).await?;
+        let mut cmd = Command::new(spec.command);
+        cmd.env_remove("VNC_PASSWORD");
+        cmd.args(&spec.args);
+        for (k, v) in &spec.env {
+            cmd.env(k, v);
+        }
+
+        let mut child = cmd
+            .kill_on_drop(true)
+            .spawn()
+            .with_context(|| format!("failed to spawn {}", spec.name))?;
+
+        if let Err(error) = self
+            .wait_ready(&mut child, &spec.ready_check, deadline)
+            .await
+        {
+            if child
+                .try_wait()
+                .with_context(|| format!("failed to reap unready {}", spec.name))?
+                .is_none()
+            {
+                child
+                    .kill()
+                    .await
+                    .with_context(|| format!("failed to reap unready {}", spec.name))?;
+            }
+            return Err(error);
+        }
+
+        if spec.name.starts_with("xvfb-") {
+            let display = spec.args.first().cloned().unwrap_or_else(|| ":99".into());
+            set_root_background(&display).await;
+        }
+
+        // Close the final readiness-to-publication race by checking ownership
+        // once more immediately before returning the child to its state slot.
+        if let Some(status) = child
+            .try_wait()
+            .with_context(|| format!("failed to check {} after readiness", spec.name))?
+        {
+            bail!(
+                "{} exited before becoming running (exit code: {:?})",
+                spec.name,
+                status.code()
+            );
+        }
+
+        Ok(child)
+    }
+
+    async fn wait_ready(
+        &self,
+        child: &mut Child,
+        check: &ReadyCheck,
+        deadline: time::Instant,
+    ) -> Result<()> {
+        time::timeout_at(deadline, async {
+            loop {
+                if let Some(status) = child
+                    .try_wait()
+                    .context("failed to check child while waiting for readiness")?
+                {
+                    bail!(
+                        "child exited before readiness (exit code: {:?})",
+                        status.code()
+                    );
+                }
+
+                let ready = match check {
+                    ReadyCheck::Immediate => true,
+                    ReadyCheck::FileExists(path) => {
+                        let readiness = Path::new(path);
+                        if !readiness.exists() {
+                            false
+                        } else {
+                            let metadata = std::fs::symlink_metadata(path)
+                                .with_context(|| format!("failed to inspect readiness: {path}"))?;
+                            if metadata.file_type().is_socket() {
+                                tokio::net::UnixStream::connect(path).await.is_ok()
+                            } else {
+                                true
+                            }
+                        }
+                    }
+                    ReadyCheck::TcpPort(port) => {
+                        let addr = format!("127.0.0.1:{port}");
+                        tokio::net::TcpStream::connect(&addr).await.is_ok()
+                    }
+                };
+                if ready {
+                    return Ok(());
+                }
+                time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .with_context(|| format!("startup deadline exceeded waiting for {check:?}"))?
     }
 
     /// Graceful shutdown — SIGTERM each child, wait, then SIGKILL stragglers.
@@ -477,7 +576,7 @@ impl Supervisor {
     pub async fn check_and_restart(&mut self) -> Result<usize> {
         let mut restarted = 0;
 
-        // Snapshot which processes are running before mutable iteration
+        // Snapshot which processes are running before mutable iteration.
         let running_names: Vec<String> = self
             .processes
             .iter()
@@ -485,120 +584,111 @@ impl Supervisor {
             .map(|p| p.spec.name.clone())
             .collect();
 
-        for proc in &mut self.processes {
-            if let ProcessState::Running {
-                child,
-                restart_count,
-                ..
-            } = &mut proc.state
-            {
-                // Non-blocking check if process exited
-                match child.try_wait() {
-                    Ok(Some(status)) => {
-                        let code = status.code();
-                        let count = *restart_count;
+        for idx in 0..self.processes.len() {
+            let exited = match &mut self.processes[idx].state {
+                ProcessState::Running {
+                    child,
+                    restart_count,
+                    ..
+                } => match child.try_wait() {
+                    Ok(Some(status)) => Some(Ok((status.code(), *restart_count))),
+                    Ok(None) => None,
+                    Err(error) => Some(Err(error.to_string())),
+                },
+                _ => None,
+            };
 
-                        tracing::warn!(
-                            name = %proc.spec.name,
-                            exit_code = ?code,
-                            restart_count = count,
-                            "process exited unexpectedly"
-                        );
+            let Some(exit) = exited else {
+                continue;
+            };
+            let (code, count) = match exit {
+                Ok(values) => values,
+                Err(error) => {
+                    tracing::error!(
+                        name = %self.processes[idx].spec.name,
+                        error,
+                        "failed to check process"
+                    );
+                    continue;
+                }
+            };
 
-                        // Check restart policy
-                        match &proc.spec.restart {
-                            RestartPolicy::Always {
-                                max_restarts,
-                                backoff,
-                            } => {
-                                if count >= *max_restarts {
-                                    tracing::error!(
-                                        name = %proc.spec.name,
-                                        "max restarts ({max_restarts}) exceeded"
-                                    );
-                                    proc.state = ProcessState::Failed {
-                                        exit_code: code,
-                                        restart_count: count,
-                                        last_error: format!(
-                                            "max restarts exceeded (exit code: {:?})",
-                                            code
-                                        ),
-                                    };
-                                    continue;
-                                }
+            // Remove the exited child from the published state before any
+            // backoff or restart work. Its handle remains owned and is dropped
+            // only after try_wait has reaped it.
+            let previous = std::mem::replace(&mut self.processes[idx].state, ProcessState::Stopped);
+            let ProcessState::Running { child, .. } = previous else {
+                continue;
+            };
+            drop(child);
 
-                                // Backoff before restart
-                                time::sleep(*backoff).await;
+            let spec = self.processes[idx].spec.clone();
+            tracing::warn!(
+                name = %spec.name,
+                exit_code = ?code,
+                restart_count = count,
+                "process exited unexpectedly"
+            );
 
-                                // Check dependencies are still running
-                                let deps_ok = proc
-                                    .spec
-                                    .depends_on
-                                    .iter()
-                                    .all(|dep| running_names.contains(dep));
+            let RestartPolicy::Always {
+                max_restarts,
+                backoff,
+            } = &spec.restart;
+            if count >= *max_restarts {
+                tracing::error!(
+                    name = %spec.name,
+                    "max restarts ({max_restarts}) exceeded"
+                );
+                self.processes[idx].state = ProcessState::Failed {
+                    exit_code: code,
+                    restart_count: count,
+                    last_error: format!("max restarts exceeded (exit code: {:?})", code),
+                };
+                continue;
+            }
 
-                                if !deps_ok {
-                                    tracing::warn!(
-                                        name = %proc.spec.name,
-                                        "dependency not running, marking failed"
-                                    );
-                                    proc.state = ProcessState::Failed {
-                                        exit_code: code,
-                                        restart_count: count,
-                                        last_error: "dependency not running".into(),
-                                    };
-                                    continue;
-                                }
+            time::sleep(*backoff).await;
 
-                                // Restart
-                                tracing::info!(
-                                    name = %proc.spec.name,
-                                    attempt = count + 1,
-                                    "restarting process"
-                                );
+            let deps_ok = spec
+                .depends_on
+                .iter()
+                .all(|dep| running_names.contains(dep));
+            if !deps_ok {
+                tracing::warn!(
+                    name = %spec.name,
+                    "dependency not running, marking failed"
+                );
+                self.processes[idx].state = ProcessState::Failed {
+                    exit_code: code,
+                    restart_count: count,
+                    last_error: "dependency not running".into(),
+                };
+                continue;
+            }
 
-                                let mut cmd = Command::new(proc.spec.command);
-                                cmd.env_remove("VNC_PASSWORD");
-                                cmd.args(&proc.spec.args);
-                                for (k, v) in &proc.spec.env {
-                                    cmd.env(k, v);
-                                }
-
-                                match cmd.spawn() {
-                                    Ok(new_child) => {
-                                        let pid = new_child.id().unwrap_or(0);
-                                        proc.state = ProcessState::Running {
-                                            child: new_child,
-                                            pid,
-                                            started_at: std::time::Instant::now(),
-                                            restart_count: count + 1,
-                                        };
-                                        if proc.spec.name.starts_with("xvfb-") {
-                                            let display = proc
-                                                .spec
-                                                .args
-                                                .first()
-                                                .cloned()
-                                                .unwrap_or_else(|| ":99".into());
-                                            set_root_background(&display).await;
-                                        }
-                                        restarted += 1;
-                                    }
-                                    Err(e) => {
-                                        proc.state = ProcessState::Failed {
-                                            exit_code: code,
-                                            restart_count: count,
-                                            last_error: e.to_string(),
-                                        };
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {} // still running
-                    Err(e) => {
-                        tracing::error!(name = %proc.spec.name, error = %e, "failed to check process");
-                    }
+            tracing::info!(
+                name = %spec.name,
+                attempt = count + 1,
+                "restarting process"
+            );
+            let deadline = time::Instant::now() + Duration::from_secs(45);
+            match self.spawn_ready_child(&spec, deadline).await {
+                Ok(new_child) => {
+                    let pid = new_child.id().unwrap_or(0);
+                    self.processes[idx].state = ProcessState::Running {
+                        child: new_child,
+                        pid,
+                        started_at: std::time::Instant::now(),
+                        restart_count: count + 1,
+                    };
+                    restarted += 1;
+                }
+                Err(error) => {
+                    self.processes[idx].state = ProcessState::Failed {
+                        exit_code: code,
+                        restart_count: count,
+                        last_error: error.to_string(),
+                    };
                 }
             }
         }
@@ -724,6 +814,219 @@ pub fn clean_x11_locks() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn cold_service_can_become_ready_after_initial_startup_delay() {
+        let directory = std::env::temp_dir().join(format!(
+            "reach-supervisor-ready-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let ready = directory.join("ready");
+        let signal = ready.clone();
+        let service = tokio::spawn(async move {
+            time::sleep(Duration::from_secs(6)).await;
+            std::fs::write(signal, b"ready").unwrap();
+        });
+        let supervisor = Supervisor::new(99, 1280, 720);
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let result = supervisor
+            .wait_ready(
+                &mut child,
+                &ReadyCheck::FileExists(ready.to_string_lossy().into_owned()),
+                time::Instant::now() + Duration::from_secs(30),
+            )
+            .await;
+        service.await.unwrap();
+        let _ = child.kill().await;
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(result.is_ok(), "cold service was abandoned: {result:?}");
+    }
+
+    #[tokio::test]
+    async fn readiness_failure_reaps_the_unpublished_process() {
+        let directory = std::env::temp_dir().join(format!(
+            "rs-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let socket = directory.join("s");
+        let spec = ProcessSpec {
+            name: "unready-service".into(),
+            command: "python3",
+            args: vec![
+                "-c".into(),
+                "import socket,sys; s=socket.socket(socket.AF_UNIX); s.bind(sys.argv[1]); s.listen(); s.accept()".into(),
+                socket.to_string_lossy().into_owned(),
+            ],
+            env: vec![],
+            restart: RestartPolicy::Always {
+                max_restarts: 0,
+                backoff: Duration::ZERO,
+            },
+            depends_on: vec![],
+            ready_check: ReadyCheck::FileExists(
+                directory.join("never-ready").to_string_lossy().into_owned(),
+            ),
+        };
+        let mut supervisor = Supervisor::new(99, 1280, 720);
+        let result = supervisor
+            .spawn_process(spec, time::Instant::now() + Duration::from_secs(3))
+            .await;
+        let started = socket.exists();
+        // Connecting also lets an incorrectly surviving fixture exit before asserting.
+        let survivor = std::os::unix::net::UnixStream::connect(&socket);
+        std::fs::remove_dir_all(directory).unwrap();
+        assert!(started, "fixture never reached its listening state");
+        assert!(result.is_err(), "unready service was published");
+        assert!(survivor.is_err(), "failed startup left its child listening");
+    }
+    #[tokio::test]
+    async fn preexisting_listener_and_dead_child_cannot_publish_running() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let spec = ProcessSpec {
+            name: "preexisting-listener".into(),
+            command: "python3",
+            args: vec!["-c".into(), "import os; os._exit(0)".into()],
+            env: vec![],
+            restart: RestartPolicy::Always {
+                max_restarts: 0,
+                backoff: Duration::ZERO,
+            },
+            depends_on: vec![],
+            ready_check: ReadyCheck::TcpPort(port),
+        };
+        let mut supervisor = Supervisor::new(99, 1280, 720);
+
+        let result = supervisor
+            .spawn_process(spec, time::Instant::now() + Duration::from_secs(1))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "pre-existing listener was adopted as readiness"
+        );
+        assert!(
+            supervisor
+                .health()
+                .iter()
+                .all(|process| process.status != ProcessStatus::Running),
+            "dead child was published as running through an unrelated listener"
+        );
+        drop(listener);
+    }
+
+    #[tokio::test]
+    async fn child_exit_during_readiness_cannot_publish_running() {
+        let directory = std::env::temp_dir().join(format!(
+            "reach-supervisor-dead-child-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let ready = directory.join("ready");
+        let spec = ProcessSpec {
+            name: "dead-before-ready".into(),
+            command: "python3",
+            args: vec![
+                "-c".into(),
+                "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ready')".into(),
+                ready.to_string_lossy().into_owned(),
+            ],
+            env: vec![],
+            restart: RestartPolicy::Always {
+                max_restarts: 0,
+                backoff: Duration::ZERO,
+            },
+            depends_on: vec![],
+            ready_check: ReadyCheck::FileExists(ready.to_string_lossy().into_owned()),
+        };
+        let mut supervisor = Supervisor::new(99, 1280, 720);
+
+        let result = supervisor
+            .spawn_process(spec, time::Instant::now() + Duration::from_secs(1))
+            .await;
+
+        assert!(
+            result.is_err(),
+            "exited child was published after readiness appeared"
+        );
+        assert!(
+            supervisor
+                .health()
+                .iter()
+                .all(|process| process.status != ProcessStatus::Running),
+            "child that exited while waiting for readiness is still running"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[tokio::test]
+    async fn restart_waits_for_readiness_and_liveness_before_running() {
+        let directory = std::env::temp_dir().join(format!(
+            "reach-supervisor-restart-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&directory).unwrap();
+        let ready = directory.join("ready");
+        let spec = ProcessSpec {
+            name: "restart-before-ready".into(),
+            command: "python3",
+            args: vec!["-c".into(), "import time; time.sleep(0.05)".into()],
+            env: vec![],
+            restart: RestartPolicy::Always {
+                max_restarts: 1,
+                backoff: Duration::ZERO,
+            },
+            depends_on: vec![],
+            ready_check: ReadyCheck::Immediate,
+        };
+        let mut supervisor = Supervisor::new(99, 1280, 720);
+        supervisor
+            .spawn_process(spec, time::Instant::now() + Duration::from_secs(1))
+            .await
+            .unwrap();
+        supervisor.processes[0].spec.args = vec![
+            "-c".into(),
+            "import pathlib,sys; pathlib.Path(sys.argv[1]).write_text('ready')".into(),
+            ready.to_string_lossy().into_owned(),
+        ];
+        supervisor.processes[0].spec.ready_check =
+            ReadyCheck::FileExists(ready.to_string_lossy().into_owned());
+        time::sleep(Duration::from_millis(100)).await;
+
+        let restarted = supervisor.check_and_restart().await.unwrap();
+
+        assert_eq!(restarted, 0, "unready restart was counted as running");
+        assert!(
+            supervisor
+                .health()
+                .iter()
+                .all(|process| process.status != ProcessStatus::Running),
+            "restart was published before readiness and liveness were both confirmed"
+        );
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn x11vnc_uses_password_file_without_plaintext_argv() {

@@ -223,6 +223,7 @@ async fn handback_handler(
     let id = cookie_session_id(screen, &headers)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "viewer session required"))?;
     let session = current_session(&state, screen, &id).await?;
+    resolve_target(&state, screen, Some(&session)).await?;
     if session.mode != ViewerMode::Control {
         return Err(error(
             StatusCode::FORBIDDEN,
@@ -276,7 +277,8 @@ async fn asset_handler(
     reject_query_token(&uri)?;
     let id = cookie_session_id(screen, &headers)
         .ok_or_else(|| error(StatusCode::UNAUTHORIZED, "viewer session required"))?;
-    current_session(&state, screen, &id).await?;
+    let session = current_session(&state, screen, &id).await?;
+    resolve_target(&state, screen, Some(&session)).await?;
     let (content_type, body): (&str, &'static [u8]) = match path.as_str() {
         "vnc.html" => (
             "text/html; charset=utf-8",
@@ -334,13 +336,13 @@ async fn resolve_target(
     screen: u32,
     pinned: Option<&ViewerSession>,
 ) -> Result<ProxyTarget, ViewerError> {
-    let sandbox = state
+    let sandbox_name = state
         .default_sandbox
         .clone()
         .ok_or_else(|| error(StatusCode::SERVICE_UNAVAILABLE, "no sandbox is pinned"))?;
     let info = state
-        .docker
-        .find(&sandbox)
+        .runtime
+        .find(&sandbox_name)
         .await
         .map_err(|_| error(StatusCode::BAD_GATEWAY, "pinned sandbox is unavailable"))?;
     if info.status != reach_cli::docker::SandboxStatus::Running {
@@ -362,13 +364,22 @@ async fn resolve_target(
     let port = base
         .checked_add(screen as u16)
         .ok_or_else(|| error(StatusCode::BAD_GATEWAY, "invalid sandbox noVNC port"))?;
+    let target_id = info.container_id.clone();
     let incarnation = state
-        .docker
-        .incarnation(&sandbox)
+        .runtime
+        .incarnation(&target_id)
         .await
         .map_err(|_| error(StatusCode::BAD_GATEWAY, "sandbox incarnation unavailable"))?;
+    let grant_incarnation = state
+        .agent
+        .screen_info(screen)
+        .and_then(|scope| scope.grant)
+        .map(|grant| grant.incarnation);
+    if grant_incarnation.as_deref() != Some(incarnation.as_str()) {
+        return Err(error(StatusCode::UNAUTHORIZED, "viewer scope revoked"));
+    }
     if let Some(pinned) = pinned {
-        if pinned.sandbox != sandbox
+        if pinned.sandbox != target_id
             || pinned.incarnation != incarnation
             || pinned.novnc_port != port
         {
@@ -376,8 +387,14 @@ async fn resolve_target(
             return Err(error(StatusCode::UNAUTHORIZED, "viewer scope revoked"));
         }
     }
+    state.ensure_viewer_token(&target_id).await.map_err(|_| {
+        error(
+            StatusCode::BAD_GATEWAY,
+            "private viewer transport unavailable",
+        )
+    })?;
     Ok(ProxyTarget {
-        sandbox,
+        sandbox: target_id,
         incarnation,
         novnc_port: port,
     })
@@ -499,13 +516,37 @@ async fn proxy_socket(
                         if bytes.len() > MAX_HTTP_BODY || rfb.observe_server(&bytes).is_err() {
                             break;
                         }
-                        if browser.send(BrowserMessage::Binary(bytes)).await.is_err() { break; }
+                        if current_session(&state, session.screen, &session_id)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if browser.send(BrowserMessage::Binary(bytes)).await.is_err() {
+                            break;
+                        }
                     }
                     UpstreamMessage::Ping(bytes) => {
-                        if browser.send(BrowserMessage::Ping(bytes)).await.is_err() { break; }
+                        if current_session(&state, session.screen, &session_id)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if browser.send(BrowserMessage::Ping(bytes)).await.is_err() {
+                            break;
+                        }
                     }
                     UpstreamMessage::Pong(bytes) => {
-                        if browser.send(BrowserMessage::Pong(bytes)).await.is_err() { break; }
+                        if current_session(&state, session.screen, &session_id)
+                            .await
+                            .is_err()
+                        {
+                            break;
+                        }
+                        if browser.send(BrowserMessage::Pong(bytes)).await.is_err() {
+                            break;
+                        }
                     }
                     UpstreamMessage::Close(_) => break,
                     UpstreamMessage::Text(_) => break,

@@ -46,7 +46,6 @@ MCP_PREFIX = "mcp__reach__"
 # Distinct default key for standalone direct Python calls (no Hermes session).
 STANDALONE_SESSION = "__standalone__"
 
-# Reach dispatcher toolset: crates/reach-cli/src/mcp.rs tool_definitions().
 REACH_TOOLS = frozenset({
     "screenshot", "click", "type", "key", "browse", "scrape",
     "playwright_eval", "exec", "page_text", "auth_handoff", "live_view", "ack_handback",
@@ -54,7 +53,10 @@ REACH_TOOLS = frozenset({
 
 # Model-supplied reach_tool argument keys that must never ride into a call.
 _FORBIDDEN_TOOL_ARGS = frozenset(
-    {"token", "authorization", "api_url", "base_url", "session_id", "owner"})
+    {"token", "authorization", "api_url", "base_url", "session_id", "owner",
+     "observation_gen", "handoff_gen", "headers", "x-observation-gen",
+     "x-handoff-gen"})
+_OBSERVATION_TOOLS = frozenset({"screenshot", "page_text"})
 
 _ctx: Any = None  # PluginContext, set by register(); None under unit tests
 _lock = threading.Lock()
@@ -66,9 +68,10 @@ _session_var: ContextVar[Optional[str]] = ContextVar(
 
 _EMPTY_STATE: Dict[str, Any] = {
     "screen": None, "owner": None, "token": None, "handoff_gen": None,
+    "observation_gen": None, "_observation_meta": None,
     "leased_at": None, "novnc_url": None, "error": None,
 }
-_REDACTED_KEYS = ("token", "handoff_gen")
+_REDACTED_KEYS = ("token", "handoff_gen", "observation_gen", "_observation_meta")
 
 
 # --------------------------------------------------------------------------
@@ -193,6 +196,7 @@ def _http_request(
     timeout: float = 10.0,
     lease_token: Optional[str] = None,
     handoff_gen: Optional[int] = None,
+    observation_gen: Optional[int] = None,
     supervisor: bool = False,
 ) -> Any:
     import urllib.parse
@@ -214,6 +218,8 @@ def _http_request(
         headers["X-Lease-Token"] = lease_token
         if handoff_gen is not None:
             headers["X-Handoff-Gen"] = str(handoff_gen)
+        if observation_gen is not None:
+            headers["X-Observation-Gen"] = str(observation_gen)
     elif supervisor:
         tok = _supervisor_token()
         if tok:
@@ -234,6 +240,73 @@ def _http_error_detail(error: Any) -> str:
         return raw.decode("utf-8", "replace")
     except Exception as decode_error:
         return f"<response body unavailable: {decode_error}>"
+def _observation_call(name: str, args: Dict[str, Any]) -> bool:
+    return name in _OBSERVATION_TOOLS or (
+        name == "browse" and args.get("snapshot") is True
+    )
+
+
+def _clear_observation(st: Dict[str, Any]) -> None:
+    st["observation_gen"] = None
+    st["_observation_meta"] = None
+
+
+def _response_meta(response: Any) -> Optional[Dict[str, Any]]:
+    if not isinstance(response, dict):
+        return None
+    meta = response.get("_meta")
+    if isinstance(meta, dict):
+        return meta
+    nested = response.get("result")
+    if isinstance(nested, dict) and isinstance(nested.get("_meta"), dict):
+        return nested["_meta"]
+    return None
+
+
+def _retain_observation(
+    st: Dict[str, Any],
+    response: Any,
+    name: str,
+    args: Dict[str, Any],
+    request_token: Optional[str],
+    request_screen: Any,
+    request_handoff: Optional[int],
+) -> None:
+    """Retain trusted metadata and reject responses crossing request authority."""
+    current = _sessions.get(_current_key())
+    if (current is not st or st.get("token") != request_token
+            or st.get("screen") != request_screen
+            or st.get("handoff_gen") != request_handoff):
+        raise ValueError("observation response crossed lease, screen, or handoff boundary")
+    observation_call = _observation_call(name, args)
+    if not isinstance(response, dict):
+        if observation_call:
+            raise ValueError("observation response omitted a valid metadata object")
+        return
+    if response.get("isError") is True:
+        return
+    nested = response.get("result")
+    if isinstance(nested, dict) and nested.get("isError") is True:
+        return
+    if not observation_call:
+        if name == "auth_handoff":
+            _clear_observation(st)
+        else:
+            st["observation_gen"] = None
+        return
+    meta = _response_meta(response)
+    if not isinstance(meta, dict) or type(meta.get("observation_gen")) is not int:
+        raise ValueError("observation response omitted a valid generation")
+    previous = st.get("_observation_meta")
+    if isinstance(previous, dict):
+        for field in ("incarnation", "task_id", "attempt_id"):
+            if previous.get(field) is not None and meta.get(field) != previous[field]:
+                raise ValueError("observation response crossed lease identity")
+        old_gen = previous.get("observation_gen")
+        if type(old_gen) is int and meta["observation_gen"] < old_gen:
+            raise ValueError("observation response is older than the current observation")
+    st["observation_gen"] = meta["observation_gen"]
+    st["_observation_meta"] = dict(meta)
 
 
 
@@ -246,6 +319,12 @@ def reach_lease_screen(
 
     st = _session_state(create=True)
     if st.get("token") and st.get("screen") is not None:
+        if type(st.get("handoff_gen")) is not int:
+            return {
+                "status": "error",
+                "state_retained": True,
+                "message": "screen lease capability requires reconciliation; lease not reusable",
+            }
         # Reuse own retained capability; occupied screens are never re-POSTed.
         if screen is not None and screen != st["screen"]:
             return {"status": "error",
@@ -259,30 +338,74 @@ def reach_lease_screen(
         screens = _http_request("/agent/screens", api_url=api, supervisor=True)
     except Exception as e:
         return {"status": "error", "message": f"Failed to list screens: {e}"}
+    if not isinstance(screens, list):
+        return {"status": "error", "message": "server did not return a valid screen list"}
 
     target = screen
     if target is None:
         # Free-screen selection: unowned screens only; owner labels never recover a lease.
-        free = next((s for s in screens if s.get("owner") is None), None)
+        free = next((s for s in screens if isinstance(s, dict) and s.get("owner") is None), None)
         if free is None:
             return {"status": "exhausted", "message": "No free Agent Computer screens available."}
         target = free.get("id", 0)
 
     try:
         lease = _http_request(f"/agent/screens/{target}/lease", "POST",
-                              {"owner": lease_owner}, api_url=api, supervisor=True)
+                              {"owner": lease_owner, "allow_exec": _cfg("allow_exec", False) is True},
+                              api_url=api, supervisor=True)
     except urllib.error.HTTPError as e:
         detail = _http_error_detail(e)
-        return {"status": "conflict",
+        return {"status": "conflict" if e.code == 409 else "error",
                 "message": f"Failed to lease screen {target} (HTTP {e.code}): {detail}"}
     except Exception as e:
         return {"status": "error", "message": f"Lease request failed: {e}"}
 
-    info = next((s for s in screens if s.get("id") == target), {})
-    if not isinstance(lease.get("token"), str) or not lease["token"] or type(lease.get("handoff_gen")) is not int:
+    info = next((s for s in screens if isinstance(s, dict) and s.get("id") == target), {})
+    candidate_token = lease.get("token") if isinstance(lease, dict) else None
+    valid = (
+        isinstance(lease, dict)
+        and isinstance(candidate_token, str)
+        and bool(candidate_token.strip())
+        and type(lease.get("handoff_gen")) is int
+    )
+    if not valid:
+        if isinstance(candidate_token, str) and candidate_token.strip():
+            st.update(
+                screen=target,
+                owner=lease_owner,
+                token=candidate_token,
+                handoff_gen=None,
+                observation_gen=None,
+                _observation_meta=None,
+                leased_at=info.get("leased_at"),
+                novnc_url=info.get("novnc_url", ""),
+                error="invalid lease receipt; reconciliation required",
+            )
+            cleanup_status = "uncertain"
+            try:
+                receipt = _http_request(
+                    f"/agent/screens/{target}/lease", "DELETE",
+                    {"owner": lease_owner},
+                    api_url=api,
+                    lease_token=candidate_token,
+                )
+                if isinstance(receipt, dict) and receipt.get("released") is True:
+                    reset_state()
+                    cleanup_status = "confirmed"
+            except Exception:
+                logger.warning("Malformed lease cleanup for screen %s failed", target)
+            result: Dict[str, Any] = {
+                "status": "error",
+                "message": f"Invalid lease receipt; cleanup={cleanup_status}",
+            }
+            if cleanup_status != "confirmed":
+                result["state_retained"] = True
+            return result
         return {"status": "error", "message": "server did not return a valid lease capability"}
-    st.update(screen=target, owner=lease_owner, token=lease.get("token"),
-              handoff_gen=lease.get("handoff_gen"), leased_at=info.get("leased_at"),
+
+    st.update(screen=target, owner=lease_owner, token=candidate_token,
+              handoff_gen=lease["handoff_gen"], observation_gen=None,
+              _observation_meta=None, leased_at=info.get("leased_at"),
               novnc_url=info.get("novnc_url", ""), error=None)
     return {"status": "ok", "screen": target, "owner": lease_owner, "novnc_url": st["novnc_url"]}
 
@@ -303,9 +426,17 @@ def reach_release_screen(
     if target is None or not st.get("token"):
         return {"status": "noop", "message": "No screen currently leased."}
     try:
-        _http_request(f"/agent/screens/{target}/lease", "DELETE",
-                      {"owner": st.get("owner") or get_owner()},
-                      api_url=api_url, lease_token=st["token"])
+        receipt = _http_request(
+            f"/agent/screens/{target}/lease", "DELETE",
+            {"owner": st.get("owner") or get_owner()},
+            api_url=api_url, lease_token=st["token"],
+        )
+        if not isinstance(receipt, dict) or receipt.get("released") is not True:
+            return {
+                "status": "error",
+                "state_retained": True,
+                "message": f"Release of screen {target} was not confirmed; state retained",
+            }
     except urllib.error.HTTPError as e:
         # e.g. HumanActive/Busy (409): the capability is still ours — retain all
         # local lease state so a later release (after handback) still works.
@@ -450,6 +581,7 @@ def _ack_handback(st: Dict[str, Any]) -> Dict[str, Any]:
         if response.get("phase") != "AgentActive" or type(response.get("handoff_gen")) is not int:
             raise ValueError("invalid handback acknowledgment")
         st["handoff_gen"] = response["handoff_gen"]
+        _clear_observation(st)
         return {"status": "ok", "phase": "AgentActive",
                 "message": "Capture a fresh observation and replan before acting."}
     except Exception as error:
@@ -469,22 +601,33 @@ def _reach_mcp_call(
     if arguments.get("screen", st["screen"]) != st["screen"]:
         raise ValueError("screen is outside this session's lease")
     arguments["screen"] = st["screen"]
+    request_token = st["token"]
+    request_screen = st["screen"]
+    request_handoff = st.get("handoff_gen")
     payload = {
         "jsonrpc": "2.0",
         "id": 1,
         "method": "tools/call",
         "params": {"name": method_name, "arguments": arguments},
     }
-    return _http_request("/mcp", method="POST", body=payload, api_url=api_url, timeout=timeout,
-                         lease_token=st["token"], handoff_gen=st.get("handoff_gen"))
+    result = _http_request(
+        "/mcp", method="POST", body=payload, api_url=api_url, timeout=timeout,
+        lease_token=request_token, handoff_gen=request_handoff,
+        observation_gen=st.get("observation_gen"),
+    )
+    _retain_observation(
+        st, result, method_name, arguments, request_token, request_screen, request_handoff
+    )
+    return result
 
 
 def reach_tool(name: str, arguments: Optional[Dict[str, Any]] = None,
                timeout: int = 60) -> Dict[str, Any]:
     """Authenticated passthrough to the reach dispatcher on this session's lease.
 
-    Injects the bound screen and sends the lease token + handoff generation in
-    headers; the model can never pass credentials or header overrides.
+    Injects the bound screen and sends lease, handoff, and retained observation
+    generations in headers; the model can never pass credentials or header overrides.
+    Approval-required responses are returned explicitly and are never replayed.
     """
     import urllib.error
 
@@ -494,7 +637,15 @@ def reach_tool(name: str, arguments: Optional[Dict[str, Any]] = None,
     if arguments is not None and not isinstance(arguments, dict):
         return {"status": "error", "message": "arguments must be an object"}
     args = dict(arguments or {})
-    bad = sorted(set(args) & _FORBIDDEN_TOOL_ARGS)
+    bad = sorted(
+        key for key in args
+        if key in _FORBIDDEN_TOOL_ARGS
+        or key.lower().replace("_", "-") in {
+            "token", "authorization", "api-url", "base-url", "session-id",
+            "owner", "observation-gen", "handoff-gen", "headers",
+            "x-observation-gen", "x-handoff-gen",
+        }
+    )
     if bad:
         return {"status": "error",
                 "message": f"rejected credential-bearing argument(s): {', '.join(bad)}"}
@@ -503,6 +654,12 @@ def reach_tool(name: str, arguments: Optional[Dict[str, Any]] = None,
     if not st.get("token") or st.get("screen") is None:
         return {"status": "error",
                 "message": "no screen leased for this session; call reach_lease_screen first"}
+    if type(st.get("handoff_gen")) is not int:
+        return {
+            "status": "error",
+            "state_retained": True,
+            "message": "screen lease capability requires reconciliation; no tool call was made",
+        }
     caller_screen = args.get("screen")
     if caller_screen is not None and caller_screen != st["screen"]:
         return {"status": "error",
@@ -513,20 +670,41 @@ def reach_tool(name: str, arguments: Optional[Dict[str, Any]] = None,
         return _ack_handback(st)
     args["screen"] = st["screen"]
     timeout = max(1, min(int(timeout), 600))
+    request_token = st["token"]
+    request_screen = st["screen"]
+    request_handoff = st.get("handoff_gen")
 
     def _call() -> Any:
         return _http_request(f"/tools/{name}", "POST", args, timeout=float(timeout),
-                             lease_token=st.get("token"), handoff_gen=st.get("handoff_gen"))
+                             lease_token=request_token, handoff_gen=request_handoff,
+                             observation_gen=st.get("observation_gen"))
 
     try:
         result = _call()
     except urllib.error.HTTPError as e:
         detail = _http_error_detail(e)
+        if e.code == 428:
+            try:
+                body = json.loads(detail)
+            except (TypeError, ValueError):
+                body = {}
+            if isinstance(body, dict) and body.get("error") == "approval_required":
+                return {"status": "approval_required", "tool": name,
+                        "digest": body.get("digest"),
+                        "message": "Approval required; do not replay until the supervisor approves this exact action."}
         return {"status": "error", "tool": name,
                 "message": f"reach tool {name} failed (HTTP {e.code}): {detail}",
                 "help": "After human handback, explicitly call ack_handback, then observe and replan; do not replay this action."}
     except Exception as e:
         return {"status": "error", "tool": name, "message": f"reach tool {name} failed: {e}"}
+    try:
+        _retain_observation(
+            st, result, name, args, request_token, request_screen, request_handoff
+        )
+    except ValueError as e:
+        return {"status": "error", "tool": name,
+                "message": f"reach tool {name} failed: {e}",
+                "help": "Capture a fresh observation and replan; do not replay this action."}
     return {"status": "error" if isinstance(result, dict) and result.get("isError") else "ok",
             "tool": name, "result": result}
 
@@ -713,10 +891,8 @@ def post_tool_call(tool_name: str = "", args: Optional[Dict[str, Any]] = None, r
         st = _session_state()
         if st.get("screen") is None or not st.get("token"):
             return
-        current_gen = st.get("handoff_gen")
-        if type(current_gen) is int and handoff["handoff_gen"] < current_gen:
-            return
         st["handoff_gen"] = handoff["handoff_gen"]
+        _clear_observation(st)
 
 
 def on_session_finalize(**kw: Any) -> None:

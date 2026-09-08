@@ -6,18 +6,34 @@ use std::path::PathBuf;
 // ═══════════════════════════════════════════════════════════
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct ReachConfig {
     pub sandbox: SandboxDefaults,
     pub server: ServerConfig,
     pub docker: DockerConfig,
+    pub runtime: RuntimeConfig,
     pub vault: VaultConfig,
     pub accounts: std::collections::BTreeMap<String, crate::lease::AccountPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-#[serde(default)]
+#[serde(rename_all = "lowercase")]
+pub enum RuntimeBackend {
+    #[default]
+    Docker,
+    Microvm,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct RuntimeConfig {
+    pub backend: RuntimeBackend,
+    pub broker_socket: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default, deny_unknown_fields)]
 pub struct VaultConfig {
     /// Custom path to secrets.json vault file
     #[serde(default)]
@@ -25,7 +41,7 @@ pub struct VaultConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SandboxDefaults {
     /// Default Docker image
     pub image: String,
@@ -98,7 +114,7 @@ pub fn default_workspace_dir() -> PathBuf {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct ServerConfig {
     /// MCP SSE server port
     pub port: u16,
@@ -118,8 +134,18 @@ impl ServerConfig {
     }
 }
 
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            port: 4200,
+            host: "127.0.0.1".into(),
+            public_host: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 #[derive(Default)]
 pub struct DockerConfig {
     /// Docker socket path (empty = auto-detect)
@@ -159,16 +185,6 @@ impl Default for SandboxDefaults {
     }
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            port: 4200,
-            host: "127.0.0.1".into(),
-            public_host: None,
-        }
-    }
-}
-
 // ═══════════════════════════════════════════════════════════
 // Loading
 // ═══════════════════════════════════════════════════════════
@@ -178,14 +194,15 @@ impl ReachConfig {
         dirs().join("config.toml")
     }
 
-    pub fn load() -> Self {
+    pub fn load() -> anyhow::Result<Self> {
         let path = Self::config_path();
-        if path.exists() {
-            let content = std::fs::read_to_string(&path).unwrap_or_default();
-            toml::from_str(&content).unwrap_or_default()
-        } else {
-            Self::default()
+        if !path.exists() {
+            return Ok(Self::default());
         }
+        let content = std::fs::read_to_string(&path)
+            .map_err(|error| anyhow::anyhow!("failed to read {}: {error}", path.display()))?;
+        toml::from_str(&content)
+            .map_err(|error| anyhow::anyhow!("failed to parse {}: {error}", path.display()))
     }
 }
 
@@ -226,5 +243,32 @@ mod tests {
     fn default_profile_dir_contains_reach_segment() {
         let dir = default_profile_dir();
         assert!(dir.to_string_lossy().contains("reach"));
+    }
+    #[test]
+    fn malformed_runtime_backend_is_rejected() {
+        let parsed = toml::from_str::<ReachConfig>(
+            r#"[runtime]
+backend = "not-a-runtime"
+"#,
+        );
+        assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn malformed_runtime_table_and_keys_are_rejected() {
+        for source in [
+            "[runtim]\nbackend = \"microvm\"\n",
+            "[runtime]\nbackened = \"microvm\"\n",
+            "[runtime]\nbroker_soket = \"/run/reach/broker.sock\"\n",
+        ] {
+            assert!(toml::from_str::<ReachConfig>(source).is_err(), "{source}");
+        }
+    }
+
+    #[test]
+    fn omitted_runtime_fields_keep_valid_defaults() {
+        let parsed = toml::from_str::<ReachConfig>("[runtime]\n").unwrap();
+        assert!(matches!(parsed.runtime.backend, RuntimeBackend::Docker));
+        assert_eq!(parsed.runtime.broker_socket, None);
     }
 }

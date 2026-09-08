@@ -1,7 +1,7 @@
 use clap::{Args, Subcommand};
 use colored::Colorize;
 use reach_cli::config::ReachConfig;
-use reach_cli::docker::DockerClient;
+use reach_cli::runtime::RuntimeClient;
 use reach_cli::tools::{ToolContext, dispatch};
 use reach_cli::vault::{self, normalize_domain};
 
@@ -211,13 +211,13 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
         )
     })?;
 
-    let cfg = ReachConfig::load();
-    let docker = DockerClient::new(cfg.docker.socket_path())?;
+    let cfg = ReachConfig::load()?;
+    let runtime = RuntimeClient::from_config(&cfg)?;
 
     let target = match args.target {
         Some(t) => t,
         None => {
-            let sandboxes = docker.list().await?;
+            let sandboxes = runtime.list().await?;
             if sandboxes.is_empty() {
                 anyhow::bail!("no running reach sandbox found; specify --target <container>");
             }
@@ -226,7 +226,7 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
     };
 
     let ctx = ToolContext {
-        docker: &docker,
+        runtime: &runtime,
         public_host: cfg.server.effective_public_host(),
         agent: None,
         profile_broker: None,
@@ -241,7 +241,7 @@ pub async fn run_inject(args: InjectArgs) -> anyhow::Result<()> {
         let display = reach_cli::tools::display_for(args.screen);
         let check_cmd =
             format!("DISPLAY={display} xdotool getactivewindow getwindowname 2>/dev/null || true");
-        if let Ok(out) = docker
+        if let Ok(out) = runtime
             .exec(&target, &["bash".into(), "-c".into(), check_cmd])
             .await
         {
